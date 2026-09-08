@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-context-continuity"
+version = "0.1.0"
+description = "Bounded context continuation helpers for native Claude Code sessions."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "macchen123"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = ["apsw==3.53.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/macchen123/claude-context-continuity"
+Source = "https://github.com/macchen123/claude-context-continuity"
+
+[project.scripts]
+cclaude = "claude_context_continuity.native_entry:main"
+claude-context = "claude_context_continuity.continuity:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

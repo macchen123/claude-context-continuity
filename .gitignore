@@ -1,0 +1,33 @@
+# Runtime state and generated local data
+runtime/
+artifacts/
+logs/
+*.log
+*.sock
+live-*
+probe-*
+recover-*
+.test-claude-config/
+.test-state*/
+
+# Python caches, environments, and coverage
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Build output
+build/
+dist/
+
+# Local configuration and editor files
+.env
+.env.*
+.DS_Store
