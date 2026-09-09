@@ -14,12 +14,13 @@
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
 [![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-社区认可-0d9488)](https://linux.do)
 
 <sub>概念插图，不是终端截图。</sub>
 
 </div>
 
-[为什么](#why) · [另一种节奏](#rhythm) · [三步开始](#quick-start) · [工作方式](#how-it-works) · [日常使用](#everyday-use) · [隐私](#privacy) · [FAQ](#faq) · [参与贡献](#contributing)
+[为什么](#why) · [另一种节奏](#rhythm) · [三步开始](#quick-start) · [工作方式](#how-it-works) · [日常使用](#everyday-use) · [隐私](#privacy) · [FAQ](#faq) · [参与贡献](#contributing) · [致谢](#acknowledgments)
 
 <a id="why"></a>
 ## 不想在长任务里反复依赖 `/compact`？
@@ -296,6 +297,11 @@ CLAUDE_CONFIG_DIR="$PWD/.test-claude-config" \
 PYTHONPATH=src \
 python3 -m unittest discover -s tests -v
 ```
+
+<a id="acknowledgments"></a>
+## 致谢
+
+感谢 [LINUX DO](https://linux.do) 社区的支持与认可。
 
 ## 许可证
 

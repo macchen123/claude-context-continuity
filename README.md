@@ -14,12 +14,13 @@ Keep long-running work moving with a context budget, a fresh start at the right 
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
 [![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
+[![LINUX DO](https://img.shields.io/badge/LINUX%20DO-Community-0d9488)](https://linux.do)
 
 <sub>Concept illustration — not a terminal screenshot.</sub>
 
 </div>
 
-[Why](#why) · [A better rhythm](#rhythm) · [Start in three steps](#quick-start) · [How it works](#how-it-works) · [Everyday use](#everyday-use) · [Privacy](#privacy) · [FAQ](#faq) · [Contributing](#contributing)
+[Why](#why) · [A better rhythm](#rhythm) · [Start in three steps](#quick-start) · [How it works](#how-it-works) · [Everyday use](#everyday-use) · [Privacy](#privacy) · [FAQ](#faq) · [Contributing](#contributing) · [Acknowledgments](#acknowledgments)
 
 <a id="why"></a>
 ## Long tasks deserve more than repeated `/compact`
@@ -296,6 +297,11 @@ CLAUDE_CONFIG_DIR="$PWD/.test-claude-config" \
 PYTHONPATH=src \
 python3 -m unittest discover -s tests -v
 ```
+
+<a id="acknowledgments"></a>
+## Acknowledgments
+
+Thanks to the [LINUX DO](https://linux.do) community for its support and recognition.
 
 ## License
 
