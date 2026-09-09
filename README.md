@@ -12,7 +12,6 @@ Keep long-running work moving with a context budget, a fresh start at the right 
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
-[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
 [![LINUX DO](https://img.shields.io/badge/LINUX%20DO-Community-0d9488)](https://linux.do)
 
@@ -60,7 +59,7 @@ You keep the native Claude Code you already use, rather than move to a replaceme
 | Terminal and PATH | Use an interactive macOS/Linux terminal with `claude`, `tmux`, and your Python environment's command directory on PATH |
 
 ```sh
-python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.1"
+python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git"
 ```
 
 **What does pip install?**
@@ -137,7 +136,7 @@ This one command is loaded only through the session-local `cclaude` plugin, with
 
 ### Durable scheduled tasks and opting out
 
-Claude Code `2.1.263` and `2.1.266` reproduce a same-process issue: existing durable tasks continue after `/clear`, while a newly created durable task can remain on disk without firing. Version 0.1.1 enables a reversible binding workaround by default. Only after a successful native `CronCreate(durable=true)` in the managed process, it aligns the new task's scheduler-session binding with that process's startup session. The startup binding is retained through `resume` as well.
+Claude Code `2.1.263` and `2.1.266` reproduce a same-process issue: existing durable tasks continue after `/clear`, while a newly created durable task can remain on disk without firing. A reversible binding workaround is enabled by default. Only after a successful native `CronCreate(durable=true)` in the managed process, it aligns the new task's scheduler-session binding with that process's startup session. The startup binding is retained through `resume` as well.
 
 The native `.claude/scheduled_tasks.json` remains the only task store; the native scheduler still fires tasks and `CronList` / `CronDelete` work normally. The workaround does not change prompts, cron expressions, firing timestamps, or creator processes. It creates no temporary duplicates or extra timers and does not patch the official binary. Original session attribution is kept in a private undo receipt; other processes' tasks are left alone. Unsafe paths, concurrent changes, unsupported records, or native JSON larger than 4 MiB leave the task untouched and surface a compatibility diagnostic. Neither task creation nor a repaired binding proves an actual firing.
 
@@ -193,7 +192,7 @@ claude-context context-request \
   --handoff "goal, completed work, remaining work, constraints, and important file locations"
 ```
 
-**Cross-window History in v0.1.0:** `history-search` searches or browses the known windows of one continuity session using a local incremental FTS5 cache. It can be called in any later turn, not just during handoff. It does not scan every project or guarantee automatic recall of the right detail.
+**Cross-window History:** `history-search` searches or browses the known windows of one continuity session using a local incremental FTS5 cache. It can be called in any later turn, not just during handoff. It does not scan every project or guarantee automatic recall of the right detail.
 
 ```sh
 # Search all known windows; the context ID defaults to CLAUDE_CONTINUITY_ID.
@@ -208,7 +207,7 @@ claude-context history --source "<source_path>" --session-id "<session_id>" \
 
 Additional filters are `--session` and `--source-kind`; omit `--query` for bounded browsing. For an unmanaged session, use `history-search --source "<session-jsonl-path>" --session-id "<session-id>" --query "decision"`. Source changes invalidate pagination cursors explicitly. Updating an existing Note still requires its current `--expected-sha256` value.
 
-Version `0.1.0` pins `apsw==3.53.4.0`, which supplies SQLite **3.53.4** and FTS5 without replacing system SQLite. Long literal queries use a trigram index; one- and two-character queries remain correct through a scan of selected cached text inside SQLite. No embedding service or retrieval-specific model is required. Unchanged sources reuse the cache; changed sources are parsed by the existing History reader and update only changed index records.
+The package pins `apsw==3.53.4.0`, which supplies SQLite **3.53.4** and FTS5 without replacing system SQLite. Long literal queries use a trigram index; one- and two-character queries remain correct through a scan of selected cached text inside SQLite. No embedding service or retrieval-specific model is required. Unchanged sources reuse the cache; changed sources are parsed by the existing History reader and update only changed index records.
 
 </details>
 
@@ -278,7 +277,7 @@ Only automatic switching pauses. Keep using the native Claude Code session norma
 
 ### Can it search every previous context at once?
 
-Yes. In `v0.1.0`, `history-search` searches the registered windows of one continuity session, with filtering, ordering, and pagination. It remains callable throughout the task. It does not search unrelated projects or ensure the model will always choose the right query. Single-source `history --search` and the window catalogue remain available.
+Yes. `history-search` searches the registered windows of one continuity session, with filtering, ordering, and pagination. It remains callable throughout the task. It does not search unrelated projects or ensure the model will always choose the right query. Single-source `history --search` and the window catalogue remain available.
 
 ### Does it replace Claude Code or fully reproduce Codex?
 
@@ -305,4 +304,4 @@ Thanks to the [LINUX DO](https://linux.do) community for its support and recogni
 
 ## License
 
-Claude Context Continuity `0.1.1` is released under the [MIT License](LICENSE).
+Claude Context Continuity is released under the [MIT License](LICENSE).

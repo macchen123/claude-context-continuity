@@ -12,7 +12,6 @@
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
-[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
 [![LINUX DO](https://img.shields.io/badge/LINUX%20DO-社区认可-0d9488)](https://linux.do)
 
@@ -60,7 +59,7 @@ Claude Code 提供 `/compact` 来整理越来越长的对话。它能腾出空�
 | 终端与 PATH | 使用 macOS/Linux 交互终端，确保 `claude`、`tmux` 及 Python 环境的命令目录在 PATH 中 |
 
 ```sh
-python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.1"
+python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git"
 ```
 
 **pip 会安装什么？**
@@ -137,7 +136,7 @@ DISABLE_COMPACT=1 cclaude
 
 ### 持久定时任务兼容与停用
 
-Claude Code `2.1.263`、`2.1.266` 中已复现：同一进程执行 `/clear` 后，已有持久任务能继续触发，新建持久任务却可能只落盘、不触发。v0.1.1 默认启用一个可撤销的绑定兼容层：只在受管进程的原生 `CronCreate(durable=true)` 成功回执中，将新任务的调度会话绑定对齐到该进程启动时的会话。`resume` 也沿用启动绑定。
+Claude Code `2.1.263`、`2.1.266` 中已复现：同一进程执行 `/clear` 后，已有持久任务能继续触发，新建持久任务却可能只落盘、不触发。默认启用一个可撤销的绑定兼容层：只在受管进程的原生 `CronCreate(durable=true)` 成功回执中，将新任务的调度会话绑定对齐到该进程启动时的会话。`resume` 也沿用启动绑定。
 
 任务仍只有一份，保存在原生 `.claude/scheduled_tasks.json`；原生调度器负责触发，`CronList` / `CronDelete` 照常使用。兼容层不修改任务内容、cron、触发时间或创建进程，不创建临时副本、不增加后台定时器、不修改官方二进制。原始会话归属保存在私有撤销回执中；其他进程的任务不处理。路径不安全、检测到并发变化、记录格式不支持或原生 JSON 超过 4 MiB 时，保留任务原样并显示兼容诊断。创建成功或绑定修正都不是实际触发证明。
 
@@ -193,7 +192,7 @@ claude-context context-request \
   --handoff "目标、已完成工作、剩余工作、约束和重要文件位置"
 ```
 
-**v0.1.0 跨窗口 History：**`history-search` 使用本地增量 FTS5 缓存，统一搜索或浏览一个连续会话已知的窗口。整个任务期间均可调用，不只在交接时使用；它不扫描所有项目，也不保证模型必然自动找回正确细节。
+**跨窗口 History：**`history-search` 使用本地增量 FTS5 缓存，统一搜索或浏览一个连续会话已知的窗口。整个任务期间均可调用，不只在交接时使用；它不扫描所有项目，也不保证模型必然自动找回正确细节。
 
 ```sh
 # 搜索已知窗口；context ID 默认取 CLAUDE_CONTINUITY_ID。
@@ -208,7 +207,7 @@ claude-context history --source "<source_path>" --session-id "<session_id>" \
 
 还可按 `--session`、`--source-kind` 过滤；省略 `--query` 则有界浏览。普通未托管会话可使用 `history-search --source "<session-jsonl-path>" --session-id "<session-id>" --query "决定"`。来源变化时分页游标明确失效，需重新搜索。更新已有 Note 仍需它当前的 `--expected-sha256`。
 
-`0.1.0` 版本锁定 `apsw==3.53.4.0`，自带 SQLite **3.53.4** 与 FTS5，不替换系统 SQLite。长词走 trigram 倒排索引，一、二字查询在 SQLite 所选缓存文本中扫描，仍保持准确匹配；无需 embedding 服务或检索专用模型。未变化来源复用缓存；变化来源由既有 History reader 解析，只更新变化的索引记录。
+项目锁定 `apsw==3.53.4.0`，自带 SQLite **3.53.4** 与 FTS5，不替换系统 SQLite。长词走 trigram 倒排索引，一、二字查询在 SQLite 所选缓存文本中扫描，仍保持准确匹配；无需 embedding 服务或检索专用模型。未变化来源复用缓存；变化来源由既有 History reader 解析，只更新变化的索引记录。
 
 </details>
 
@@ -278,7 +277,7 @@ cclaude
 
 ### 它能一次检索每个过往 context 吗？
 
-可以。`v0.1.0` 的 `history-search` 可统一搜索一个连续会话登记的窗口，并支持过滤、排序和分页；整个任务期间均可调用。它不搜索无关项目，也不保证模型每次都能选择正确的查询词。单源 `history --search` 与窗口目录接口仍然保留。
+可以。`history-search` 可统一搜索一个连续会话登记的窗口，并支持过滤、排序和分页；整个任务期间均可调用。它不搜索无关项目，也不保证模型每次都能选择正确的查询词。单源 `history --search` 与窗口目录接口仍然保留。
 
 ### 它会替代 Claude Code，或完整复刻 Codex 吗？
 
@@ -305,4 +304,4 @@ python3 -m unittest discover -s tests -v
 
 ## 许可证
 
-Claude Context Continuity `0.1.1` 使用 [MIT License](LICENSE) 发布。
+Claude Context Continuity 使用 [MIT License](LICENSE) 发布。
