@@ -143,8 +143,8 @@ def safe_path(root, value, *, exists=True):
 
 def secret_values():
     # 只在内存中用于拒绝意外落盘，不保存环境或凭证。
-    return tuple(v for k, v in os.environ.items() if v and re.search(
-        r"(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|PASSWORD|SECRET|PRIVATE_KEY)$", k))
+    return tuple(v for k, v in os.environ.items() if v and (k == "CLAUDE_BG_RV_AUTH" or re.search(
+        r"(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|PASSWORD|SECRET|PRIVATE_KEY)$", k)))
 
 
 def no_secrets(value):

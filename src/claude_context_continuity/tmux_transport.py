@@ -12,7 +12,6 @@ import stat
 import subprocess
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from . import core
 
@@ -201,7 +200,7 @@ def _binding(value: dict[str, Any], *, require_socket: bool) -> dict[str, Any]:
 
 
 def _run(command: list[str], *, cwd: Path | None = None,
-         environment: dict[str, str] | None = None, stdin: str | None = None) -> str:
+         environment: dict[str, str] | None = None) -> str:
     """运行一次 tmux client；任何失败都不重试，也不暴露 stderr。"""
     kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
@@ -215,8 +214,6 @@ def _run(command: list[str], *, cwd: Path | None = None,
         kwargs["cwd"] = str(cwd)
     if environment is not None:
         kwargs["env"] = environment
-    if stdin is not None:
-        kwargs["input"] = stdin
     try:
         completed = subprocess.run(command, **kwargs)
     except (OSError, subprocess.SubprocessError):
@@ -330,24 +327,3 @@ def capture(binding: dict[str, Any]) -> str:
     """只读捕获已核验 pane 的当前屏幕，不访问 tmux history 或其他 pane。"""
     expected = inspect(binding)
     return _run(_tmux(Path(expected["socket_path"]), "capture-pane", "-p", "-t", expected["pane_id"]))
-
-
-def send_clear(binding: dict[str, Any]) -> None:
-    """只在已核验 pane 输入字面 /clear；任一步失败均不重试。"""
-    expected = inspect(binding)
-    socket, pane = Path(expected["socket_path"]), expected["pane_id"]
-    _run(_tmux(socket, "send-keys", "-t", pane, "-l", "/clear"))
-    _run(_tmux(socket, "send-keys", "-t", pane, "Enter"))
-
-
-def send_text(binding: dict[str, Any], text: str) -> None:
-    """经一次性 tmux buffer 粘贴 Unicode 文本，再向准确 pane 发送 Enter。"""
-    if not isinstance(text, str):
-        _fail("待发送文本必须是字符串")
-    expected = inspect(binding)
-    socket, pane = Path(expected["socket_path"]), expected["pane_id"]
-    # 随机 buffer 名与文本无关；文本只通过 stdin 进入 tmux，不参与 shell 或命令拼接。
-    buffer_name = f"continuity-{uuid4().hex}"
-    _run(_tmux(socket, "load-buffer", "-b", buffer_name, "-"), stdin=text)
-    _run(_tmux(socket, "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane))
-    _run(_tmux(socket, "send-keys", "-t", pane, "Enter"))

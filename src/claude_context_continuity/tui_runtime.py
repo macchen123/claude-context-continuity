@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import os
 from pathlib import Path
+import secrets
 import shlex
 import subprocess
 import sys
 import time
 from uuid import uuid4
 
-from . import core, __version__
+from . import core, native_control, __version__
 from .context_runtime import (ContextRuntime, ContextRuntimeError, _safe_note, _source, _uuid,
                               context_prompt, _runtime_message, _event_context_window)
 from .history import HistorySource, redact
@@ -27,7 +29,7 @@ def _durable_cron_compat_enabled():
 
 
 _PLUGIN_EVENTS = (
-    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop",
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop",
     "SubagentStart", "SubagentStop", "PreCompact",
 )
 
@@ -63,7 +65,7 @@ disable-model-invocation: true
 
 用户手动请求带交接的新上下文。只改变换窗时机，不扩大原任务授权，不重跑已完成工作。
 
-1. 遵守当前项目指令和 shell 前缀约束。停止派发新工作，不杀任务；已有工具或后台任务未完成时，说明正在等待什么，等待真实终态后再交接。
+1. 遵守当前项目指令和 shell 前缀约束。记录仍在运行的后台任务 ID、输出位置和下一步，不杀任务，也不必等它们全部完成。
 2. 保存简短交接：当前目标、限制、已完成和未完成事项、准确产物/历史来源，以及下一步。必要细节使用现有 Notes；不复制整段 transcript、隐藏思考或凭证。
 3. 按本项目命令约束调用现有唯一请求入口，替换下面的交接占位文字并正确引用 shell 参数：
 
@@ -77,7 +79,7 @@ disable-model-invocation: true
 {status}
 ```
 
-5. 请求被接受后结束当前回合，让原生 Stop 与现有控制器在空输入和活动结算后的安全边界切换。若暂停则说明实际原因，不清状态、不盲目重试、不要求用户为已完成动作重新授权。
+5. 请求被接受后结束当前回合；宿主在当前直接工具调用结算后通过原生队列换窗。后台任务继续运行，已提交输入在新窗口处理，输入框草稿保持原样。若暂停则说明实际原因，不清状态、不盲目重试。
 
 不要自行执行 /clear、向终端注入内容、创建新控制器或修改全局设置。新上下文由既有自动接续机制加载交接与 History/Notes。
 """
@@ -100,7 +102,7 @@ class TuiRuntime(ContextRuntime):
         return ContextRuntime._receipt(state) | {key: state.get(key) for key in (
             "transport", "initial_session_started", "native_clear_confirmations",
             "native_resume_confirmations", "continuation_observed", "manual_clear_count", "controller_pid",
-            "durable_cron_compat")}
+            "durable_cron_compat", "native_cli_version", "native_control", "output_budget")}
 
     def _verify_config(self, state):
         # 只读取实时预算；模型、权限和其他设置不属于本层管控范围。
@@ -122,8 +124,7 @@ class TuiRuntime(ContextRuntime):
         """用户可在任意正常回合恢复；未结自动输入仍不能重放。"""
         if (state["rotation"].get("clear") is not None
                 or state.get("continuation_hash") is not None
-                or state["pending_tool_ids"] or state["active_child_handles"]
-                or state.get("background_tool_ids")):
+                or state["pending_tool_ids"]):
             raise ContextRuntimeError("仍有未结活动；保留原生恢复，仅暂停自动换窗")
 
     def _bind_resume(self, state, event, sid):
@@ -133,8 +134,8 @@ class TuiRuntime(ContextRuntime):
         activity, latest = source.activity(), source.latest_usage()
         if latest["cwd"] != state["cwd"]:
             raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
-        if activity["pending_tools"] or activity["background_handles"]:
-            raise ContextRuntimeError("恢复来源仍有未结算工具或后台句柄，不自动接管")
+        if activity["pending_tools"]:
+            raise ContextRuntimeError("恢复来源仍有未结算的直接工具调用，不自动接管")
         candidate = dict(state)
         candidate["phase"], candidate["pause_reason"] = "running", None
         candidate["rotation"] = {**state["rotation"], "request": None, "clear": None}
@@ -142,6 +143,16 @@ class TuiRuntime(ContextRuntime):
         candidate["native_context_window"] = None
         candidate["usage"], candidate["budget_stream"], candidate["budget_handoff_signal"] = None, None, None
         candidate["budget"] = {}
+        candidate.pop("output_budget", None)
+        candidate.pop("tool_batch_boundary", None)
+        candidate["deferred_inputs"] = []
+        catalogue = core.safe_path(self.directory, "history", exists=False)
+        for path in sorted(catalogue.glob(f"*-{sid}.json")):
+            known = core.read_json(core.safe_path(self.directory, path))
+            if known["session_id"] != sid or known["source_path"] != str(source.path):
+                raise ContextRuntimeError("恢复来源与已登记的原生历史不符")
+            candidate["window_generation"] = known["generation"]
+            break
         candidate.pop("rotation_model", None)
         candidate.pop("rotation_permission", None)
         for key in ("stop_observed_at", "stop_text_hash", "stop_serial", "stop_turn_generation",
@@ -227,26 +238,8 @@ class TuiRuntime(ContextRuntime):
                 state["native_permission_mode"] = permission
                 self._save(state)
         if name == "UserPromptSubmit":
-            with core.lock(self.lock_path, wait_seconds=5):
-                state = self._state()
-                if event.get("session_id") != state["session_id"]:
-                    self._pause(state, "输入所属会话不符")
-                elif state["phase"] in {"clear_sent", "awaiting_tui_prompt", "continuation_dispatching"} and event.get("prompt", "").strip() != "/clear":
-                    self._pause(state, "自动换窗期间收到用户输入；不再自动注入")
-                state.pop("resume_safe_boundary", None)
-                state.pop("resume_snapshot", None)
-                state["at_turn_boundary"] = False
-                state["turn_generation"] = state.get("turn_generation", 0) + 1
-                self._save(state)
-                if state["phase"] == "paused":
-                    return {}
-            return {}
+            return self._user_prompt(event)
         if name != "SessionStart":
-            if name in {"SubagentStart", "SubagentStop"}:
-                with core.lock(self.lock_path, wait_seconds=5):
-                    state = self._state()
-                    state["at_turn_boundary"] = False
-                    self._save(state)
             if name == "Stop":
                 with core.lock(self.lock_path, wait_seconds=5):
                     state = self._state()
@@ -260,7 +253,12 @@ class TuiRuntime(ContextRuntime):
             # 从真实 hook 绑定的新 JSONL 确认接续已被原生宿主消费。
             with core.lock(self.lock_path, wait_seconds=5):
                 state = self._state()
-                if name == "Stop" and state["phase"] != "paused" and state.get("source_path"):
+                if event.get("session_id") == state["session_id"]:
+                    if name == "PostToolUse":
+                        result = self._observe_output(state, event, result)
+                    elif name == "PostToolBatch":
+                        result = self._finish_batch(state, event, result)
+                if name == "Stop" and event.get("session_id") == state["session_id"] and state.get("source_path"):
                     source = HistorySource(Path(state["source_path"]), state["session_id"])
                     final_text = event.get("last_assistant_message")
                     state["stop_text_hash"] = core.digest(final_text.strip()) if isinstance(final_text, str) else None
@@ -269,79 +267,229 @@ class TuiRuntime(ContextRuntime):
                     state["stop_turn_generation"] = state.get("turn_generation", 0)
                     state["stop_snapshot"] = {"instruction_head": source.instruction_bounds()["last"]}
                     self._save(state)
-                if state["phase"] != "paused" and state.get("continuation_hash") and state.get("source_path"):
-                    source = HistorySource(Path(state["source_path"]), state["session_id"])
-                    from .history import _content, _texts
-                    observed = any(core.digest("\n".join(_texts(_content(info.data)))) == state["continuation_hash"]
-                                   for info in source._records() if info.data.get("type") == "user")
-                    if observed:
-                        state["continuation_observed"] = True
-                        state.pop("continuation_hash", None)
-                        state.pop("rotation_model", None)
-                        state.pop("rotation_permission", None)
-                        state["phase"] = "running"
-                        self._save(state)
+                if state["phase"] != "paused" and state.get("continuation_hash"):
+                    self._confirm_continuation(state)
                 result = self._repair_durable_cron(state, event, result)
+                self._save(state)
             return result
+        return self._session_start(event)
+
+    @staticmethod
+    def _output_accounting(state):
+        usage = state.get("usage")
+        if not usage:
+            return None
+        sample = core.digest([state["session_id"], usage["request_id"]])
+        accounting = state.get("output_budget")
+        if not accounting or accounting["sample"] != sample:
+            accounting = {"sample": sample, "items": {}, "total_text_bytes": 0,
+                          "basis": "native_input_and_output_tokens_plus_pending_utf8_json_bytes"}
+            state["output_budget"] = accounting
+        return accounting
+
+    def _observe_output(self, state, event, result, *, can_replace=True):
+        from .result_budget import bound_result
+        accounting = self._output_accounting(state)
+        tool_id = event.get("tool_use_id")
+        if accounting is None or not isinstance(tool_id, str) or tool_id in accounting["items"]:
+            return result
+        response, name = event.get("tool_response"), event.get("tool_name")
+        blocks = response if isinstance(response, list) else response.get("content", []) if isinstance(response, dict) else []
+        rich = (isinstance(response, dict) and (
+            name == "Read" and response.get("type") != "text" or response.get("isImage") is True))
+        rich = rich or isinstance(blocks, list) and any(isinstance(block, dict)
+            and block.get("type") in {"image", "image_url", "audio", "resource"} for block in blocks)
+        if rich or response is None:
+            # 多模态 payload 交由原生计量，不把 base64 字节冒充文本 token。
+            accounting["items"][tool_id] = {"text_bytes": 0, "native_rich_or_unmeasured": True, "defer": False}
+            return result
+        raw_bytes = len(json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        usage = state["usage"]
+        room = (usage["remaining_context_tokens"] - usage.get("output_tokens", 0)
+                - accounting["total_text_bytes"] - state["budget"]["guard_tokens"])
+        limit = min(16_000, max(1, room))
+        model_bytes, defer = raw_bytes, raw_bytes > max(0, room)
+        if can_replace and raw_bytes > limit:
+            bounded = bound_result(name, response, directory=self.directory, byte_limit=limit)
+            model_bytes = bounded["model_bytes"] if bounded["model_bytes"] is not None else raw_bytes
+            defer = bounded["defer_required"] and raw_bytes > max(0, room)
+            if bounded["replaced"]:
+                result = dict(result)
+                specific = dict(result.get("hookSpecificOutput", {}))
+                specific.update(hookEventName="PostToolUse", updatedToolOutput=bounded["response"])
+                reference = bounded["reference"]
+                notice = (f"本次工具输出已限长，完整脱敏结果：{reference['path']}，SHA256={reference['sha256']}。"
+                          "需要细节时有界读取，不为恢复输出重跑已完成工具。")
+                specific["additionalContext"] = "\n".join(filter(None, (specific.get("additionalContext"), notice)))
+                result["hookSpecificOutput"] = specific
+        context = result.get("hookSpecificOutput", {}).get("additionalContext", "")
+        model_bytes += len(context.encode("utf-8"))
+        accounting["items"][tool_id] = {"text_bytes": model_bytes, "raw_bytes": raw_bytes, "defer": defer}
+        accounting["total_text_bytes"] += model_bytes
+        return result
+
+    def _finish_batch(self, state, event, result):
+        if state["phase"] == "paused" or not state.get("usage"):
+            return result
+        for call in event["tool_calls"]:
+            self._observe_output(state, call, {}, can_replace=False)
+        accounting = self._output_accounting(state)
+        usage = state["usage"]
+        projected = (usage["total_input_and_cache_tokens"] + usage.get("output_tokens", 0)
+                     + accounting["total_text_bytes"]
+                     + len(result.get("hookSpecificOutput", {}).get("additionalContext", "").encode("utf-8")))
+        if (projected >= usage["native_context_window"] - state["budget"]["guard_tokens"]
+                or any(item["defer"] for item in accounting["items"].values())):
+            state["budget_handoff_signal"] = {"generation": state["window_generation"],
+                "reason": "pending_tool_output_budget", "projected_text_budget": projected}
+        self._automatic_rotation(state)
+        if state["rotation"]["request"]:
+            state["tool_batch_boundary"] = {"session_id": state["session_id"],
+                "turn_generation": state.get("turn_generation", 0), "usage_locator": usage["usage_locator"]}
+            state["at_turn_boundary"] = True
+            result = dict(result)
+            result["continue"] = False
+            result["stopReason"] = "正在自动切换上下文；后台任务继续运行，后续输入和结果在新窗口处理。"
+        return result
+
+    def _user_prompt(self, event):
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
+            name = "UserPromptSubmit"
+            if event.get("session_id") != state["session_id"]:
+                self._pause(state, "输入所属会话不符")
+                result = self._hook_output(state, name)
+                self._save(state)
+                return result
+            prompt = event.get("prompt", "")
+            own_input = isinstance(prompt, str) and core.digest(prompt.strip()) == state.get("continuation_hash")
+            if state.get("continuation_hash") and not own_input:
+                self._confirm_continuation(state)
+            state.pop("resume_safe_boundary", None)
+            state.pop("resume_snapshot", None)
+            state.pop("tool_batch_boundary", None)
+            state["at_turn_boundary"] = False
+            state["turn_generation"] = state.get("turn_generation", 0) + 1
+            result = self._hook_output(state, name)
+            if not own_input and state["phase"] != "paused" and prompt.strip() != "/clear":
+                self._usage(state, False)
+                self._automatic_rotation(state)
+                switching = state["rotation"]["request"] is not None or state["phase"] in {
+                    "clear_sent", "awaiting_tui_prompt", "continuation_dispatching", "awaiting_continuation"}
+                if switching:
+                    # continue:false 保留原生 user 记录但不调用模型；这里只记来源与哈希，不另造输入队列。
+                    path = event.get("transcript_path") or state.get("source_path")
+                    receipt = {"session_id": state["session_id"], "source_path": path,
+                               "prompt_hash": core.digest(prompt.strip()),
+                               "after_byte": Path(path).stat().st_size if path and Path(path).is_file() else 0,
+                               "turn_generation": state["turn_generation"]}
+                    state.setdefault("deferred_inputs", []).append(receipt)
+                    state["at_turn_boundary"] = True
+                    result["continue"] = False
+                    result["stopReason"] = "正在切换上下文；刚提交的内容将在新窗口处理，后台任务照常运行。"
+            self._save(state)
+        return result
+
+    @staticmethod
+    def _deferred_input_locators(state):
+        from .history import _content, _texts
+        locators = []
+        for item in state.get("deferred_inputs", []):
+            path = item.get("source_path")
+            if not path or not Path(path).is_file():
+                return None
+            source = _source(path, item["session_id"])
+            found = next((row for row in source._records()
+                          if row.start >= item["after_byte"] and row.data.get("type") == "user" and row.kind != "tool_result"
+                          and core.digest("\n".join(_texts(_content(row.data))).strip()) == item["prompt_hash"]), None)
+            if found is None:
+                return None
+            locators.append(source.locator(found.message_id))
+        return locators
+
+    def _session_start(self, event):
+        """原生换窗事实始终可观测；暂停只约束后续自动输入。"""
+        with core.lock(self.lock_path, wait_seconds=5):
+            previous = self._state()
+            state = deepcopy(previous)
             try:
                 self._verify_config(state)
                 sid = _uuid(event["session_id"], "native session_id")
-                state["cwd"] = str(Path(event["cwd"]).resolve())
-                if state["phase"] == "created" and event.get("source") in {"startup", "resume"}:
-                    state["durable_cron_compat"] = {
-                        "enabled": _durable_cron_compat_enabled(), "scheduler_session_id": sid}
-                if state["phase"] == "created" and event.get("source") == "startup":
-                    state["session_id"] = sid
-                    state["phase"] = "running"
-                    state["initial_session_started"] = True
-                elif event.get("source") == "resume":
-                    self._bind_resume(state, event, sid)
-                elif state["phase"] == "clear_sent" and event.get("source") == "clear":
-                    clear = state["rotation"]["clear"]
-                    if sid == clear["old_session_id"]:
-                        raise ContextRuntimeError("原生 clear 没有产生新 session ID")
-                    clear.update(reset_seen=True, new_session_id=sid)
-                    state["session_id"], state["source_path"] = sid, None
-                    state["window_generation"] = state["rotation"]["generation"]
-                    state["budget"], state["budget_handoff_signal"] = {}, None
-                    state["usage"], state["budget_stream"] = None, None
-                    state.pop("resume_safe_boundary", None)
-                    state.pop("resume_snapshot", None)
-                    state["phase"] = "awaiting_tui_prompt"
-                    state["native_clear_confirmations"] = state.get("native_clear_confirmations", 0) + 1
-                elif (state["phase"] == "running" and event.get("source") == "clear"
-                      and sid != state["session_id"] and not state["rotation"]["request"]
-                      and not state["pending_tool_ids"] and not state["active_child_handles"]):
-                    # 用户主动 /clear 保持原生语义：新任务从空上下文开始，不注入旧交接。
-                    state["session_id"], state["source_path"], state["authorization"] = sid, None, None
-                    state["window_generation"] += 1
-                    state["rotation"]["generation"] = state["window_generation"]
-                    state["budget"], state["usage"], state["budget_handoff_signal"] = {}, None, None
-                    state.pop("resume_safe_boundary", None)
-                    state.pop("resume_snapshot", None)
-                    state["at_turn_boundary"] = False
-                    state["manual_clear_count"] = state.get("manual_clear_count", 0) + 1
-                else:
-                    raise ContextRuntimeError("未安排的会话切换；保留状态，不自动接管")
+                cwd = Path(event["cwd"]).resolve(strict=True)
+                if not cwd.is_dir():
+                    raise ContextRuntimeError("SessionStart 的工作目录不可用")
                 path = event.get("transcript_path")
                 if path is not None:
                     native_path = Path(path)
                     if (not native_path.is_absolute() or native_path.name != f"{sid}.jsonl"
                             or native_path.resolve(strict=False) != native_path):
                         raise ContextRuntimeError("SessionStart 的原生历史路径不符")
-                    state["source_path"] = str(native_path)
-                model = event.get("model")
-                if model is not None:
-                    state["native_session_model"] = model
-                state["session_start_source"] = event.get("source")
+                old_sid, source = state["session_id"], event.get("source")
+                duplicate = (state["phase"] != "created" and sid == old_sid
+                             and source == state.get("session_start_source"))
+                if duplicate and path is not None and state.get("source_path") not in {None, path}:
+                    raise ContextRuntimeError("重复 SessionStart 的原生历史路径不符")
+                state["cwd"] = str(cwd)
+                if state["phase"] == "created" and source in {"startup", "resume"}:
+                    state["durable_cron_compat"] = {
+                        "enabled": _durable_cron_compat_enabled(), "scheduler_session_id": sid}
+                if state["phase"] == "created" and source == "startup":
+                    state["session_id"] = sid
+                    state["phase"] = "running"
+                    state["initial_session_started"] = True
+                elif duplicate:
+                    pass
+                elif source == "resume":
+                    self._bind_resume(state, event, sid)
+                elif source == "clear" and sid != old_sid:
+                    clear = state["rotation"]["clear"]
+                    expected = (clear is not None and clear["old_session_id"] == old_sid
+                                and not clear["reset_seen"])
+                    if expected:
+                        clear.update(reset_seen=True, new_session_id=sid)
+                        state["window_generation"] = clear["generation"]
+                        state["phase"] = "awaiting_tui_prompt"
+                        state["rotation_deadline"] = time.monotonic() + 45
+                        state["native_clear_confirmations"] = state.get("native_clear_confirmations", 0) + 1
+                    else:
+                        # 手动 /clear 只绑定新的空上下文，不复活旧任务或旧交接。
+                        state["authorization"] = None
+                        state["deferred_inputs"] = []
+                        state["window_generation"] = max(state["window_generation"], state["rotation"]["generation"]) + 1
+                        state["rotation"] = {"generation": state["window_generation"], "request": None, "clear": None}
+                        state["phase"] = "running"
+                        state["manual_clear_count"] = state.get("manual_clear_count", 0) + 1
+                        state.pop("continuation_hash", None)
+                        state.pop("rotation_model", None)
+                        state.pop("rotation_permission", None)
+                    if previous["phase"] == "paused":
+                        state["last_observation_pause"] = {
+                            "reason": previous["pause_reason"], "diagnostic": previous.get("diagnostic")}
+                    state["pause_reason"], state["diagnostic"] = None, None
+                    state["session_id"], state["source_path"] = sid, None
+                    state["native_context_window"] = None
+                    state["budget"], state["budget_handoff_signal"] = {}, None
+                    state["usage"], state["budget_stream"] = None, None
+                    state.pop("output_budget", None)
+                    state.pop("tool_batch_boundary", None)
+                    state["at_turn_boundary"] = False
+                    for key in ("resume_safe_boundary", "resume_snapshot", "stop_snapshot", "stop_text_hash"):
+                        state.pop(key, None)
+                else:
+                    raise ContextRuntimeError("未安排的会话切换；保留状态，不自动接管")
+                if path is not None:
+                    state["source_path"] = path
+                    self._catalogue_source(state)
+                self._window(state, event)
+                if event.get("model") is not None:
+                    state["native_session_model"] = event["model"]
+                state["session_start_source"] = source
             except (ValueError, OSError, KeyError, TypeError) as exc:
+                state = previous
                 self._pause(state, redact(str(exc), core.secret_values())[:400])
+            result = self._hook_output(state, "SessionStart", context_prompt())
             self._save(state)
-            if state["phase"] == "paused":
-                return {}
-        return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context_prompt()}}
+        return result
 
     def recover_observation(self, session_id):
         """重新观测准确的现有会话，不输入、清空或重新执行任何任务。"""
@@ -354,12 +502,12 @@ class TuiRuntime(ContextRuntime):
                 return self._receipt(state)
             tmux_transport.inspect(state["tmux"])
             if (state["rotation"]["clear"] or state.get("continuation_hash")
-                    or state["pending_tool_ids"] or state["active_child_handles"]):
+                    or state["pending_tool_ids"]):
                 raise ContextRuntimeError("自动输入结果或活动尚未结算；不重放")
             source = _source(state["source_path"], session_id)
             activity = source.activity()
-            if activity["pending_tools"] or activity["background_handles"]:
-                raise ContextRuntimeError("原生来源仍有未结活动；不恢复自动换窗")
+            if activity["pending_tools"]:
+                raise ContextRuntimeError("原生来源仍有未结算的直接工具调用；不恢复自动换窗")
             self._verify_config(state)
             self._bind(state, {"session_id": session_id, "cwd": state["cwd"],
                                "transcript_path": state["source_path"]})
@@ -376,16 +524,17 @@ class TuiRuntime(ContextRuntime):
             self._save(state)
             return self._receipt(state)
 
-    @staticmethod
-    def _empty_prompt(binding, screen):
-        """只认光标所在行的空原生输入提示符；不清除或覆盖用户输入。"""
-        lines = screen.splitlines()
-        y, x = binding.get("cursor_y"), binding.get("cursor_x")
-        if type(y) is not int or not 0 <= y < len(lines) or type(x) is not int:
-            return False
-        line = lines[y]
-        stripped = line.strip()
-        return stripped in {"❯", ">"} and x <= len(line.rstrip()) + 2
+    def _boundary_flushed(self, state, source):
+        if state.get("deferred_inputs"):
+            return self._deferred_input_locators(state) is not None
+        batch = state.get("tool_batch_boundary")
+        if batch is not None:
+            if (batch["session_id"] != state["session_id"]
+                    or batch["turn_generation"] != state.get("turn_generation", 0)):
+                state["at_turn_boundary"] = False
+                return False
+            return source.latest_usage()["locator"] == batch["usage_locator"]
+        return self._stop_flushed(state, source)
 
     def _stop_flushed(self, state, source):
         from .history import _content, _texts
@@ -395,23 +544,45 @@ class TuiRuntime(ContextRuntime):
         records = source._records()
         head = source.instruction_bounds()["last"]
         if head != state.get("stop_snapshot", {}).get("instruction_head"):
-            state["at_turn_boundary"] = False
-            return False
-        if head is not None:
-            info = next((row for row in records if row.message_id == head["message_id"]), None)
-            if info is not None and info.data.get("type") == "attachment":
-                return False  # 排队的人类输入尚未转成实际 user 记录，不能抢先 clear。
+            info = next((row for row in records if head is not None and row.message_id == head["message_id"]), None)
+            if info is None or info.data.get("type") != "attachment":
+                state["at_turn_boundary"] = False
+                return False
+            # 尚未执行的原生排队输入留在队列中，不必为了清空队列继续消耗旧窗口。
         latest = next((row for row in reversed(records) if row.kind == "assistant"
                        and row.data.get("message", {}).get("model") != "<synthetic>"), None)
         if latest is None or not state.get("stop_text_hash"):
             return False
-        last_input = max((row.start for row in records if row.data.get("type") == "user"
-                          or (row.data.get("type") == "attachment"
-                              and row.data.get("attachment", {}).get("type") == "queued_command")), default=-1)
+        last_input = max((row.start for row in records if row.data.get("type") == "user"), default=-1)
         if latest.start <= last_input:
             return False  # 相同的最终文本也可能属于上一轮，必须晚于本轮输入/工具回执。
         text = "\n".join(_texts(_content(latest.data))).strip()
         return core.digest(text) == state["stop_text_hash"]
+
+    def _continuation(self, state):
+        value = json.loads(super()._continuation(state))
+        deferred = self._deferred_input_locators(state)
+        if deferred is None:
+            raise ContextRuntimeError("延后输入尚未写入原生历史，不按内存副本重放")
+        value["deferred_inputs"] = deferred
+        value["deferred_input_instruction"] = (
+            "These submitted inputs were persisted by the native host before any model execution. "
+            "Read and handle them in order, respecting later corrections or cancellations. Do not rerun completed tools.")
+        value["active_background_agents"] = list(state["active_child_handles"])
+        source_path = state["rotation"]["request"].get("source_path")
+        if source_path:
+            source = HistorySource(Path(source_path), state["rotation"]["request"]["session_id"])
+            latest = source.instruction_bounds()["last"]
+            if latest is not None:
+                value["latest_instruction_locator"] = latest
+            value["background_handles"] = source.activity()["background_handles"]
+            recent = [row for row in source._records() if row.kind in {"assistant", "tool_result", "original_user"}][-4:]
+            value["recent_history_locators"] = [source.locator(row.message_id) for row in recent]
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        core.no_secrets(value)
+        if len(encoded.encode("utf-8")) > core.MAX_PACKET:
+            raise ContextRuntimeError("接续记录超过有界消息大小")
+        return encoded
 
     def _confirm_continuation(self, state):
         from .history import _content, _texts
@@ -424,6 +595,9 @@ class TuiRuntime(ContextRuntime):
         if observed:
             state["continuation_observed"] = True
             state.pop("continuation_hash", None)
+            state.pop("rotation_model", None)
+            state.pop("rotation_permission", None)
+            state["deferred_inputs"] = []
             state["phase"] = "running"
             state["at_turn_boundary"] = False
         return observed
@@ -436,44 +610,38 @@ class TuiRuntime(ContextRuntime):
             if state["phase"] in {"paused", "closed"} or not state.get("tmux"):
                 return self._receipt(state)
             try:
-                binding = tmux_transport.inspect(state["tmux"])
+                tmux_transport.inspect(state["tmux"])
                 self._verify_config(state)
+                control = state.get("native_control")
+                if not control:
+                    raise ContextRuntimeError("当前控制器未建立原生消息通道；不回退到输入框注入")
                 if state["phase"] == "awaiting_continuation":
                     self._confirm_continuation(state)
                 if state["phase"] in {"clear_sent", "awaiting_tui_prompt", "awaiting_continuation"}:
                     if time.monotonic() > state["rotation_deadline"]:
                         raise ContextRuntimeError("未收到准确的新会话或输入接收确认；不按延迟猜测成功")
                 if state["phase"] == "awaiting_tui_prompt":
-                    if self._empty_prompt(binding, tmux_transport.capture(state["tmux"])):
+                    if native_control.ready(control) and self._deferred_input_locators(state) is not None:
                         text = _runtime_message(self._continuation(state))
                         state["continuation_hash"] = core.digest(text)
                         state["continuation_observed"] = False
                         state["phase"] = "continuation_dispatching"
-                        action = ("continue", text, state["tmux"])
+                        action = ("continue", text, control)
                 elif state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}:
                     if (state.get("at_turn_boundary") or state.get("resume_safe_boundary")) and state.get("source_path"):
                         source = HistorySource(Path(state["source_path"]), state["session_id"])
                         resuming = bool(state.get("resume_safe_boundary"))
-                        if resuming:
-                            if not self._resume_flushed(state, source):
-                                self._save(state)
-                                return self._receipt(state)
-                        elif not self._stop_flushed(state, source):
+                        stable = self._resume_flushed(state, source) if resuming else self._boundary_flushed(state, source)
+                        if not stable:
                             self._save(state)
                             return self._receipt(state)
                         self._usage(state, True)
                         self._automatic_rotation(state)
                         if state["rotation"]["request"]:
-                            source = HistorySource(Path(state["source_path"]), state["session_id"])
                             activity = source.activity()
-                            if (activity["pending_tools"] or activity["background_handles"]
-                                    or state["pending_tool_ids"] or state["active_child_handles"]):
+                            if activity["pending_tools"] or state["pending_tool_ids"]:
                                 state["phase"] = "waiting_safe_boundary"
-                                state["settlement_stop_serial"] = state.get("stop_serial", 0)
-                            elif not resuming and state.get("stop_serial", 0) <= state.get("settlement_stop_serial", -1):
-                                state["phase"] = "waiting_safe_boundary"
-                            elif self._empty_prompt(binding, tmux_transport.capture(state["tmux"])):
-                                # 不通过休眠猜测清空结果。后续必须收到同一原生进程的 SessionStart(clear)。
+                            elif native_control.ready(control):
                                 self._latest_before_clear(state)
                                 request = state["rotation"]["request"]
                                 state["rotation"]["clear"] = {
@@ -483,7 +651,7 @@ class TuiRuntime(ContextRuntime):
                                 state["rotation_permission"] = state.get("native_permission_mode")
                                 state["phase"] = "clear_sent"
                                 state["rotation_deadline"] = time.monotonic() + 45
-                                action = ("clear", None, state["tmux"])
+                                action = ("clear", None, control)
                         elif resuming:
                             state.pop("resume_safe_boundary", None)
                             state.pop("resume_snapshot", None)
@@ -504,36 +672,26 @@ class TuiRuntime(ContextRuntime):
                     expected = "clear_sent" if action[0] == "clear" else "continuation_dispatching"
                     if state["phase"] != expected:
                         return self._receipt(state)
-                    binding = tmux_transport.inspect(action[2])
-                    if (state["pending_tool_ids"] or state["active_child_handles"]
-                            or not self._empty_prompt(binding, tmux_transport.capture(action[2]))):
-                        self._pause(state, "自动输入前出现活动或用户正在编辑；不发送")
-                        self._save(state)
-                        return self._receipt(state)
+                    tmux_transport.inspect(state["tmux"])
+                    auth = getattr(self, "_control_auth", None) or os.environ.get(native_control.AUTH_ENV)
                     if action[0] == "clear":
-                        source = HistorySource(Path(state["source_path"]), state["session_id"])
-                        stable = (self._resume_flushed(state, source) if state.get("resume_safe_boundary")
-                                  else state.get("at_turn_boundary") and self._stop_flushed(state, source))
-                        if not stable:
-                            self._pause(state, "自动清空前来源已变化；不发送")
-                            self._save(state)
-                            return self._receipt(state)
-                        tmux_transport.send_clear(action[2])
+                        native_control.send_clear(action[2], auth)
                     else:
-                        tmux_transport.send_text(action[2], action[1])
+                        native_control.send_continuation(action[2], auth, action[1])
                         state["phase"] = "awaiting_continuation"
                         state["rotation_deadline"] = time.monotonic() + 45
                         state["rotation"]["request"] = state["rotation"]["clear"] = None
                         state["at_turn_boundary"] = False
                         self._save(state)
             except Exception as exc:
-                self._pause_external("终端输入结果未知，不重发：" + redact(str(exc), core.secret_values())[:200])
+                self._pause_external("原生消息投递结果未知，不重发：" + redact(str(exc), core.secret_values())[:200])
         return self.receipt()
 
 
 def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
     from . import tmux_transport
     _durable_cron_compat_enabled()
+    native_version = native_control.require_supported_cli()
     cwd = Path(cwd).resolve(strict=True)
     sid, context_id = str(uuid4()), str(uuid4())
     runtime = TuiRuntime.create(cwd=cwd, session_id=sid, conversation_id=context_id,
@@ -543,7 +701,14 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
     env = dict(os.environ)
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_SESSION_ID", None)
+    env.pop("CLAUDE_CODE_SESSION_KIND", None)
+    env.pop("CLAUDE_JOB_DIR", None)
+    env.pop("CLAUDE_BG_SOCKET_TOKENS_PATH", None)
     env["CLAUDE_CONTINUITY_ID"] = context_id
+    control = native_control.binding(context_id)
+    native_control.prepare(control)
+    runtime._control_auth = secrets.token_urlsafe(32)
+    env.update(native_control.environment(control, runtime._control_auth))
     # 原生参数保持原样；可重复的 plugin-dir 不覆盖 settings、prompt 或 session-id。
     argv = ["claude", "--plugin-dir", str(plugin), *native_args]
     if prompt is not None:
@@ -554,6 +719,8 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
         state = runtime._state()
         state["transport"] = "tmux_tui"
         state["tmux"] = binding
+        state["native_control"] = control
+        state["native_cli_version"] = native_version
         state["owned_pid"] = binding["pane_pid"]
         runtime._save(state)
     return runtime
@@ -585,9 +752,11 @@ def run(cwd, *, prompt=None, detached=False, native_args=()):
         raise ContextRuntimeError("原生 TUI 需从终端启动；隔离验证可显式使用 --detached")
     size = os.get_terminal_size() if sys.stdin.isatty() else os.terminal_size((120, 40))
     runtime = create(cwd, prompt=prompt, width=size.columns, height=size.lines, native_args=native_args)
+    controller_env = {**os.environ, native_control.AUTH_ENV: runtime._control_auth,
+                      "CLAUDE_CONTINUITY_ID": runtime.conversation_id}
     process = subprocess.Popen(core.module_argv("tui-serve", "--context-id", runtime.conversation_id),
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               start_new_session=True)
+                               start_new_session=True, env=controller_env)
     with core.lock(runtime.lock_path, wait_seconds=5):
         state = runtime._state()
         state["controller_pid"] = process.pid
@@ -605,6 +774,13 @@ def recover(context_id, session_id):
     from . import tmux_transport
     runtime = TuiRuntime.load(context_id)
     with core.lock(runtime.directory / "controller-start.lock"), core.lock(runtime.directory / "controller.lock"):
+        with core.lock(runtime.lock_path, wait_seconds=5):
+            state = runtime._state()
+            control = state.get("native_control")
+            if (not control or os.environ.get("CLAUDE_CONTINUITY_ID") != context_id
+                    or os.environ.get(native_control.SOCKET_ENV) != control["socket_path"]):
+                raise ContextRuntimeError("恢复需要对应受管终端的原生通道环境；不从其他会话接管")
+            control_env = native_control.environment(control, os.environ.get(native_control.AUTH_ENV))
         runtime.recover_observation(session_id)
         with core.lock(runtime.lock_path, wait_seconds=5):
             state = runtime._state()
@@ -614,7 +790,7 @@ def recover(context_id, session_id):
             state["at_turn_boundary"] = False
             process = subprocess.Popen(core.module_argv("tui-serve", "--context-id", context_id),
                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       start_new_session=True)
+                                       start_new_session=True, env={**os.environ, **control_env})
             state["controller_pid"] = process.pid
             runtime._save(state)
     return runtime.receipt()

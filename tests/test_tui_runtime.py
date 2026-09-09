@@ -12,7 +12,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from claude_context_continuity import core, tmux_transport, tui_runtime
+from claude_context_continuity import core, native_control, tmux_transport, tui_runtime
 from claude_context_continuity.history import HistorySource
 from claude_context_continuity.tui_runtime import TuiRuntime
 
@@ -40,15 +40,28 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": self.sid,
                               "cwd": str(self.cwd), "source": "startup"})
         self.binding = {"pane_pid": os.getpid(), "cursor_x": 2, "cursor_y": 1}
+        self.control_binding = patch.object(native_control, "binding", side_effect=lambda cid: {
+            "protocol": native_control.PROTOCOL, "context_id": cid,
+            "socket_path": str(self.home / "runtime/control" / f"{cid}.sock")})
+        self.control_binding.start()
+        self.addCleanup(self.control_binding.stop)
+        self.control_ready = patch.object(native_control, "ready", return_value=True)
+        self.control_ready.start()
+        self.addCleanup(self.control_ready.stop)
+        version = patch.object(native_control, "require_supported_cli", return_value="2.1.266")
+        version.start()
+        self.addCleanup(version.stop)
+        self.runtime._control_auth = "isolated-test-auth-not-a-real-secret"
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
             state["tmux"] = self.binding
+            state["native_control"] = native_control.binding(self.runtime.conversation_id)
             state["transport"] = "tmux_tui"
             self.runtime._save(state)
         self.inspector = patch.object(tmux_transport, "inspect", return_value=self.binding)
         self.capture = patch.object(tmux_transport, "capture", return_value="native TUI\n❯ \n")
-        self.clear = patch.object(tmux_transport, "send_clear")
-        self.send = patch.object(tmux_transport, "send_text")
+        self.clear = patch.object(native_control, "send_clear")
+        self.send = patch.object(native_control, "send_continuation")
         self.inspector.start()
         self.capture_mock = self.capture.start()
         self.clear_mock = self.clear.start()
@@ -73,9 +86,11 @@ class TuiRuntimeTests(unittest.TestCase):
                                     configuration_reader=lambda _: self.config)
         runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid,
                          "cwd": str(self.cwd), "source": "startup", "transcript_path": str(source)})
+        runtime._control_auth = "isolated-test-auth-not-a-real-secret"
         with core.lock(runtime.lock_path):
             state = runtime._state()
             state["tmux"] = self.binding
+            state["native_control"] = native_control.binding(runtime.conversation_id)
             state["transport"] = "tmux_tui"
             runtime._save(state)
         return runtime, sid, source
@@ -232,19 +247,24 @@ class TuiRuntimeTests(unittest.TestCase):
                          "cwd": str(self.cwd), "source": "clear", "transcript_path": str(new_source)})
         runtime.advance()
         self.send_mock.assert_called_once()
-        self.assertIn(old_sid, self.send_mock.call_args.args[1])
+        self.assertIn(old_sid, self.send_mock.call_args.args[2])
 
-    def test_resume_new_prompt_cancels_the_old_safe_boundary_without_blocking(self):
+    def test_resume_over_budget_defers_new_input_until_native_history_is_flushed(self):
         runtime, _, _ = self.resume_runtime()
         old_sid, old_source = self.resume_source(1200)
         runtime.on_hook({"hook_event_name": "SessionStart", "session_id": old_sid,
                          "cwd": str(self.cwd), "source": "resume", "transcript_path": str(old_source)})
         blocked = runtime.on_hook({"hook_event_name": "UserPromptSubmit", "session_id": old_sid,
                                    "cwd": str(self.cwd), "prompt": "不要在检查前请求模型"})
-        self.assertNotIn("continue", blocked)
-        self.assertEqual(runtime.advance()["phase"], "running")
+        self.assertFalse(blocked["continue"])
+        self.assertEqual(runtime.advance()["phase"], "rotation_requested")
         self.assertNotIn("resume_safe_boundary", runtime._state())
         self.clear_mock.assert_not_called()
+        with old_source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": old_sid,
+                "message": {"role": "user", "content": "不要在检查前请求模型"}}) + "\n")
+        self.assertEqual(runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
     def test_resume_rejects_a_cross_directory_source_without_rebinding(self):
@@ -305,7 +325,7 @@ class TuiRuntimeTests(unittest.TestCase):
                               "cwd": str(self.cwd), "source": "clear"})
         self.runtime.advance()
         self.send_mock.assert_called_once()
-        text = self.send_mock.call_args.args[1]
+        text = self.send_mock.call_args.args[2]
         self.assertTrue(text.startswith("<continuity-host-event>"))
         self.assertIn(self.sid, text)
         self.assertEqual(self.runtime.receipt()["phase"], "awaiting_continuation")
@@ -341,10 +361,10 @@ class TuiRuntimeTests(unittest.TestCase):
                               "cwd": str(self.cwd), "source": "clear"})
         self.runtime.advance()
         self.send_mock.assert_called_once()
-        self.assertIn(first["handoff"], self.send_mock.call_args.args[1])
+        self.assertIn(first["handoff"], self.send_mock.call_args.args[2])
 
-    def test_manual_request_waits_for_activity_and_preserves_typed_input(self):
-        self.runtime.request_rotation("先结算当前活动，再按原任务继续。")
+    def test_manual_request_waits_only_for_direct_calls_not_the_input_draft(self):
+        self.runtime.request_rotation("先结算当前直接调用，再按原任务继续。")
         self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="unfinished"))
         self.runtime.on_hook(self.hook("Stop"))
         self.assertEqual(self.runtime.advance()["phase"], "waiting_safe_boundary")
@@ -352,11 +372,9 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="unfinished"))
         self.runtime.on_hook(self.hook("Stop"))
         self.capture_mock.return_value = "native TUI\n❯ 正在输入\n"
-        self.runtime.advance()
-        self.clear_mock.assert_not_called()
-        self.capture_mock.return_value = "native TUI\n❯ \n"
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
         self.clear_mock.assert_called_once()
+        self.capture_mock.assert_not_called()
 
     def test_new_tool_free_turn_cannot_reuse_previous_stop(self):
         self.runtime.on_hook(self.hook("Stop"))
@@ -381,15 +399,16 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
         self.clear_mock.assert_called_once()
 
-    def test_queued_human_input_is_not_skipped_at_stop_boundary(self):
+    def test_queued_human_input_does_not_block_native_queued_clear(self):
         with self.source.open("a") as f:
             f.write(json.dumps({"type": "attachment", "uuid": str(uuid4()), "sessionId": self.sid,
                 "isSidechain": False, "userType": "external", "attachment": {
                 "type": "queued_command", "origin": {"kind": "human"}, "commandMode": "prompt",
                 "source_uuid": self.sid, "prompt": "queued follow-up"}}) + "\n")
         self.threshold()
-        self.runtime.advance()
-        self.clear_mock.assert_not_called()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+        self.assertIn("queued follow-up", self.source.read_text())
 
     def test_accepted_continuation_does_not_time_out_during_long_thinking(self):
         self.threshold()
@@ -400,7 +419,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid,
             "cwd": str(self.cwd), "source": "clear", "transcript_path": str(path)})
         self.runtime.advance()
-        text = self.send_mock.call_args.args[1]
+        text = self.send_mock.call_args.args[2]
         path.write_text(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
                                    "message": {"role": "user", "content": text}}) + "\n")
         with core.lock(self.runtime.lock_path):
@@ -412,11 +431,12 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertTrue(result["continuation_observed"])
         self.assertFalse(self.runtime._state()["at_turn_boundary"])
 
-    def test_user_input_is_not_cleared_or_overwritten(self):
+    def test_user_draft_is_not_read_or_overwritten_by_native_clear(self):
         self.threshold()
         self.capture_mock.return_value = "native TUI\n❯ 正在编辑的输入\n"
         self.runtime.advance()
-        self.clear_mock.assert_not_called()
+        self.clear_mock.assert_called_once()
+        self.capture_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
     def test_no_clear_while_native_background_or_tool_is_unsettled(self):
@@ -453,6 +473,166 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertIsNone(outcome["authorization"])
         self.runtime.advance()
         self.send_mock.assert_not_called()
+
+    def test_late_clear_confirmation_rebinds_after_concurrent_input_pause(self):
+        self.threshold()
+        self.runtime.advance()
+        deferred = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="scheduled follow-up"))
+        self.assertFalse(deferred["continue"])
+        self.runtime._pause_external("原生投递确认暂时缺失")
+        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        sid, source = self.resume_source(125)
+        result = self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear",
+            "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)})
+        state = self.runtime._state()
+        self.assertEqual(state["session_id"], sid)
+        self.assertEqual(state["source_path"], str(source))
+        self.assertTrue(state["rotation"]["clear"]["reset_seen"])
+        self.assertEqual(state["rotation"]["clear"]["new_session_id"], sid)
+        self.assertIn("history-search", result["hookSpecificOutput"]["additionalContext"])
+        catalogue = list((self.runtime.directory / "history").glob(f"*-{sid}.json"))
+        self.assertEqual(len(catalogue), 1)
+        self.assertEqual(core.read_json(catalogue[0])["source_path"], str(source))
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+
+    def test_manual_clear_while_paused_restores_observation_without_old_handoff(self):
+        self.runtime._pause_external("observation temporarily unavailable")
+        sid, source = self.resume_source(125)
+        result = self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear",
+            "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)})
+        state = self.runtime._state()
+        self.assertEqual(state["session_id"], sid)
+        self.assertEqual(state["phase"], "running")
+        self.assertIsNone(state["authorization"])
+        self.assertIsNone(state["rotation"]["request"])
+        self.assertIn("history-search", result["hookSpecificOutput"]["additionalContext"])
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_paused_automation_still_observes_usage_and_warns_once(self):
+        self.runtime._pause_external("terminal input outcome is unknown")
+        self.usage(450)
+        first = self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="new-work"))
+        state = self.runtime._state()
+        self.assertEqual(state["phase"], "paused")
+        self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 450)
+        self.assertIn("systemMessage", first)
+        second = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="new-work"))
+        self.assertNotIn("systemMessage", second)
+        self.assertNotIn("continue", first)
+        self.assertFalse(self.runtime.receipt()["pending_tool_ids"])
+
+    def test_invalid_clear_source_does_not_replace_bound_session(self):
+        self.threshold()
+        self.runtime.advance()
+        sid = str(uuid4())
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear",
+            "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(self.source)})
+        state = self.runtime._state()
+        self.assertEqual(state["session_id"], self.sid)
+        self.assertEqual(state["source_path"], str(self.source))
+        self.assertFalse(state["rotation"]["clear"]["reset_seen"])
+
+    def test_duplicate_clear_confirmation_does_not_create_another_generation(self):
+        self.threshold()
+        self.runtime.advance()
+        sid, source = self.resume_source(125)
+        event = {"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                 "cwd": str(self.cwd), "transcript_path": str(source)}
+        self.runtime.on_hook(event)
+        generation = self.runtime._state()["window_generation"]
+        self.runtime.on_hook(event)
+        state = self.runtime._state()
+        self.assertEqual(state["window_generation"], generation)
+        self.assertEqual(state["native_clear_confirmations"], 1)
+        self.assertNotEqual(state["phase"], "paused")
+        self.assertEqual(len(list((self.runtime.directory / "history").glob(f"*-{sid}.json"))), 1)
+
+    def test_tool_batch_stops_before_next_request_without_waiting_for_background_agent(self):
+        self.runtime.on_hook(self.hook("SubagentStart", agent_id="still-running"))
+        self.usage(800)
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
+        self.assertFalse(result["continue"])
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], ["still-running"])
+        self.assertIsNone(self.runtime._state().get("stop_serial"))
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.runtime.advance()
+        packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
+        self.assertEqual(packet["active_background_agents"], ["still-running"])
+
+    def test_batch_accounts_multiple_outputs_and_bounds_native_response(self):
+        self.config = {"hash": "output-budget", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100000"}}
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["budget"] = {}
+            self.runtime._save(state)
+        self.usage(60000)
+        response = {"stdout": "x" * 8000, "stderr": "", "interrupted": False}
+        first = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="out-one", tool_name="Bash",
+                                               tool_response=response))
+        self.assertNotIn("updatedToolOutput", first.get("hookSpecificOutput", {}))
+        second = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="out-two", tool_name="Bash",
+                                                tool_response=response))
+        replacement = second["hookSpecificOutput"]["updatedToolOutput"]
+        self.assertFalse(replacement["interrupted"])
+        self.assertLess(len(replacement["stdout"]), len(response["stdout"]))
+        self.assertTrue(list((self.runtime.directory / "outputs").glob("*.json")))
+        before = self.runtime._state()["output_budget"]["total_text_bytes"]
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
+            {"tool_use_id": "out-one", "tool_name": "Bash", "tool_input": {}, "tool_response": response},
+            {"tool_use_id": "out-two", "tool_name": "Bash", "tool_input": {}, "tool_response": replacement},
+        ]))
+        self.assertFalse(result["continue"])
+        self.assertEqual(self.runtime._state()["output_budget"]["total_text_bytes"], before)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+
+    def test_native_image_bytes_do_not_force_repeated_fresh_window_resets(self):
+        response = {"type": "image", "file": {"base64": "A" * 200000, "type": "image/png"}}
+        result = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="figure", tool_name="Read",
+                                                tool_response=response))
+        self.assertNotIn("updatedToolOutput", result.get("hookSpecificOutput", {}))
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
+            {"tool_use_id": "figure", "tool_name": "Read", "tool_input": {}, "tool_response": response}]))
+        self.assertNotIn("continue", batch)
+        self.assertTrue(self.runtime._state()["output_budget"]["items"]["figure"]["native_rich_or_unmeasured"])
+
+    def test_deferred_input_is_read_from_native_history_and_not_replayed_as_a_command(self):
+        self.threshold()
+        self.runtime.advance()
+        prompt = "只继续检查已有结果，不要重新执行实验。"
+        deferred = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=prompt))
+        self.assertFalse(deferred["continue"])
+        self.assertNotIn(prompt, self.runtime.state_path.read_text())
+        with self.source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+                                     "message": {"role": "user", "content": prompt}}) + "\n")
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.runtime.advance()
+        text = self.send_mock.call_args.args[2]
+        packet = json.loads(text.split("\n", 1)[1].split("\n", 1)[1])
+        locator = packet["deferred_inputs"][0]
+        self.assertEqual(HistorySource(self.source, self.sid).read(locator)["text"], prompt)
+        self.assertEqual(packet["latest_instruction_locator"], locator)
+        self.assertNotIn(prompt, text)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
+    def test_current_native_plugin_keeps_history_on_the_existing_cli(self):
+        manifest = tui_runtime._plugin_manifest(self.runtime.conversation_id)
+        self.assertNotIn("mcpServers", manifest)
+        self.assertIn("PostToolBatch", manifest["hooks"])
+        prompt = tui_runtime.context_prompt()
+        self.assertIn("history-search", prompt)
+        self.assertIn("notes list/read/search/write/append", prompt)
+        self.assertNotIn("ToolSearch", prompt)
 
     def test_resume_rebinds_after_manual_clear(self):
         current_sid = str(uuid4())
@@ -510,10 +690,11 @@ class TuiRuntimeTests(unittest.TestCase):
             self.assertEqual(self.runtime.on_hook(self.hook(name, agent_id="same-agent")), {})
         self.assertEqual(self.runtime.receipt()["active_child_handles"], ["same-agent"])
         self.threshold()
-        self.assertEqual(self.runtime.advance()["phase"], "waiting_safe_boundary")
-        self.clear_mock.assert_not_called()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
         for name in ("SubagentStop", "SubagentStop", "SubagentStart", "SubagentStop"):
             self.assertEqual(self.runtime.on_hook(self.hook(name, agent_id="same-agent")), {})
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
         self.runtime.on_hook(self.hook("Stop"))
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
         self.clear_mock.assert_called_once()
@@ -544,7 +725,9 @@ class TuiRuntimeTests(unittest.TestCase):
         self.threshold()
         self.clear_mock.side_effect = RuntimeError("unknown transport result")
         self.runtime.advance()
-        self.assertEqual(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="继续正常任务")), {})
+        notice = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="继续正常任务"))
+        self.assertIn("systemMessage", notice)
+        self.assertNotIn("continue", notice)
         self.runtime.on_hook(self.hook("Stop"))
         self.assertEqual(self.runtime.advance()["phase"], "paused")
         self.clear_mock.assert_called_once()
@@ -593,22 +776,37 @@ class TuiRuntimeTests(unittest.TestCase):
 
     def test_input_appearing_between_prepare_and_dispatch_is_preserved(self):
         self.threshold()
-        self.capture_mock.side_effect = ["native TUI\n❯ \n", "native TUI\n❯ 用户新输入\n"]
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        self.clear_mock.assert_not_called()
+        self.capture_mock.side_effect = AssertionError("原生队列投递不得捕获或改写输入框")
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
+
+    def test_recovery_without_bound_native_credentials_does_not_start_or_change_state(self):
+        self.runtime._pause_external("hook_state_or_source_drift")
+        before = self.runtime.state_path.read_bytes()
+        environment = {native_control.AUTH_ENV: "", "CLAUDE_CONTINUITY_ID": self.runtime.conversation_id,
+                       native_control.SOCKET_ENV: self.runtime._state()["native_control"]["socket_path"]}
+        with patch.dict(os.environ, environment), patch.object(tui_runtime.subprocess, "Popen") as spawn:
+            spawn.return_value.pid = 123456
+            with self.assertRaisesRegex(ValueError, "凭证|通道"):
+                tui_runtime.recover(self.runtime.conversation_id, self.sid)
+            spawn.assert_not_called()
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
 
     def test_recovery_cli_starts_only_an_unowned_controller(self):
         from claude_context_continuity import continuity
         self.runtime._pause_external("hook_state_or_source_drift")
         args = continuity.parser().parse_args(["tui-recover", "--context-id", self.runtime.conversation_id,
                                                "--session-id", self.sid])
-        with patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
+        environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)
+        environment["CLAUDE_CONTINUITY_ID"] = self.runtime.conversation_id
+        with patch.dict(os.environ, environment), patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
             spawn.return_value.pid = 123456
             result = continuity.dispatch(args)
             self.assertEqual(result["controller_pid"], 123456)
             self.assertFalse(self.runtime._state()["at_turn_boundary"])
             self.assertNotIn("--model", spawn.call_args.args[0])
+            self.assertEqual(spawn.call_args.kwargs["env"][native_control.AUTH_ENV], self.runtime._control_auth)
         with core.lock(self.runtime.directory / "controller.lock"), patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
             with self.assertRaises(core.ContinuityError):
                 continuity.dispatch(args)
@@ -654,10 +852,15 @@ class TuiRuntimeTests(unittest.TestCase):
             runtime = tui_runtime.create(self.cwd, native_args=caller_argv)
         plugin = runtime.directory / "plugin"
         self.assertEqual(create.call_args.args[2], ["claude", "--plugin-dir", str(plugin), *caller_argv])
-        self.assertEqual(create.call_args.args[3], {
-            **{key: value for key, value in os.environ.items() if key not in {"CLAUDECODE", "CLAUDE_CODE_SESSION_ID"}},
-            "CLAUDE_CONTINUITY_ID": runtime.conversation_id,
-        })
+        child_env = create.call_args.args[3]
+        self.assertEqual(child_env["CLAUDE_CONTINUITY_ID"], runtime.conversation_id)
+        self.assertEqual(child_env["CLAUDE_BG_BACKEND"], "daemon")
+        self.assertNotIn("CLAUDE_CODE_SESSION_KIND", child_env)
+        self.assertEqual(child_env[native_control.SOCKET_ENV], runtime._state()["native_control"]["socket_path"])
+        self.assertTrue(child_env[native_control.AUTH_ENV] == runtime._control_auth)
+        self.assertNotIn(runtime._control_auth, runtime.state_path.read_text())
+        self.assertNotIn("CLAUDECODE", child_env)
+        self.assertNotIn("CLAUDE_CODE_SESSION_ID", child_env)
         manifest = core.read_json(plugin / ".claude-plugin/plugin.json")
         self.assertEqual(manifest["name"], "cclaude")
         self.assertEqual(manifest["version"], tui_runtime.__version__)
@@ -738,7 +941,7 @@ class TuiRuntimeTests(unittest.TestCase):
             "transcript_path": str(source), "tool_use_id": "no-budget-tool", "tool_name": "Read",
             "tool_input": {"file_path": str(self.cwd / "unblocked.txt")},
         })
-        self.assertEqual(tool, {})
+        self.assertIn("systemMessage", tool)
         self.assertNotIn("permissionDecision", tool)
         self.assertNotIn("continue", tool)
         self.assertEqual(runtime.receipt()["phase"], "paused")

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 
 CONTINUITY_ROOT = Path(__file__).resolve().parents[1]
@@ -252,93 +252,6 @@ class TmuxTransportTests(unittest.TestCase):
             ["tmux", "-S", str(path), "capture-pane", "-p", "-t", "%7"],
         ])
         self.assertTrue(all("-J" not in command for command in calls))
-
-    def test_send_clear_inspects_first_uses_literal_and_never_retries_failure(self) -> None:
-        path = self._prepared_socket_path()
-        responses = [
-            self._result([], self._inspection_output()),
-            self._result([], ""),
-            self._result([], "", returncode=1),
-        ]
-        calls: list[list[str]] = []
-
-        def fake_run(args, **kwargs):
-            calls.append(list(args))
-            return responses.pop(0)
-
-        with patch.object(tmux_transport, "_require_private_socket"), \
-                patch.object(tmux_transport.subprocess, "run", side_effect=fake_run):
-            with self.assertRaises(tmux_transport.TmuxTransportError):
-                tmux_transport.send_clear(self._binding(path))
-
-        self.assertEqual(calls, [
-            self._inspect_command(path),
-            ["tmux", "-S", str(path), "send-keys", "-t", "%7", "-l", "/clear"],
-            ["tmux", "-S", str(path), "send-keys", "-t", "%7", "Enter"],
-        ])
-        flattened = [argument for command in calls for argument in command]
-        self.assertNotIn("C-u", flattened)
-        self.assertNotIn("C-c", flattened)
-        self.assertNotIn("clear-history", flattened)
-        self.assertEqual(calls.count(calls[1]), 1)
-        self.assertEqual(calls.count(calls[2]), 1)
-
-    def test_send_text_loads_unicode_only_through_stdin_then_pastes_exact_pane(self) -> None:
-        path = self._prepared_socket_path()
-        text = "中文 continuation\n第二行：café"
-        nonce = UUID("12345678-1234-5678-1234-567812345678")
-        responses = [
-            self._result([], self._inspection_output()),
-            self._result([], ""),
-            self._result([], ""),
-            self._result([], ""),
-        ]
-        calls: list[tuple[list[str], dict[str, object]]] = []
-
-        def fake_run(args, **kwargs):
-            calls.append((list(args), kwargs))
-            return responses.pop(0)
-
-        with patch.object(tmux_transport, "_require_private_socket"), \
-                patch.object(tmux_transport, "uuid4", return_value=nonce), \
-                patch.object(tmux_transport.subprocess, "run", side_effect=fake_run):
-            tmux_transport.send_text(self._binding(path), text)
-
-        buffer_name = "continuity-12345678123456781234567812345678"
-        self.assertEqual([command for command, _ in calls], [
-            self._inspect_command(path),
-            ["tmux", "-S", str(path), "load-buffer", "-b", buffer_name, "-"],
-            ["tmux", "-S", str(path), "paste-buffer", "-p", "-d", "-b", buffer_name, "-t", "%7"],
-            ["tmux", "-S", str(path), "send-keys", "-t", "%7", "Enter"],
-        ])
-        self.assertEqual(calls[1][1]["input"], text)
-        self.assertNotIn(text, calls[1][0])
-        self.assertTrue(all("shell" not in kwargs for _, kwargs in calls))
-        self.assertTrue(all(command[1] == "-S" for command, _ in calls))
-
-    def test_send_text_failure_does_not_paste_or_retry(self) -> None:
-        path = self._prepared_socket_path()
-        responses = [
-            self._result([], self._inspection_output()),
-            self._result([], "", returncode=1),
-        ]
-        calls: list[list[str]] = []
-
-        def fake_run(args, **kwargs):
-            calls.append(list(args))
-            return responses.pop(0)
-
-        with patch.object(tmux_transport, "_require_private_socket"), \
-                patch.object(tmux_transport.subprocess, "run", side_effect=fake_run):
-            with self.assertRaises(tmux_transport.TmuxTransportError):
-                tmux_transport.send_text(self._binding(path), "不会重试")
-
-        self.assertEqual(calls[0], self._inspect_command(path))
-        self.assertEqual(calls[1][:5], ["tmux", "-S", str(path), "load-buffer", "-b"])
-        self.assertRegex(calls[1][5], r"^continuity-[0-9a-f]{32}$")
-        self.assertEqual(calls[1][6], "-")
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn("paste-buffer", [argument for command in calls for argument in command])
 
 
 if __name__ == "__main__":

@@ -44,9 +44,9 @@ You keep your existing native Claude Code setup. This tool does not rebuild codi
 
 <p align="center"><em>Concept flow — not a terminal screenshot.</em></p>
 
-1. **Budget Awareness:** Continuously tracks token usage and reserves space for handoff before the window overflows.
-2. **Safe Switching:** Only initiates context rotation when the active command finishes and the input prompt is completely idle. Never interrupts ongoing work.
-3. **Seamless Handoff:** The fresh session inherits a concise summary of current progress, while all prior transcripts are indexed locally for exact keyword retrieval.
+1. **Prepare before the limit:** Leaves room for a handoff before the conversation fills up, rather than stopping when space has already run out.
+2. **Keep work moving:** Background tasks keep running. Messages sent during the switch and drafts you haven't submitted are kept, so you don't have to start over.
+3. **Find details when you need them:** A short handoff goes to the new window; the original conversation stays available locally. Look up the details you need instead of relying only on a summary.
 
 | With `/compact` | With Context Continuity |
 | --- | --- |
@@ -61,7 +61,7 @@ You keep your existing native Claude Code setup. This tool does not rebuild codi
 
 ### 1. Requirements & Installation
 
-Prerequisites: Python 3.10+, Git, `tmux`, and a working native `claude` CLI.
+Prerequisites: Python 3.10+, Git, `tmux`, and native Claude Code **2.1.266 or newer**. Run `claude --version` to check your installed version.
 
 ```sh
 python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git"
@@ -94,7 +94,9 @@ cclaude
 
 Work in your project directory exactly as you normally do with Claude Code.
 
-When your session approaches the budget limit, the tool waits for the current command to settle, creates a concise handoff, and smoothly switches to a fresh window.
+When the conversation gets close to full, the tool opens a fresh context window and continues the current work. Background tasks keep running, messages sent during the switch are handled in the new window, and unfinished drafts are not sent.
+
+If an automatic switch cannot proceed, the terminal tells you why. You can still carry on with your work and look up earlier history.
 
 ### Proactive rotation with `/renew`
 
@@ -187,7 +189,7 @@ ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-continuity/
 No. Native `/compact` remains completely untouched. You can still invoke `/compact` manually whenever you choose.
 
 ### 2. Will the tool interrupt active commands or tasks?
-No. Switching only occurs when all current background tasks and tool executions have finished, and the CLI prompt is idle.
+It won't stop or rerun background tasks just to switch context. It waits for the current tool calls to finish, then switches; background tasks don't all have to be done. Messages sent during the switch are handled in the new window, and drafts are kept.
 
 ### 3. Can I still access details from earlier windows?
 Yes. All prior sessions in the task chain are indexed locally in SQLite FTS5. Use `claude-context history-search` to query any previous turn or decision.

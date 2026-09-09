@@ -682,8 +682,14 @@ class HistorySource:
             values = {name: usage.get(name, 0) for name in names}
             if "input_tokens" not in usage or any(type(value) is not int or value < 0 for value in values.values()):
                 raise HistoryError("latest native input usage is incomplete")
+            output = usage.get("output_tokens", 0)
+            if type(output) is not int or output < 0:
+                raise HistoryError("latest native output usage is invalid")
+            request_id = message.get("id")
             return {"locator": self._locator(info, info.kind), "actual_model": model,
                     "cwd": info.data.get("cwd"), "usage": values, "total_input_tokens": sum(values.values()),
+                    "output_tokens": output, "timestamp": info.data.get("timestamp"),
+                    "request_id": request_id if isinstance(request_id, str) and request_id else info.message_id,
                     "cache_fields_complete": all(name in usage for name in names[1:])}
         raise HistoryError("no native main-session usage is available")
 

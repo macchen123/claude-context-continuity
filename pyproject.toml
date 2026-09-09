@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-context-continuity"
-version = "0.1.1"
+version = "0.2.0"
 description = "Bounded context continuation helpers for native Claude Code sessions."
 readme = "README.md"
 requires-python = ">=3.10"

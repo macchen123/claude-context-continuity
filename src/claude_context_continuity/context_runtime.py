@@ -241,6 +241,9 @@ def context_prompt() -> str:
             "遵守已有用户指令和原生权限，禁止 compact，不重启已执行的工作。"
             "用户也可随时输入 /renew 提前请求带交接的新上下文；手动和自动共用同一安全切换流程。"
             "hook 会提供真实 input+cache 用量、窗口来源和剩余预算。"
+            "宿主在工具批次结算后、下一次模型请求前检查预算；后台任务无须全部结束，输入和结果可跨窗口继续处理。"
+            "History/Notes 使用下列现有 CLI，在整个任务期间持续可用；"
+            "缺少旧约束、决定或结果位置时查回原记录，不凭交接摘要补猜。"
             "若剩余预算不足以覆盖下一步与交接，主动执行 "
             f"{entry} context-request --handoff '简短说明目标、完成项、未完成项、约束和产物定位'，"
             "然后结束本轮回复；宿主会自动切换并继续，不要要求用户操作。"
@@ -352,6 +355,7 @@ class ContextRuntime:
         if state["source_path"] not in {None, str(source.path)}:
             raise ContextRuntimeError("native history source drifted")
         state["source_path"] = str(source.path)
+        self._catalogue_source(state)
         bounds = source.instruction_bounds()
         if state["authorization"] is None:
             if bounds["first"] is None:
@@ -360,15 +364,39 @@ class ContextRuntime:
                                       "latest_instruction_locator": bounds["last"]}
         elif bounds["last"] is not None:
             state["authorization"]["latest_instruction_locator"] = bounds["last"]
+        return source
+
+    def _catalogue_source(self, state: dict[str, Any]) -> None:
+        """历史登记不依赖交接、用户首条输入或自动换窗是否可用。"""
+        path = state.get("source_path")
+        if path is None:
+            return
+        native_path = Path(path)
+        if (not native_path.is_absolute() or native_path.name != f"{state['session_id']}.jsonl"
+                or native_path.resolve(strict=False) != native_path):
+            raise ContextRuntimeError("native history catalogue source is invalid")
         generation = state["window_generation"]
         window = self.directory / "history" / f"{generation:08d}-{state['session_id']}.json"
-        binding = {"source_path": str(source.path), "session_id": state["session_id"], "generation": generation}
+        binding = {"source_path": path, "session_id": state["session_id"], "generation": generation}
         if window.exists():
             if core.read_json(window) != binding:
                 raise ContextRuntimeError("native history catalogue drifted")
         else:
             core.atomic(window, binding, exclusive=True)
-        return source
+
+    @staticmethod
+    def _hook_output(state: dict[str, Any], name: str, context: str | None = None) -> dict[str, Any]:
+        result = {} if context is None or name == "Stop" else {
+            "hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
+        if state["phase"] == "paused":
+            reason = state.get("diagnostic") or state.get("pause_reason") or "原因尚未确认"
+            notice_key = core.digest([state["session_id"], reason])
+            if state.get("pause_notice_key") != notice_key:
+                result["systemMessage"] = "cclaude 自动换窗已暂停；原生任务与历史查询仍可使用。原因：" + reason
+                state["pause_notice_key"] = notice_key
+        else:
+            state.pop("pause_notice_key", None)
+        return result
 
     def _usage(self, state: dict[str, Any], required: bool
                ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
@@ -390,6 +418,8 @@ class ContextRuntime:
         remaining = window - usage["total_input_tokens"]
         state["usage"] = result = {
             "usage_locator": usage["locator"], "actual_model": usage["actual_model"],
+            "request_id": usage["request_id"], "sample_timestamp": usage["timestamp"],
+            "output_tokens": usage["output_tokens"],
             "input_tokens": usage["usage"]["input_tokens"],
             "cache_creation_input_tokens": usage["usage"]["cache_creation_input_tokens"],
             "cache_read_input_tokens": usage["usage"]["cache_read_input_tokens"],
@@ -467,6 +497,9 @@ class ContextRuntime:
                   f"Actual native input+cache tokens: {usage['total_input_and_cache_tokens']}; effective host window: "
                   f"{usage['native_context_window']} ({source}); remaining: {usage['remaining_context_tokens']}; "
                   f"budget guard: {decision['guard_tokens']}; safe-approach threshold: {decision['threshold_tokens']}; {cache}. ")
+        if state["phase"] == "paused":
+            return status + ("Automatic terminal actions are paused, but budget observation and History/Notes remain "
+                             "available. Do not repeat a pending clear or assume the controller changed sessions.")
         if decision["handoff_required"]:
             return (status + "The safe-approach threshold is reached. Save a concise handoff through the existing "
                     "context-request command (goal, completed work, remaining work, constraints, and artifact locators), "
@@ -484,7 +517,7 @@ class ContextRuntime:
             store.write(f"details-{generation}", notes, None, secrets=core.secret_values())
         state["rotation"]["generation"] = generation
         state["rotation"]["request"] = {"generation": generation, "session_id": state["session_id"],
-                                          "handoff": handoff, "notes": notes}
+                                          "source_path": state["source_path"], "handoff": handoff, "notes": notes}
         if automatic:
             state["automatic_rotations"] = state.get("automatic_rotations", 0) + 1
         state["budget_handoff_signal"] = None
@@ -575,8 +608,6 @@ class ContextRuntime:
                         state["active_child_handles"].append(agent)
                     if name == "SubagentStop" and agent in state["active_child_handles"]:
                         state["active_child_handles"].remove(agent)
-                self._save(state)
-                return {}
             context = None
             try:
                 if _compact(event):
@@ -595,8 +626,15 @@ class ContextRuntime:
                     self._bind(state, event)
                     self._window(state, event)
                     tool = event.get("tool_use_id")
-                    if name != "Stop" and (name not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
-                                           or not isinstance(tool, str) or not tool):
+                    if name == "PostToolBatch":
+                        calls = event.get("tool_calls")
+                        if not isinstance(calls, list) or any(not isinstance(call, dict)
+                                or not isinstance(call.get("tool_use_id"), str) for call in calls):
+                            raise ContextRuntimeError("native tool batch identity is unavailable")
+                        completed = {call["tool_use_id"] for call in calls}
+                        state["pending_tool_ids"] = [key for key in state["pending_tool_ids"] if key not in completed]
+                    elif name != "Stop" and (name not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+                                             or not isinstance(tool, str) or not tool):
                         raise ContextRuntimeError("tool hook lacks its native identity")
                     if name == "PreToolUse":
                         if tool not in state["pending_tool_ids"]:
@@ -609,13 +647,23 @@ class ContextRuntime:
                         if name == "PostToolUse":
                             self._settle_task_hook(state, event)
                     context = self._context(state)
+                if (state["phase"] == "paused" and state.get("observation_only_pause") and context is not None
+                        and not state["rotation"]["clear"] and not state.get("continuation_hash")):
+                    state["last_observation_pause"] = {"reason": state["pause_reason"],
+                                                       "diagnostic": state.get("diagnostic")}
+                    state["phase"] = "rotation_requested" if state["rotation"]["request"] else "running"
+                    state["pause_reason"], state["diagnostic"] = None, None
+                    state.pop("observation_only_pause", None)
+                    state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
             except (OSError, TypeError, ValueError, HistoryError, core.ContinuityError, ContextRuntimeError) as exc:
+                was_running = state["phase"] != "paused"
                 self._pause(state, "hook_state_or_source_drift")
+                if was_running and not _compact(event):
+                    state["observation_only_pause"] = True
                 state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+            result = self._hook_output(state, name, context)
             self._save(state)
-            if state["phase"] == "paused":
-                return {}
-        return {} if context is None or name == "Stop" else {"hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
+        return result
 
     def _pause_external(self, reason: str) -> dict[str, Any]:
         with core.lock(self.lock_path, wait_seconds=5):
