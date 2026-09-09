@@ -19,283 +19,198 @@ Keep long-running work moving with a context budget, a fresh start at the right 
 
 </div>
 
-[Why](#why) · [A better rhythm](#rhythm) · [Start in three steps](#quick-start) · [How it works](#how-it-works) · [Everyday use](#everyday-use) · [Privacy](#privacy) · [FAQ](#faq) · [Contributing](#contributing) · [Acknowledgments](#acknowledgments)
+[Why](#why) · [How it works](#how-it-works) · [Start in three steps](#quick-start) · [Everyday use](#everyday-use) · [Cron Workaround](#cron-compat) · [Advanced Features](#advanced) · [Privacy](#privacy) · [FAQ](#faq) · [Contributing](#contributing) · [Acknowledgments](#acknowledgments)
 
 <a id="why"></a>
-## Long tasks deserve more than repeated `/compact`
+## Why Claude Context Continuity?
 
-Claude Code provides `/compact` to make room as a conversation grows. It is useful, but repeatedly continuing from summaries can come with tradeoffs:
+Claude Code natively provides `/compact` to summarize growing conversations. However, in complex or long-running tasks, repeatedly relying on summaries can introduce serious pain points:
 
-- **Details may get left out.** An exact constraint or the reason behind a decision may not survive in full.
-- **Background may need explaining again.** Missing details can lead to corrections or repeated work.
-- **The work has to pause.** Condensing the conversation takes time, and rebuilding the background can take more.
+- **Crucial details get dropped:** Strict constraints, architecture decisions, or edge cases established early on rarely survive multiple rounds of summary compression.
+- **Drift and compounding errors:** Once key context is lost, the model tends to hallucinate or deviate, resulting in code that diverges from your initial specifications.
+- **Workflow interruptions:** Waiting for compaction takes time, and rebuilding background context manually takes even more.
 
-We built Claude Context Continuity to bring a **Codex-style alternative to native Claude Code: watch the budget, start a fresh context when it is time, and continue with working notes and access to the original history—not just another round of summaries.**
+**Our approach: Inspired by Codex.**  
+Instead of summarizing in-place, we monitor your token budget. When you approach the limit, we switch cleanly to a fresh context window while passing forward a concise handoff. The entire original history remains fully searchable locally. **Replace lossy compression with seamless context continuity.**
 
-You keep the native Claude Code you already use, rather than move to a replacement coding assistant. The design is inspired by Codex's [new-context mechanism](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/tools/handlers/new_context_window_spec.rs) and [History/Notes tools](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/ext/history-notes/src/tools.rs). This is an independent community project, not an official product or a full Codex port.
+You keep your existing native Claude Code setup. This tool does not rebuild coding models or replace your tools. It is an independent community project inspired by Codex's [new-context mechanism](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/core/src/tools/handlers/new_context_window_spec.rs) and [History/Notes tools](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/ext/history-notes/src/tools.rs).
 
-<a id="rhythm"></a>
-## A better rhythm for a long session
+---
 
-| With `/compact` | With context continuity |
+<a id="how-it-works"></a>
+## How it works
+
+<img src="docs/images/context-flow.svg" alt="Concept flow: Session 1 leaves a concise handoff, fresh context continues in the same workspace with access to original history" width="100%" />
+
+<p align="center"><em>Concept flow — not a terminal screenshot.</em></p>
+
+1. **Budget Awareness:** Continuously tracks token usage and reserves space for handoff before the window overflows.
+2. **Safe Switching:** Only initiates context rotation when the active command finishes and the input prompt is completely idle. Never interrupts ongoing work.
+3. **Seamless Handoff:** The fresh session inherits a concise summary of current progress, while all prior transcripts are indexed locally for exact keyword retrieval.
+
+| With `/compact` | With Context Continuity |
 | --- | --- |
-| Make room by summarizing the active conversation. | Make room by starting with a fresh context. |
-| Keep a shortened account in the active context. | Carry a short handoff and references to the original history. |
-| An omitted detail may need to be explained again. | Give the new context a direct way to look up the earlier detail. |
+| Compresses conversation in-place via summary | Switches cleanly to a fresh context window |
+| Lossy: early constraints and details easily get lost | Carries key progress forward; exact history remains queryable |
+| Prone to compounding errors over long runs | Stays in an optimal low-latency, high-accuracy context range |
+
+---
 
 <a id="quick-start"></a>
 ## Start in three steps
 
-### 1. Prepare your environment and install
+### 1. Requirements & Installation
 
-**What do you need first?**
-
-| Prerequisite | How to prepare |
-| --- | --- |
-| Python 3.10+ and pip | Install Python or use an existing Python environment |
-| Git | Needed for the Git URL below; not needed when installing the Release wheel |
-| Native Claude Code | Install it separately, sign in or configure authentication, and confirm `claude` works |
-| tmux | Install it through your system package manager; this package manages the session for you |
-| Terminal and PATH | Use an interactive macOS/Linux terminal with `claude`, `tmux`, and your Python environment's command directory on PATH |
+Prerequisites: Python 3.10+, Git, `tmux`, and a working native `claude` CLI.
 
 ```sh
 python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git"
 ```
 
-**What does pip install?**
+*Note: Installation does not modify your global Claude Code settings. All hooks and custom commands are loaded dynamically per session via a local plugin.*
 
-| Installed component | Purpose |
-| --- | --- |
-| `claude-context-continuity` Python package | Automatic context continuity, budget observation, History, and Notes |
-| `apsw==3.53.4.0` | Supplies SQLite 3.53.4 and FTS5 without replacing system SQLite |
-| `cclaude` command | Starts native Claude Code with context continuity |
-| `claude-context` command | Searches History, manages Notes, and requests context switches |
-| The `/renew` implementation | Ships with the package and loads in managed cclaude sessions; no separate skill installation |
+### 2. Set Context Budget
 
-Installation leaves Claude Code's global configuration unchanged; `/renew` and the related hooks load through a session-local plugin.
-
-### 2. Set your context budget
+Set your desired token ceiling based on your model's effective context capacity (e.g. 200k):
 
 ```sh
-# Example only: choose a positive estimate for your own native host.
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000
 ```
 
-`200000` is an example; choose a suitable estimate for your host's context capacity. A smaller detected native window takes precedence. Until a usable budget is available, the native session runs normally with automatic switching off.
+### 3. Launch
 
-### 3. Start as usual
+Run `cclaude` in place of your usual `claude` command:
 
 ```sh
 cclaude
 ```
 
-<details>
-<summary>Optional: choose a no-compact invocation</summary>
+*(Optional: If you wish to disable native auto-compaction for this session, pass `DISABLE_COMPACT=1 cclaude`)*
 
-If your native host supports the setting and you deliberately want that workflow for this invocation:
-
-```sh
-DISABLE_COMPACT=1 cclaude
-```
-
-This is your choice. The package reads no-compact configuration but never edits global settings or guarantees how another host will handle compaction. When available, it also considers `autoCompactEnabled: false`.
-
-</details>
-
-<a id="how-it-works"></a>
-## How it works
-
-<img src="docs/images/context-flow.svg" alt="Concept diagram: Session 1 leaves a short handoff, a fresh context continues in the same workspace, and the original conversation and Notes remain available on demand" width="100%" />
-
-<p align="center"><em>Concept flow, not a terminal screenshot.</em></p>
-
-1. **Choose room to work.** Set a context estimate before the session gets crowded.
-2. **Finish, then switch.** The tool waits until current activity is finished and the prompt is empty before asking Claude Code for a fresh context. If it cannot tell, it leaves the session alone.
-3. **Continue with the work intact.** The new context gets a short handoff; the same workspace, original conversation, and working Notes remain available.
+---
 
 <a id="everyday-use"></a>
 ## Everyday use
 
-Use `cclaude` where you would normally start an interactive `claude` session. Keep working in the same project directory and use the same native tools and settings.
+Work in your project directory exactly as you normally do with Claude Code.
 
-As the chosen budget gets close, the tool keeps room for a clean switch after current work is done. The next context receives a brief handoff rather than a full transcript, while the workspace stays where it is.
+When your session approaches the budget limit, the tool waits for the current command to settle, creates a concise handoff, and smoothly switches to a fresh window.
 
-You do not need to handle session IDs for the ordinary path. If an exact earlier detail matters later, the original conversation is still available to read, and Notes can hold a few useful reminders.
+### Proactive rotation with `/renew`
 
-### Switch early with `/renew`
-
-In a managed `cclaude` session, type:
+If you've completed a milestone and want to start fresh immediately, type inside your session:
 
 ```text
 /renew
 ```
 
-Use this when a work stage has finished or you want a clean context before the budget threshold. The model prepares a concise handoff and calls the same `context-request` used by the existing controller. It waits for current work to settle and does not force `/clear`, kill tasks, or overwrite typed input. A request being accepted is not proof that the switch has already completed.
+The model drafts a quick handoff note and safely rotates to a new window. If another plugin occupies `/renew`, use `/cclaude:renew`.
 
-This one command is loaded only through the session-local `cclaude` plugin, with no global installation or extra setup. The `cclaude` plugin namespace is reserved for this package. `/renew` is the short alias supported by the verified native CLI; if another command already uses that name, use `/cclaude:renew` without overwriting the other command. Manual invocation keeps native tool permissions and can require a normal model turn; automatic budget observation does not depend on invoking this command.
+---
 
-### Durable scheduled tasks and opting out
+<a id="cron-compat"></a>
+## Scheduled Tasks (CronCreate) Bug Workaround
 
-Claude Code `2.1.263` and `2.1.266` reproduce a same-process issue: existing durable tasks continue after `/clear`, while a newly created durable task can remain on disk without firing. A reversible binding workaround is enabled by default. Only after a successful native `CronCreate(durable=true)` in the managed process, it aligns the new task's scheduler-session binding with that process's startup session. The startup binding is retained through `resume` as well.
+In official Claude Code releases, there is a known upstream issue: **Running `/clear` in a session can break session binding for newly created durable tasks (`CronCreate(durable=true)`), causing them to stay on disk without firing.**
 
-The native `.claude/scheduled_tasks.json` remains the only task store; the native scheduler still fires tasks and `CronList` / `CronDelete` work normally. The workaround does not change prompts, cron expressions, firing timestamps, or creator processes. It creates no temporary duplicates or extra timers and does not patch the official binary. Original session attribution is kept in a private undo receipt; other processes' tasks are left alone. Unsafe paths, concurrent changes, unsupported records, or native JSON larger than 4 MiB leave the task untouched and surface a compatibility diagnostic. Neither task creation nor a repaired binding proves an actual firing.
+Since rotating context involves session boundaries, this package includes a lightweight, reversible workaround enabled by default:
+- It automatically aligns new durable tasks with the active scheduler session so they fire reliably.
+- **Never modifies official binaries.** Tasks remain in the official `.claude/scheduled_tasks.json`, and native commands like `CronList` / `CronDelete` continue to work normally.
 
-Start a new session with the workaround disabled:
+**Controls:**
+- **Disable workaround** (e.g., after upstream officially fixes the issue):
+  ```sh
+  CCLAUDE_DURABLE_CRON_COMPAT=off cclaude
+  ```
+- **Inspect status:**
+  ```sh
+  claude-context cron-compat status --context-id "$CLAUDE_CONTINUITY_ID"
+  ```
+- **Revert modifications:**
+  ```sh
+  claude-context cron-compat restore --context-id "<context-id>"
+  ```
 
-```sh
-CCLAUDE_DURABLE_CRON_COMPAT=off cclaude
-```
+---
 
-Inspect its status in a managed session:
+<a id="advanced"></a>
+## Advanced Features: History Search & Working Notes
 
-```sh
-claude-context cron-compat status --context-id "$CLAUDE_CONTINUITY_ID"
-```
-
-To undo existing repairs, exit the corresponding native Claude process and other schedulers using that project directory first, then run from a normal terminal:
-
-```sh
-claude-context cron-compat restore --context-id "<context-id>"
-```
-
-Undo restores attribution only for tasks still matching their receipts. It never resurrects cancelled tasks, overwrites later edits, or changes native locks; a live owner process blocks restoration. Once upstream fixes the issue, disable the workaround and verify initial creation, an existing task across `/clear`, and a new task after `/clear` before retiring it. Do not infer a fix from a version number. Upgrading this package does not hot-update a running controller; start a new `cclaude` session.
-
-<details>
-<summary>Advanced commands: inspect a conversation, use Notes, or request a handoff</summary>
-
-These commands are optional. `history` always requires both `--source` and `--session-id`, and the selected source filename must match that session ID.
-
-```sh
-# Read the human instructions from one selected conversation.
-claude-context history \
-  --source "<session-jsonl-path>" \
-  --session-id "<session-id>" \
-  --instructions
-
-# Search that conversation, or list source conversations known to a context.
-claude-context history \
-  --source "<session-jsonl-path>" \
-  --session-id "<session-id>" \
-  --search "decision" \
-  --page-size 5
-claude-context history-windows --context-id "<context-id>"
-
-# Read or create a short working Note.
-claude-context notes list --context-id "<context-id>"
-claude-context notes read handoff-1 --context-id "<context-id>"
-printf '%s' 'Short working note.' | \
-  claude-context notes write plan --context-id "<context-id>"
-
-# Request a handoff for an already managed session after current work is done.
-claude-context context-request \
-  --context-id "$CLAUDE_CONTINUITY_ID" \
-  --handoff "goal, completed work, remaining work, constraints, and important file locations"
-```
-
-**Cross-window History:** `history-search` searches or browses the known windows of one continuity session using a local incremental FTS5 cache. It can be called in any later turn, not just during handoff. It does not scan every project or guarantee automatic recall of the right detail.
+When working in a fresh window, you can search across all previous session transcripts at any time:
 
 ```sh
-# Search all known windows; the context ID defaults to CLAUDE_CONTINUITY_ID.
-claude-context history-search --query "decision" --role user --recent-first --page-size 5
-# Browse one window's tool results, or continue a search with the same options.
-claude-context history-search --context-id "<context-id>" --window 0 --tool Bash
-claude-context history-search --query "decision" --role user --recent-first --page-size 5 --cursor "<next_cursor>"
-# Verify the exact original record returned by search.
-claude-context history --source "<source_path>" --session-id "<session_id>" \
-  --message-id "<message_id>" --expected-sha256 "<sha256>"
+# Search across all past context windows (powered by local SQLite FTS5)
+claude-context history-search --query "database schema" --recent-first
+
+# Inspect exact matched message content
+claude-context history --source "<path>" --session-id "<id>" --message-id "<id>" --expected-sha256 "<hash>"
+
+# Manage shared working notes
+claude-context notes list
+claude-context notes read plan
+printf '%s' 'Milestone notes' | claude-context notes write plan
 ```
 
-Additional filters are `--session` and `--source-kind`; omit `--query` for bounded browsing. For an unmanaged session, use `history-search --source "<session-jsonl-path>" --session-id "<session-id>" --query "decision"`. Source changes invalidate pagination cursors explicitly. Updating an existing Note still requires its current `--expected-sha256` value.
-
-The package pins `apsw==3.53.4.0`, which supplies SQLite **3.53.4** and FTS5 without replacing system SQLite. Long literal queries use a trigram index; one- and two-character queries remain correct through a scan of selected cached text inside SQLite. No embedding service or retrieval-specific model is required. Unchanged sources reuse the cache; changed sources are parsed by the existing History reader and update only changed index records.
-
-</details>
-
-<a id="native-behavior"></a>
-## Fits around native Claude Code
-
-The normal path is simply `cclaude` in an interactive terminal. It adds context continuity around native Claude Code rather than replacing its prompts, models, tools, permissions, or settings.
-
-<details>
-<summary>Technical compatibility and direct-native behavior</summary>
-
-`cclaude` checks the local `claude --help` shape before it decides to manage a session. This routing is based on observed Claude Code CLI `2.1.263`; it is not a promise that future native CLI versions expose the same flags or tools.
-
-Only a normal interactive `cclaude` TTY is automated. Print modes, `--bg`/`--background`, `--cloud`, native subcommands, `--bare`, `--safe-mode`, non-TTY invocations, and unrecognized native arguments go straight to `claude` unchanged. Use `claude-context context-run` to start the same interactive route explicitly from a TTY.
-
-</details>
+---
 
 <a id="privacy"></a>
-## Local data and privacy
+## Local Data & Privacy
 
-By default, continuity data lives separately from package source under:
+All session records, notes, and search indices are stored strictly on your local machine:
 
 ```text
 ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-continuity/
 ```
 
-This local directory holds continuity data, working Notes, and the rebuildable History search cache. Original conversations remain where native Claude Code keeps them. The cache stores permitted, redacted searchable text and exact locators—not raw transcripts, hidden thinking, or tool-call inputs—and must still be protected as private conversation data.
+- **Local only:** No data is ever transmitted to third-party telemetry or cloud services.
+- **Secret redaction:** Common secret environment variables (API keys, tokens) are stripped before writing to local index caches.
+- **Model queries:** When you retrieve past history into the active conversation, it interacts directly with your configured Claude provider, exactly like normal Claude Code usage.
 
-Continuity files stay local, and this package does not run an extra upload service. But when you or native Claude Code retrieve a conversation or Note into a prompt, that text may be sent to the normal model provider used by the native session. Handle local conversation history with the same care as any other Claude Code transcript; this is not a promise that data never leaves your machine.
-
-<details>
-<summary>Choose the local data directory</summary>
-
-Choose another local state directory before starting a command:
-
-```sh
-export CLAUDE_CONTEXT_CONTINUITY_DIR="<chosen-state-directory>"
-cclaude
-```
-
-No additional skills or template-copying steps are required. A managed `cclaude` session loads `/renew` from its own local plugin. Plain `claude` sessions do not receive this command. For an unmanaged session, you can still ask the model for a concise handoff and use the same `claude-context` History/Notes commands.
-
-</details>
+---
 
 <a id="platform"></a>
-## Platform
+## Platform Support
 
-| Environment | Status |
+| Platform | Status |
 | --- | --- |
-| Python | 3.10+ required; 3.12 tested |
-| macOS and Linux | Supported POSIX baseline with native `claude` and `tmux` available |
-| WSL | Not verified |
-| Native Windows | Unsupported |
+| Python | 3.10+ (tested on 3.12) |
+| macOS & Linux | Fully supported (requires `tmux`) |
+| WSL | Functional (standard POSIX baseline) |
+| Windows Native | Unsupported |
+
+---
 
 <a id="faq"></a>
 ## FAQ
 
-### Can this replace a compaction-centered workflow?
+### 1. Does this replace or disable native `/compact`?
+No. Native `/compact` remains completely untouched. You can still invoke `/compact` manually whenever you choose.
 
-Yes. You can use “leave room early → switch to a fresh context → continue from notes and original history” instead of repeatedly relying on `/compact`.
+### 2. Will the tool interrupt active commands or tasks?
+No. Switching only occurs when all current background tasks and tool executions have finished, and the CLI prompt is idle.
 
-The tool does not patch or remove the native command, and it does not guarantee better results or perfect recall for every task. `/compact` summarizes the active context; it does not delete the original conversation records.
+### 3. Can I still access details from earlier windows?
+Yes. All prior sessions in the task chain are indexed locally in SQLite FTS5. Use `claude-context history-search` to query any previous turn or decision.
 
-### What if the tool cannot tell that work is finished or cannot find a usable budget?
+### 4. Does this alter Claude Code's models, prompts, or permissions?
+No. You are still using native Claude Code. Your models, system prompts, MCP servers, and permission policies remain identical.
 
-Only automatic switching pauses. Keep using the native Claude Code session normally; the tool does not force a clear, take over another terminal, or replay uncertain input.
-
-### Can it search every previous context at once?
-
-Yes. `history-search` searches the registered windows of one continuity session, with filtering, ordering, and pagination. It remains callable throughout the task. It does not search unrelated projects or ensure the model will always choose the right query. Single-source `history --search` and the window catalogue remain available.
-
-### Does it replace Claude Code or fully reproduce Codex?
-
-No. You still use native Claude Code. This tool adds context continuity rather than rebuilding the coding assistant or changing its models, tools, and permissions.
+---
 
 <a id="contributing"></a>
-## Contributing and testing
+## Contributing
 
-Contributions are welcome through forks and pull requests. Only the repository owner can update or merge into `main`; contributors do not need write access to run tests locally. Release notes are maintained on [GitHub Releases](https://github.com/macchen123/claude-context-continuity/releases).
+Contributions and feedback are welcome via GitHub Issues and Pull Requests.
 
-From your source checkout, install the package and its dependencies using your trusted package mirror, then run the isolated test suite:
-
+To run tests locally:
 ```sh
 python3 -m pip install -e .
 CLAUDE_CONFIG_DIR="$PWD/.test-claude-config" \
 PYTHONPATH=src \
 python3 -m unittest discover -s tests -v
 ```
+
+---
 
 <a id="acknowledgments"></a>
 ## Acknowledgments
