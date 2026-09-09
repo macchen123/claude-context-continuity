@@ -97,6 +97,54 @@ class TuiRuntimeTests(unittest.TestCase):
         self.usage(800)
         self.runtime.on_hook(self.hook("Stop"))
 
+    def test_durable_cron_startup_binding_survives_clear_and_resume(self):
+        initial = self.runtime._state()["durable_cron_compat"]["scheduler_session_id"]
+        sid, source = self.resume_source(150)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.assertEqual(self.runtime._state()["durable_cron_compat"]["scheduler_session_id"], initial)
+        resumed_sid, resumed_source = self.resume_source(200)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "resume", "session_id": resumed_sid,
+                              "cwd": str(self.cwd), "transcript_path": str(resumed_source)})
+        self.assertEqual(self.runtime._state()["durable_cron_compat"]["scheduler_session_id"], initial)
+        self.assertEqual(self.runtime.receipt()["session_id"], resumed_sid)
+
+    def test_durable_cron_post_hook_repairs_native_record_without_running_it(self):
+        initial = self.sid
+        self.sid, self.source = self.resume_source(150)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": self.sid,
+                              "cwd": str(self.cwd), "transcript_path": str(self.source)})
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["owned_pid"] = os.getpid()
+            self.runtime._save(state)
+        task = {"id": "a1234567", "cron": "* * * * *", "prompt": "report the time", "recurring": True,
+                "createdAt": 123456, "createdBySessionId": self.sid, "createdByPid": os.getpid(),
+                "createdByProcStart": "fixture-start"}
+        path = self.cwd / ".claude/scheduled_tasks.json"
+        core.atomic(path, {"tasks": [task]})
+        core.atomic(path.with_name("scheduled_tasks.lock"), {
+            "sessionId": initial, "pid": os.getpid(), "procStart": "fixture-start", "acquiredAt": 123})
+        fields = {"tool_use_id": "cron-create", "tool_name": "CronCreate",
+                  "tool_input": {"cron": task["cron"], "prompt": task["prompt"], "durable": True, "recurring": True},
+                  "tool_response": {"id": task["id"], "durable": True, "recurring": True}}
+        self.runtime.on_hook(self.hook("PreToolUse", **fields))
+        response = self.runtime.on_hook(self.hook("PostToolUse", **fields))
+        observed = json.loads(path.read_text())["tasks"][0]
+        self.assertEqual(observed, {**task, "createdBySessionId": initial})
+        self.assertEqual(self.runtime.receipt()["durable_cron_compat"]["last_result"]["status"], "applied")
+        self.assertIn("不代表任务已自动触发", response["hookSpecificOutput"]["additionalContext"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_durable_cron_compat_can_be_disabled_without_changing_native_arguments(self):
+        with patch.dict(os.environ, {tui_runtime.DURABLE_CRON_COMPAT_ENV: "off"}):
+            runtime, _, _ = self.resume_runtime()
+        self.assertFalse(runtime.receipt()["durable_cron_compat"]["enabled"])
+        with patch.dict(os.environ, {tui_runtime.DURABLE_CRON_COMPAT_ENV: "maybe"}):
+            with self.assertRaisesRegex(ValueError, "on 或 off"):
+                tui_runtime.create(self.cwd)
+
     def test_taskstop_settles_current_hook_and_history_before_rotation(self):
         def append(record_type, content, **extra):
             with self.source.open("a") as f:

@@ -12,7 +12,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
-[![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.0)
+[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
 
 <sub>概念插图，不是终端截图。</sub>
@@ -59,7 +59,7 @@ Claude Code 提供 `/compact` 来整理越来越长的对话。它能腾出空�
 | 终端与 PATH | 使用 macOS/Linux 交互终端，确保 `claude`、`tmux` 及 Python 环境的命令目录在 PATH 中 |
 
 ```sh
-python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.0"
+python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.1"
 ```
 
 **pip 会安装什么？**
@@ -133,6 +133,32 @@ DISABLE_COMPACT=1 cclaude
 一个阶段完成，或想在达到预算阈值前换个干净上下文时，可以主动使用它。模型先整理简短交接，再调用现有控制器使用的同一个 `context-request`。它等待当前工作结算，不强制 `/clear`、不杀任务、不覆盖正在编辑的输入；请求已接受不等于换窗已经完成。
 
 这个命令只通过会话本地 `cclaude` plugin 加载，不需要全局安装或额外配置；`cclaude` 插件命名空间由本包使用。`/renew` 是已核验原生 CLI 支持的短别名；如有其他命令占用同名，可使用 `/cclaude:renew`，不覆盖已有命令。手动调用沿用原生工具权限，可能产生正常的模型回合开销；自动预算观察不依赖调用这个命令。
+
+### 持久定时任务兼容与停用
+
+Claude Code `2.1.263`、`2.1.266` 中已复现：同一进程执行 `/clear` 后，已有持久任务能继续触发，新建持久任务却可能只落盘、不触发。v0.1.1 默认启用一个可撤销的绑定兼容层：只在受管进程的原生 `CronCreate(durable=true)` 成功回执中，将新任务的调度会话绑定对齐到该进程启动时的会话。`resume` 也沿用启动绑定。
+
+任务仍只有一份，保存在原生 `.claude/scheduled_tasks.json`；原生调度器负责触发，`CronList` / `CronDelete` 照常使用。兼容层不修改任务内容、cron、触发时间或创建进程，不创建临时副本、不增加后台定时器、不修改官方二进制。原始会话归属保存在私有撤销回执中；其他进程的任务不处理。路径不安全、检测到并发变化、记录格式不支持或原生 JSON 超过 4 MiB 时，保留任务原样并显示兼容诊断。创建成功或绑定修正都不是实际触发证明。
+
+关闭兼容层后启动新会话：
+
+```sh
+CCLAUDE_DURABLE_CRON_COMPAT=off cclaude
+```
+
+在受管会话中查看状态：
+
+```sh
+claude-context cron-compat status --context-id "$CLAUDE_CONTINUITY_ID"
+```
+
+若要撤销已有修正，先退出对应原生 Claude 进程及同目录的其他调度会话，再从普通终端执行：
+
+```sh
+claude-context cron-compat restore --context-id "<context-id>"
+```
+
+撤销只恢复仍匹配回执的任务归属，不复活已取消任务，不覆盖后来改动，也不修改原生锁。运行中的进程会阻止撤销。官方修复后，先关闭此开关验证三种情况：初始新建、跨 `/clear` 保留、`/clear` 后新建；全部通过再停用兼容层，不按版本号猜测。升级本包不会热更新已经运行的控制器，需新启动 `cclaude`。
 
 <details>
 <summary>进阶命令：查看会话、使用 Notes 或请求交接</summary>
@@ -273,4 +299,4 @@ python3 -m unittest discover -s tests -v
 
 ## 许可证
 
-Claude Context Continuity `0.1.0` 使用 [MIT License](LICENSE) 发布。
+Claude Context Continuity `0.1.1` 使用 [MIT License](LICENSE) 发布。

@@ -12,7 +12,7 @@ Keep long-running work moving with a context budget, a fresh start at the right 
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MIT License](https://img.shields.io/badge/License-MIT-2ea44f)](LICENSE)
-[![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.0)
+[![Version 0.1.1](https://img.shields.io/badge/version-0.1.1-6f42c1)](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.1.1)
 [![Platform macOS and Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555555)](#platform)
 
 <sub>Concept illustration — not a terminal screenshot.</sub>
@@ -59,7 +59,7 @@ You keep the native Claude Code you already use, rather than move to a replaceme
 | Terminal and PATH | Use an interactive macOS/Linux terminal with `claude`, `tmux`, and your Python environment's command directory on PATH |
 
 ```sh
-python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.0"
+python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git@v0.1.1"
 ```
 
 **What does pip install?**
@@ -133,6 +133,32 @@ In a managed `cclaude` session, type:
 Use this when a work stage has finished or you want a clean context before the budget threshold. The model prepares a concise handoff and calls the same `context-request` used by the existing controller. It waits for current work to settle and does not force `/clear`, kill tasks, or overwrite typed input. A request being accepted is not proof that the switch has already completed.
 
 This one command is loaded only through the session-local `cclaude` plugin, with no global installation or extra setup. The `cclaude` plugin namespace is reserved for this package. `/renew` is the short alias supported by the verified native CLI; if another command already uses that name, use `/cclaude:renew` without overwriting the other command. Manual invocation keeps native tool permissions and can require a normal model turn; automatic budget observation does not depend on invoking this command.
+
+### Durable scheduled tasks and opting out
+
+Claude Code `2.1.263` and `2.1.266` reproduce a same-process issue: existing durable tasks continue after `/clear`, while a newly created durable task can remain on disk without firing. Version 0.1.1 enables a reversible binding workaround by default. Only after a successful native `CronCreate(durable=true)` in the managed process, it aligns the new task's scheduler-session binding with that process's startup session. The startup binding is retained through `resume` as well.
+
+The native `.claude/scheduled_tasks.json` remains the only task store; the native scheduler still fires tasks and `CronList` / `CronDelete` work normally. The workaround does not change prompts, cron expressions, firing timestamps, or creator processes. It creates no temporary duplicates or extra timers and does not patch the official binary. Original session attribution is kept in a private undo receipt; other processes' tasks are left alone. Unsafe paths, concurrent changes, unsupported records, or native JSON larger than 4 MiB leave the task untouched and surface a compatibility diagnostic. Neither task creation nor a repaired binding proves an actual firing.
+
+Start a new session with the workaround disabled:
+
+```sh
+CCLAUDE_DURABLE_CRON_COMPAT=off cclaude
+```
+
+Inspect its status in a managed session:
+
+```sh
+claude-context cron-compat status --context-id "$CLAUDE_CONTINUITY_ID"
+```
+
+To undo existing repairs, exit the corresponding native Claude process and other schedulers using that project directory first, then run from a normal terminal:
+
+```sh
+claude-context cron-compat restore --context-id "<context-id>"
+```
+
+Undo restores attribution only for tasks still matching their receipts. It never resurrects cancelled tasks, overwrites later edits, or changes native locks; a live owner process blocks restoration. Once upstream fixes the issue, disable the workaround and verify initial creation, an existing task across `/clear`, and a new task after `/clear` before retiring it. Do not infer a fix from a version number. Upgrading this package does not hot-update a running controller; start a new `cclaude` session.
 
 <details>
 <summary>Advanced commands: inspect a conversation, use Notes, or request a handoff</summary>
@@ -273,4 +299,4 @@ python3 -m unittest discover -s tests -v
 
 ## License
 
-Claude Context Continuity `0.1.0` is released under the [MIT License](LICENSE).
+Claude Context Continuity `0.1.1` is released under the [MIT License](LICENSE).

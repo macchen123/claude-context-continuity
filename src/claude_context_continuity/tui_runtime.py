@@ -16,6 +16,16 @@ from .context_runtime import (ContextRuntime, ContextRuntimeError, _safe_note, _
 from .history import HistorySource, redact
 
 
+DURABLE_CRON_COMPAT_ENV = "CCLAUDE_DURABLE_CRON_COMPAT"
+
+
+def _durable_cron_compat_enabled():
+    value = os.environ.get(DURABLE_CRON_COMPAT_ENV, "on").lower()
+    if value not in {"on", "off"}:
+        raise ContextRuntimeError(f"{DURABLE_CRON_COMPAT_ENV} 只接受 on 或 off")
+    return value == "on"
+
+
 _PLUGIN_EVENTS = (
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "Stop",
     "SubagentStart", "SubagentStop", "PreCompact",
@@ -89,7 +99,8 @@ class TuiRuntime(ContextRuntime):
     def _receipt(state):
         return ContextRuntime._receipt(state) | {key: state.get(key) for key in (
             "transport", "initial_session_started", "native_clear_confirmations",
-            "native_resume_confirmations", "continuation_observed", "manual_clear_count", "controller_pid")}
+            "native_resume_confirmations", "continuation_observed", "manual_clear_count", "controller_pid",
+            "durable_cron_compat")}
 
     def _verify_config(self, state):
         # 只读取实时预算；模型、权限和其他设置不属于本层管控范围。
@@ -165,6 +176,38 @@ class TuiRuntime(ContextRuntime):
             return False
         return True
 
+    def _repair_durable_cron(self, state, event, result):
+        """只在原生工具尚处于忙碌回合的同步回执中修复自身新建任务。"""
+        tool_input = event.get("tool_input")
+        if (event.get("hook_event_name") != "PostToolUse" or event.get("tool_name") != "CronCreate"
+                or not isinstance(tool_input, dict) or tool_input.get("durable") is not True):
+            return result
+        compat = state.get("durable_cron_compat", {})
+        if not compat.get("enabled"):
+            return result
+        from . import durable_cron, tmux_transport
+        try:
+            tmux_transport.inspect(state["tmux"])
+            outcome = durable_cron.repair_created_task(state, event, self.directory)
+        except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            outcome = {"status": "error", "reason": redact(str(exc), core.secret_values())[:300]}
+        compat["last_result"] = outcome
+        self._save(state)
+        if outcome.get("status") == "not_needed":
+            return result
+        if outcome.get("status") == "applied":
+            notice = ("cclaude 持久任务兼容层已修正本进程的调度会话绑定，未改变任务内容、时间或数量；"
+                      "这不代表任务已自动触发，仍须按实际触发记录报告。")
+        else:
+            notice = ("cclaude 持久任务兼容检查未应用修复，不能据创建成功宣称自动触发正常。"
+                      "用 tui-status 检查 durable_cron_compat.last_result；不改锁或重放任务来掩盖失败。")
+        result = dict(result)
+        specific = dict(result.get("hookSpecificOutput", {}))
+        previous = specific.get("additionalContext", "")
+        specific.update(hookEventName="PostToolUse", additionalContext="\n".join(filter(None, (previous, notice))))
+        result["hookSpecificOutput"] = specific
+        return result
+
     def on_hook(self, event):
         if not isinstance(event, dict):
             return super().on_hook(event)
@@ -238,6 +281,7 @@ class TuiRuntime(ContextRuntime):
                         state.pop("rotation_permission", None)
                         state["phase"] = "running"
                         self._save(state)
+                result = self._repair_durable_cron(state, event, result)
             return result
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
@@ -245,6 +289,9 @@ class TuiRuntime(ContextRuntime):
                 self._verify_config(state)
                 sid = _uuid(event["session_id"], "native session_id")
                 state["cwd"] = str(Path(event["cwd"]).resolve())
+                if state["phase"] == "created" and event.get("source") in {"startup", "resume"}:
+                    state["durable_cron_compat"] = {
+                        "enabled": _durable_cron_compat_enabled(), "scheduler_session_id": sid}
                 if state["phase"] == "created" and event.get("source") == "startup":
                     state["session_id"] = sid
                     state["phase"] = "running"
@@ -486,6 +533,7 @@ class TuiRuntime(ContextRuntime):
 
 def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
     from . import tmux_transport
+    _durable_cron_compat_enabled()
     cwd = Path(cwd).resolve(strict=True)
     sid, context_id = str(uuid4()), str(uuid4())
     runtime = TuiRuntime.create(cwd=cwd, session_id=sid, conversation_id=context_id,

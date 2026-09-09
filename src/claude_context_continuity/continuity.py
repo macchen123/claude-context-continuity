@@ -68,6 +68,9 @@ def parser():
         command.add_argument("--context-id", required=True)
         if action == "tui-recover":
             command.add_argument("--session-id", required=True)
+    cron = sub.add_parser("cron-compat", help="查看持久任务兼容状态，或在原生进程退出后撤销绑定修正")
+    cron.add_argument("operation", choices=("status", "restore"))
+    cron.add_argument("--context-id", default=os.environ.get("CLAUDE_CONTINUITY_ID"))
     native_input = native.add_mutually_exclusive_group()
     native_input.add_argument("--prompt")
     native_input.add_argument("--prompt-file")
@@ -161,6 +164,20 @@ def dispatch_history_search(args):
 
 
 def dispatch(args):
+    if args.action == "cron-compat":
+        from . import durable_cron
+        from .tui_runtime import TuiRuntime
+        runtime = TuiRuntime.load(core.uuid(args.context_id))
+        with core.lock(runtime.lock_path, wait_seconds=5):
+            state = runtime._state()
+            if args.operation == "status":
+                return {"context_id": runtime.conversation_id,
+                        "durable_cron_compat": state.get("durable_cron_compat"), "write_authority": False}
+            outcome = durable_cron.restore_bindings(state, runtime.directory)
+            if outcome.get("status") not in {"error", "blocked"}:
+                state.setdefault("durable_cron_compat", {})["enabled"] = False
+                runtime._save(state)
+            return {"context_id": runtime.conversation_id, **outcome}
     if args.action.startswith("tui-"):
         from . import tui_runtime
         if args.action == "tui-hook":
@@ -212,7 +229,9 @@ def main():
         result = dispatch(args)
         core.no_secrets(result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 2 if isinstance(result, dict) and result.get("status") == "paused" else 0
+        failed = isinstance(result, dict) and (result.get("status") == "paused" or
+                 args.action == "cron-compat" and result.get("status") in {"blocked", "error"})
+        return 2 if failed else 0
     except (ValueError, OSError, KeyError, TypeError) as exc:
         if args.action == "tui-hook":
             # 连续性观测失败不能变成原生工具的权限拒绝。

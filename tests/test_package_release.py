@@ -143,6 +143,31 @@ class PublicPackageTests(unittest.TestCase):
             self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
             self.assertEqual(json.loads(read.stdout)["text"], "fresh isolated note")
 
+    def test_cron_compat_status_and_live_process_restore_guard(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="package-cron-") as temporary:
+            root = Path(temporary)
+            workspace, state_root = root / "workspace", root / "state"
+            workspace.mkdir()
+            sid = str(uuid4())
+            with patch.object(core, "HOME", state_root):
+                runtime = TuiRuntime.create(cwd=workspace, session_id=sid,
+                    configuration={"hash": "test", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000"}})
+                with core.lock(runtime.lock_path):
+                    state = runtime._state()
+                    state["owned_pid"] = os.getpid()
+                    state["tmux"] = {"pane_pid": os.getpid()}
+                    state["durable_cron_compat"] = {"enabled": True, "scheduler_session_id": sid}
+                    runtime._save(state)
+            environment = self._environment(state_root)
+            status = subprocess.run(self._module_command("cron-compat", "status", "--context-id", runtime.conversation_id),
+                cwd=workspace, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertTrue(json.loads(status.stdout)["durable_cron_compat"]["enabled"])
+            restore = subprocess.run(self._module_command("cron-compat", "restore", "--context-id", runtime.conversation_id),
+                cwd=workspace, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(restore.returncode, 2, restore.stdout + restore.stderr)
+            self.assertTrue(core.read_json(runtime.state_path)["durable_cron_compat"]["enabled"])
+
     def test_generated_plugin_module_command_binds_valid_session_start_in_isolated_state(self) -> None:
         with tempfile.TemporaryDirectory(prefix="package-hook-") as temporary:
             root = Path(temporary)
