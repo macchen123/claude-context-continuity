@@ -127,8 +127,215 @@ class TuiRuntime(ContextRuntime):
                 or state["pending_tool_ids"]):
             raise ContextRuntimeError("仍有未结活动；保留原生恢复，仅暂停自动换窗")
 
-    def _bind_resume(self, state, event, sid):
-        """绑定原生已选中的停止来源，并在首次模型请求前取得真实用量。"""
+    @staticmethod
+    def _same_resume_binding(state, sid, source_path, cwd):
+        return (isinstance(state, dict) and state.get("session_id") == sid
+                and state.get("source_path") == source_path and state.get("cwd") == cwd)
+
+    @staticmethod
+    def _catalogue_floor(state, entries):
+        rotation = state.get("rotation")
+        if not isinstance(rotation, dict):
+            raise ContextRuntimeError("恢复窗口 rotation 无效")
+        values = [entry["generation"] for entry in entries]
+        for value in (state.get("window_generation"), rotation.get("generation")):
+            if type(value) is not int or value < 0:
+                raise ContextRuntimeError("恢复窗口 generation 无效")
+            values.append(value)
+        return max(values, default=0)
+
+    def _catalogue_entries(self, runtime):
+        """Read only canonical reference entries and validate each through _catalogue_source."""
+        history = core.safe_path(runtime.directory, "history", exists=False)
+        if not history.exists():
+            return []
+        if not history.is_dir() or history.is_symlink():
+            raise ContextRuntimeError("native history catalogue is unavailable")
+        entries = []
+        for path in sorted(history.glob("*.json"), key=lambda item: item.name):
+            name = path.name
+            if not (name.endswith(".json") and len(name) > 14 and name[:8].isdigit() and name[8] == "-"):
+                continue
+            try:
+                expected_generation = int(name[:8])
+                expected_sid = _uuid(name[9:-5], "catalogue filename session_id")
+            except ContextRuntimeError:
+                continue
+            try:
+                raw = core.read_json(core.safe_path(runtime.directory, path))
+                if not isinstance(raw, dict):
+                    raise ContextRuntimeError("native history catalogue entry is invalid")
+                probe = {"session_id": raw.get("session_id"), "source_path": raw.get("source_path"),
+                         "window_generation": raw.get("generation")}
+                binding = runtime._catalogue_source(probe, require_existing=True)
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                raise ContextRuntimeError("native history catalogue entry is invalid") from exc
+            expected_path = history / f"{expected_generation:08d}-{expected_sid}.json"
+            if raw != binding or path != expected_path:
+                raise ContextRuntimeError("native history catalogue entry is invalid")
+            entries.append(binding)
+        return sorted(entries, key=lambda entry: (entry["generation"], entry["session_id"], entry["source_path"]))
+
+    def _resume_candidate(self, state, incoming_state, source, sid):
+        """Reset only transient ownership while retaining the target event identity on a deep copy."""
+        entries = self._catalogue_entries(self)
+        floor = self._catalogue_floor(state, entries)
+        source_path = str(source.path)
+        known = [entry["generation"] for entry in entries
+                 if (entry["session_id"], entry["source_path"]) == (sid, source_path)]
+        incoming_generation = incoming_state.get("window_generation") if isinstance(incoming_state, dict) else None
+        if (self._same_resume_binding(incoming_state, sid, source_path, state["cwd"])
+                and type(incoming_generation) is int and incoming_generation in known
+                and incoming_generation >= floor):
+            generation = incoming_generation
+        else:
+            generation = floor + 1
+        candidate = deepcopy(state)
+        candidate["phase"], candidate["pause_reason"] = "running", None
+        candidate["rotation"] = {"generation": max(floor, generation), "request": None, "clear": None}
+        candidate["window_generation"] = generation
+        candidate["session_id"], candidate["source_path"], candidate["authorization"] = sid, None, None
+        candidate["native_context_window"] = None
+        candidate["usage"], candidate["budget_stream"], candidate["budget_handoff_signal"] = None, None, None
+        candidate["budget"] = {}
+        candidate["deferred_inputs"] = []
+        candidate["at_turn_boundary"] = False
+        for key in ("output_budget", "tool_batch_boundary", "rotation_model", "rotation_permission",
+                    "rotation_deadline", "continuation_hash", "continuation_observed", "diagnostic",
+                    "observation_only_pause", "pause_notice_key", "last_observation_pause", "stop_observed_at",
+                    "stop_text_hash", "stop_serial", "stop_turn_generation", "stop_snapshot",
+                    "settlement_stop_serial", "resume_safe_boundary", "resume_snapshot"):
+            candidate.pop(key, None)
+        return candidate
+
+    def _lineage_catalogue_entries(self, owner, owner_state, authorization):
+        """Return every validated reference from the root window through the owner's exact current source."""
+        entries = self._catalogue_entries(owner)
+        current = (owner_state["session_id"], owner_state["source_path"])
+        current_generation = owner_state["window_generation"]
+        if not any((entry["session_id"], entry["source_path"], entry["generation"])
+                   == (*current, current_generation) for entry in entries):
+            raise ContextRuntimeError("恢复来源未登记为 owner 的当前原生历史")
+        root = authorization["root_instruction_locator"]
+        latest = authorization["latest_instruction_locator"]
+        root_pair = (root["session_id"], root["source_path"])
+        latest_pair = (latest["session_id"], latest["source_path"])
+        root_generations = [entry["generation"] for entry in entries
+                            if (entry["session_id"], entry["source_path"]) == root_pair
+                            and entry["generation"] <= current_generation]
+        latest_generations = [entry["generation"] for entry in entries
+                              if (entry["session_id"], entry["source_path"]) == latest_pair
+                              and entry["generation"] <= current_generation]
+        if not root_generations or not latest_generations:
+            raise ContextRuntimeError("授权 lineage 缺少已登记的原生历史")
+        first_generation = min(root_generations)
+        if first_generation > current_generation:
+            raise ContextRuntimeError("授权 lineage generation 不连续")
+        references = [entry for entry in entries
+                      if first_generation <= entry["generation"] <= current_generation]
+        present = {(entry["session_id"], entry["source_path"]) for entry in references}
+        if root_pair not in present or latest_pair not in present or current not in present:
+            raise ContextRuntimeError("授权 lineage 历史不完整")
+        return references
+
+    def _resolve_resume_authorization(self, incoming_state, source, sid, cwd):
+        """Resolve only an exact, settled owner lineage for a host-only native source."""
+        source_path = str(source.path)
+        owners = []
+
+        def consider(owner, owner_state):
+            if not isinstance(owner_state, dict):
+                return
+            if owner_state.get("session_id") != sid or owner_state.get("source_path") != source_path:
+                return
+            if owner_state.get("cwd") != cwd:
+                raise ContextRuntimeError("恢复来源与已登记 owner 的工作目录不符")
+            rotation = owner_state.get("rotation")
+            if not isinstance(rotation, dict) or type(owner_state.get("window_generation")) is not int:
+                raise ContextRuntimeError("恢复 owner 状态无效")
+            if (rotation.get("request") is not None or rotation.get("clear") is not None
+                    or owner_state.get("continuation_hash") is not None
+                    or owner_state.get("pending_tool_ids")
+                    or owner_state.get("phase") in {"clear_sent", "awaiting_tui_prompt",
+                                                    "continuation_dispatching", "awaiting_continuation"}):
+                raise ContextRuntimeError("恢复 owner 仍有未结自动操作")
+            owner._catalogue_source(owner_state, require_existing=True)
+            authorization = owner_state.get("authorization")
+            if authorization is None:
+                return
+            owner._verify_authorization(owner_state)
+            owners.append((owner.conversation_id, {
+                "root_instruction_locator": deepcopy(authorization["root_instruction_locator"]),
+                "latest_instruction_locator": deepcopy(authorization["latest_instruction_locator"]),
+            }, self._lineage_catalogue_entries(owner, owner_state, authorization)))
+
+        consider(self, incoming_state)
+        root = self.directory.parent
+        try:
+            directories = sorted(root.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise ContextRuntimeError("无法枚举既有私有 context 状态") from exc
+        for directory in directories:
+            if directory == self.directory or not directory.is_dir() or directory.is_symlink():
+                continue
+            try:
+                owner = ContextRuntime(_uuid(directory.name, "context directory"),
+                                       configuration_reader=self.configuration_reader)
+                if owner.directory != directory:
+                    continue
+                owner_state = owner._state()
+            except (OSError, TypeError, ValueError, KeyError):
+                continue
+            consider(owner, owner_state)
+        if not owners:
+            return None
+        root_latest = (owners[0][1]["root_instruction_locator"], owners[0][1]["latest_instruction_locator"])
+        if any((authorization["root_instruction_locator"], authorization["latest_instruction_locator"])
+               != root_latest for _, authorization, _ in owners[1:]):
+            raise ContextRuntimeError("恢复来源存在相互冲突的已验证授权 lineage")
+        return min(owners, key=lambda owner: owner[0])[1:]
+
+    def _adopt_lineage_catalogue(self, candidate, incoming_state, source, references):
+        """Copy validated source references into this context without touching another owner's registry."""
+        entries = self._catalogue_entries(self)
+        floor = self._catalogue_floor(candidate, entries)
+        source_path = str(source.path)
+        target = (candidate["session_id"], source_path)
+        unique = []
+        seen = set()
+        for reference in references:
+            key = (reference["session_id"], reference["source_path"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(reference)
+        if target not in seen:
+            raise ContextRuntimeError("恢复 lineage 缺少当前来源引用")
+        local = {}
+        for entry in entries:
+            local.setdefault((entry["session_id"], entry["source_path"]), []).append(entry["generation"])
+        for reference in unique:
+            key = (reference["session_id"], reference["source_path"])
+            if key == target or key in local:
+                continue
+            floor += 1
+            probe = {"session_id": reference["session_id"], "source_path": reference["source_path"],
+                     "window_generation": floor}
+            self._catalogue_source(probe)
+            local[key] = [floor]
+        target_generations = local.get(target, [])
+        incoming_bound = self._same_resume_binding(incoming_state, *target, candidate["cwd"])
+        if incoming_bound and any(generation >= floor for generation in target_generations):
+            target_generation = max(generation for generation in target_generations if generation >= floor)
+        else:
+            floor += 1
+            target_generation = floor
+            self._catalogue_source({"session_id": target[0], "source_path": target[1],
+                                    "window_generation": target_generation})
+        candidate["window_generation"] = target_generation
+        candidate["rotation"]["generation"] = max(candidate["rotation"]["generation"], floor, target_generation)
+
+    def _bind_resume(self, state, event, sid, *, incoming_state=None):
+        """Bind an exact native resume source, including a verified prior owner for host-only windows."""
         self._resume_eligible(state, sid)
         source = _source(event.get("transcript_path"), sid)
         activity, latest = source.activity(), source.latest_usage()
@@ -136,29 +343,34 @@ class TuiRuntime(ContextRuntime):
             raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
         if activity["pending_tools"]:
             raise ContextRuntimeError("恢复来源仍有未结算的直接工具调用，不自动接管")
-        candidate = dict(state)
-        candidate["phase"], candidate["pause_reason"] = "running", None
-        candidate["rotation"] = {**state["rotation"], "request": None, "clear": None}
-        candidate["session_id"], candidate["source_path"], candidate["authorization"] = sid, None, None
-        candidate["native_context_window"] = None
-        candidate["usage"], candidate["budget_stream"], candidate["budget_handoff_signal"] = None, None, None
-        candidate["budget"] = {}
-        candidate.pop("output_budget", None)
-        candidate.pop("tool_batch_boundary", None)
-        candidate["deferred_inputs"] = []
-        catalogue = core.safe_path(self.directory, "history", exists=False)
-        for path in sorted(catalogue.glob(f"*-{sid}.json")):
-            known = core.read_json(core.safe_path(self.directory, path))
-            if known["session_id"] != sid or known["source_path"] != str(source.path):
-                raise ContextRuntimeError("恢复来源与已登记的原生历史不符")
-            candidate["window_generation"] = known["generation"]
-            break
-        candidate.pop("rotation_model", None)
-        candidate.pop("rotation_permission", None)
-        for key in ("stop_observed_at", "stop_text_hash", "stop_serial", "stop_turn_generation",
-                    "stop_snapshot", "settlement_stop_serial", "resume_safe_boundary", "resume_snapshot"):
-            candidate.pop(key, None)
-        source = self._bind(candidate, event)
+        incoming_state = state if incoming_state is None else incoming_state
+        candidate = self._resume_candidate(state, incoming_state, source, sid)
+        candidate["source_path"] = str(source.path)
+        bounds = source.instruction_bounds()
+        if bounds["first"] is None:
+            selected = self._resolve_resume_authorization(incoming_state, source, sid, state["cwd"])
+            if selected is None:
+                self._catalogue_source(candidate)
+                self._window(candidate, event)
+                observed = self._usage(candidate, True)
+                if observed is None:
+                    raise ContextRuntimeError("恢复来源没有可用的实际原生用量")
+                usage, _ = observed
+                candidate["native_session_model"] = usage["actual_model"]
+                candidate["phase"] = "paused"
+                candidate["pause_reason"] = "native history has no root user instruction"
+                candidate["observation_only_pause"] = True
+                state.clear()
+                state.update(candidate)
+                return
+            authorization, references = selected
+            candidate["authorization"] = deepcopy(authorization)
+            self._verify_authorization(candidate)
+            self._adopt_lineage_catalogue(candidate, incoming_state, source, references)
+            source = self._bind(candidate, event)
+        else:
+            source = self._bind(candidate, event)
+        self._verify_authorization(candidate)
         self._window(candidate, event)
         observed = self._usage(candidate, True)
         if observed is None:
@@ -167,7 +379,7 @@ class TuiRuntime(ContextRuntime):
         candidate["native_session_model"] = usage["actual_model"]
         candidate["resume_safe_boundary"] = True
         candidate["resume_snapshot"] = {
-            "instruction_head": candidate["authorization"]["latest_instruction_locator"],
+            "instruction_head": source.instruction_bounds()["last"],
             "usage_locator": usage["usage_locator"],
         }
         candidate["native_resume_confirmations"] = candidate.get("native_resume_confirmations", 0) + 1
@@ -352,6 +564,36 @@ class TuiRuntime(ContextRuntime):
             result["stopReason"] = "正在自动切换上下文；后台任务继续运行，后续输入和结果在新窗口处理。"
         return result
 
+    def _recover_prompt_observation(self, state, event):
+        """Let a genuine newly persisted user record restore an observation-only paused source."""
+        if state["phase"] != "paused" or not state.get("observation_only_pause"):
+            return False
+        if state["rotation"]["clear"] or state.get("continuation_hash") or state["pending_tool_ids"]:
+            return False
+        try:
+            self._verify_config(state)
+            self._bind(state, event)
+            self._verify_authorization(state)
+            self._window(state, event)
+            if self._usage(state, True) is None:
+                raise ContextRuntimeError("恢复来源没有可用的实际原生用量")
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+            return False
+        state["last_observation_pause"] = {"reason": state["pause_reason"],
+                                           "diagnostic": state.get("diagnostic")}
+        state["phase"] = "rotation_requested" if state["rotation"]["request"] else "running"
+        state["pause_reason"] = None
+        state.pop("diagnostic", None)
+        state.pop("observation_only_pause", None)
+        state["background_tool_ids"] = []
+        state["at_turn_boundary"] = False
+        state.pop("resume_safe_boundary", None)
+        state.pop("resume_snapshot", None)
+        state.pop("tool_batch_boundary", None)
+        state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
+        return True
+
     def _user_prompt(self, event):
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
@@ -361,6 +603,7 @@ class TuiRuntime(ContextRuntime):
                 result = self._hook_output(state, name)
                 self._save(state)
                 return result
+            self._recover_prompt_observation(state, event)
             prompt = event.get("prompt", "")
             own_input = isinstance(prompt, str) and core.digest(prompt.strip()) == state.get("continuation_hash")
             if state.get("continuation_hash") and not own_input:
@@ -440,7 +683,7 @@ class TuiRuntime(ContextRuntime):
                 elif duplicate:
                     pass
                 elif source == "resume":
-                    self._bind_resume(state, event, sid)
+                    self._bind_resume(state, event, sid, incoming_state=previous)
                 elif source == "clear" and sid != old_sid:
                     clear = state["rotation"]["clear"]
                     expected = (clear is not None and clear["old_session_id"] == old_sid

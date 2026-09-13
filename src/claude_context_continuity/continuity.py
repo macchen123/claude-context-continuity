@@ -229,7 +229,7 @@ def main():
         result = dispatch(args)
         core.no_secrets(result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        failed = isinstance(result, dict) and (result.get("status") == "paused" or
+        failed = isinstance(result, dict) and (result.get("status") == "paused" or result.get("phase") == "paused" or
                  args.action == "cron-compat" and result.get("status") in {"blocked", "error"})
         return 2 if failed else 0
     except (ValueError, OSError, KeyError, TypeError) as exc:

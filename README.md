@@ -197,6 +197,11 @@ Yes. All prior sessions in the task chain are indexed locally in SQLite FTS5. Us
 ### 4. Does this alter Claude Code's models, prompts, or permissions?
 No. You are still using native Claude Code. Your models, system prompts, MCP servers, and permission policies remain identical.
 
+### 5. What does “automatic context switching paused” mean?
+The native conversation and History/Notes remain available; only automatic switching is paused. Use `claude-context tui-status --context-id <context-id>` to check the reason. A `context-request` receipt with `phase: paused` exits with code `2`. An accepted request is not proof that a new window has opened; check the reported phase and native confirmation.
+
+If a resumed window has no genuine user instruction yet, the host tries to verify registered earlier instructions instead of treating its continuation message as new authorization. If no prior session is registered to reuse, it keeps observing the selected native session without switching automatically; a later genuine user record can restore automatic switching after validation.
+
 ---
 
 <a id="contributing"></a>

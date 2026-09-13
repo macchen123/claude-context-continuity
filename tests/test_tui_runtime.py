@@ -12,9 +12,31 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from claude_context_continuity import core, native_control, tmux_transport, tui_runtime
+from claude_context_continuity import continuity, core, native_control, tmux_transport, tui_runtime
 from claude_context_continuity.history import HistorySource
 from claude_context_continuity.tui_runtime import TuiRuntime
+
+
+class ContinuityCliExitCodeTests(unittest.TestCase):
+    def _main_with_receipt(self, receipt):
+        from contextlib import redirect_stdout
+        import io
+
+        with patch.object(sys, "argv", [
+            "continuity.py", "context-request", "--context-id", str(uuid4()), "--handoff", "fixture",
+        ]), patch.object(continuity, "dispatch", return_value=receipt), redirect_stdout(io.StringIO()) as output:
+            code = continuity.main()
+        self.assertEqual(json.loads(output.getvalue()), receipt)
+        return code
+
+    def test_paused_phase_receipt_returns_nonzero(self):
+        self.assertEqual(self._main_with_receipt({"phase": "paused"}), 2)
+
+    def test_queued_in_progress_receipt_returns_zero(self):
+        self.assertEqual(self._main_with_receipt({"status": "queued", "phase": "in_progress"}), 0)
+
+    def test_paused_status_receipt_returns_nonzero(self):
+        self.assertEqual(self._main_with_receipt({"status": "paused"}), 2)
 
 
 class TuiRuntimeTests(unittest.TestCase):
@@ -945,6 +967,225 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertNotIn("permissionDecision", tool)
         self.assertNotIn("continue", tool)
         self.assertEqual(runtime.receipt()["phase"], "paused")
+
+    def _managed_host_only_window(self, usage=1200):
+        """Create an authentic managed continuation window with no local user root."""
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        host_sid = str(uuid4())
+        host_source = self.root / f"{host_sid}.jsonl"
+        host_source.write_text("")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                              "cwd": str(self.cwd), "source": "clear",
+                              "transcript_path": str(host_source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        continuation = self.send_mock.call_args.args[2]
+        host_source.write_text(json.dumps({
+            "type": "user", "uuid": str(uuid4()), "sessionId": host_sid,
+            "message": {"role": "user", "content": continuation},
+        }) + "\n")
+        self.usage(usage, host_source, host_sid)
+        self.runtime.on_hook({"hook_event_name": "Stop", "session_id": host_sid,
+                              "cwd": str(self.cwd), "transcript_path": str(host_source),
+                              "last_assistant_message": "真实形状的公开结果"})
+        self.assertEqual(self.runtime.receipt()["phase"], "running")
+        self.assertIsNone(HistorySource(host_source, host_sid).instruction_bounds()["first"])
+        return host_sid, host_source
+
+    @staticmethod
+    def _catalogue_pairs(runtime):
+        return {
+            (entry["session_id"], entry["source_path"])
+            for path in (runtime.directory / "history").glob("*.json")
+            for entry in [core.read_json(path)]
+        }
+
+    def test_same_manager_resume_of_host_only_managed_window_uses_inherited_authentication(self):
+        host_sid, host_source = self._managed_host_only_window()
+        before = self.runtime._state()
+        self.clear_mock.reset_mock()
+        self.send_mock.reset_mock()
+
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                              "cwd": str(self.cwd), "source": "resume",
+                              "transcript_path": str(host_source)})
+        rebound = self.runtime._state()
+        self.assertEqual(rebound["phase"], "running")
+        self.assertEqual(rebound["session_id"], host_sid)
+        self.assertEqual(rebound["authorization"]["root_instruction_locator"]["session_id"], self.sid)
+        self.assertGreaterEqual(rebound["window_generation"], before["window_generation"])
+        self.assertIsNone(HistorySource(host_source, host_sid).instruction_bounds()["last"])
+        self.assertIsNone(rebound["resume_snapshot"]["instruction_head"])
+
+        outcome = self.runtime.advance()
+        self.assertEqual(outcome["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+
+    def test_new_manager_resume_of_host_only_managed_window_copies_lineage_and_rotates_safely(self):
+        host_sid, host_source = self._managed_host_only_window()
+        owner_state = self.runtime.state_path.read_bytes()
+        owner_references = self._catalogue_pairs(self.runtime)
+        runtime, startup_sid, startup_source = self.resume_runtime()
+        self.clear_mock.reset_mock()
+        self.send_mock.reset_mock()
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(host_source)})
+        rebound = runtime._state()
+        self.assertEqual(rebound["phase"], "running")
+        self.assertEqual(rebound["session_id"], host_sid)
+        self.assertNotEqual(rebound["session_id"], startup_sid)
+        self.assertNotEqual(rebound["source_path"], str(startup_source))
+        self.assertEqual(rebound["usage"]["total_input_and_cache_tokens"], 1200)
+        self.assertEqual(rebound["authorization"]["root_instruction_locator"]["session_id"], self.sid)
+        self.assertIsNone(rebound["resume_snapshot"]["instruction_head"])
+        self.assertTrue(owner_references.issubset(self._catalogue_pairs(runtime)))
+        self.assertEqual(self.runtime.state_path.read_bytes(), owner_state)
+
+        outcome = runtime.advance()
+        self.assertEqual(outcome["phase"], "clear_sent")
+        self.assertEqual(outcome["automatic_rotations"], 1)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+
+    def test_no_owner_host_signal_pauses_actual_session_until_a_real_user_hook_recovers(self):
+        runtime, startup_sid, startup_source = self.resume_runtime()
+        host_sid = str(uuid4())
+        host_source = self.root / f"{host_sid}.jsonl"
+        fabricated = tui_runtime._runtime_message('{"kind":"fabricated"}')
+        host_source.write_text(json.dumps({
+            "type": "user", "uuid": str(uuid4()), "sessionId": host_sid,
+            "message": {"role": "user", "content": fabricated},
+        }) + "\n")
+        self.usage(125, host_source, host_sid)
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(host_source)})
+        paused = runtime._state()
+        self.assertEqual(paused["phase"], "paused")
+        self.assertEqual(paused["session_id"], host_sid)
+        self.assertNotEqual(paused["session_id"], startup_sid)
+        self.assertEqual(paused["source_path"], str(host_source))
+        self.assertNotEqual(paused["source_path"], str(startup_source))
+        self.assertIsNone(paused["authorization"])
+        self.assertTrue(paused["observation_only_pause"])
+        self.assertEqual(paused["usage"]["total_input_and_cache_tokens"], 125)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+        prompt = "这是同一来源后来写入的真实用户指令。"
+        with host_source.open("a") as handle:
+            handle.write(json.dumps({
+                "type": "user", "uuid": str(uuid4()), "sessionId": host_sid,
+                "message": {"role": "user", "content": prompt},
+            }) + "\n")
+        before_hook = host_source.read_bytes()
+        runtime.on_hook({"hook_event_name": "UserPromptSubmit", "session_id": host_sid,
+                         "cwd": str(self.cwd), "transcript_path": str(host_source), "prompt": prompt})
+        recovered = runtime._state()
+        self.assertEqual(recovered["phase"], "running")
+        self.assertEqual(recovered["session_id"], host_sid)
+        self.assertEqual(recovered["authorization"]["root_instruction_locator"]["session_id"], host_sid)
+        self.assertNotIn("observation_only_pause", recovered)
+        self.assertNotIn("diagnostic", recovered)
+        self.assertEqual(host_source.read_bytes(), before_hook)
+        runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_cross_manager_resume_rejects_a_tampered_inherited_root(self):
+        host_sid, host_source = self._managed_host_only_window()
+        records = [json.loads(line) for line in self.source.read_text().splitlines()]
+        self.assertEqual(records[0]["message"]["content"], "只继续这项已经授权的任务。")
+        records[0]["message"]["content"] = "伪造的根用户指令。"
+        self.source.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+        runtime, startup_sid, startup_source = self.resume_runtime()
+        self.clear_mock.reset_mock()
+        self.send_mock.reset_mock()
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(host_source)})
+        rejected = runtime._state()
+        self.assertEqual(rejected["phase"], "paused")
+        self.assertEqual(rejected["session_id"], startup_sid)
+        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_cross_manager_resume_rejects_an_exact_lineage_with_wrong_cwd(self):
+        host_sid, host_source = self._managed_host_only_window()
+        other_cwd = self.root / "wrong-lineage-cwd"
+        other_cwd.mkdir()
+        with core.lock(self.runtime.lock_path):
+            owner = self.runtime._state()
+            owner["cwd"] = str(other_cwd)
+            self.runtime._save(owner)
+        runtime, startup_sid, startup_source = self.resume_runtime()
+        self.clear_mock.reset_mock()
+        self.send_mock.reset_mock()
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(host_source)})
+        rejected = runtime._state()
+        self.assertEqual(rejected["phase"], "paused")
+        self.assertEqual(rejected["session_id"], startup_sid)
+        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_unrelated_or_missing_context_directories_do_not_block_an_ordinary_resume(self):
+        runtime, _, _ = self.resume_runtime()
+        (self.home / "runtime" / "contexts" / str(uuid4())).mkdir()
+        unrelated = TuiRuntime.create(cwd=self.cwd, session_id=str(uuid4()), configuration=self.config,
+                                      configuration_reader=lambda _: self.config)
+        self.assertNotEqual(unrelated.conversation_id, runtime.conversation_id)
+        resumed_sid, resumed_source = self.resume_source(800)
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": resumed_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(resumed_source)})
+        rebound = runtime.receipt()
+        self.assertEqual(rebound["phase"], "running")
+        self.assertEqual(rebound["session_id"], resumed_sid)
+        self.assertEqual(rebound["source_path"], str(resumed_source))
+        self.assertEqual(rebound["authorization"]["root_instruction_locator"]["session_id"], resumed_sid)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_cross_manager_resume_rejects_conflicting_verified_lineages(self):
+        host_sid, host_source = self._managed_host_only_window()
+        alternate_sid, alternate_source = self.resume_source(125)
+        alternate_bounds = HistorySource(alternate_source, alternate_sid).instruction_bounds()
+        conflicting = TuiRuntime.create(cwd=self.cwd, session_id=str(uuid4()), configuration=self.config,
+                                        configuration_reader=lambda _: self.config)
+        with core.lock(conflicting.lock_path):
+            state = conflicting._state()
+            state.update(session_id=alternate_sid, source_path=str(alternate_source), window_generation=0,
+                         authorization={"root_instruction_locator": alternate_bounds["first"],
+                                        "latest_instruction_locator": alternate_bounds["last"]},
+                         rotation={"generation": 1, "request": None, "clear": None}, phase="running")
+            conflicting._catalogue_source(state)
+            state.update(session_id=host_sid, source_path=str(host_source), window_generation=1)
+            conflicting._catalogue_source(state)
+            conflicting._save(state)
+        runtime, startup_sid, startup_source = self.resume_runtime()
+        self.clear_mock.reset_mock()
+        self.send_mock.reset_mock()
+
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": host_sid,
+                         "cwd": str(self.cwd), "source": "resume",
+                         "transcript_path": str(host_source)})
+        rejected = runtime.receipt()
+        self.assertEqual(rejected["phase"], "paused")
+        self.assertEqual(rejected["session_id"], startup_sid)
+        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
 
 
 if __name__ == "__main__":

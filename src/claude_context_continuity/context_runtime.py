@@ -48,6 +48,10 @@ class ContextRuntimeError(ValueError):
     pass
 
 
+class MissingRootAuthorization(ContextRuntimeError):
+    """The exact native source has no authentic root user instruction yet."""
+
+
 def _budget_number(value: Any, label: str, *, positive: bool = False) -> int:
     if type(value) is not int or value < 0 or (positive and value == 0):
         raise ContextRuntimeError(f"{label} must be a {'positive ' if positive else ''}non-negative integer")
@@ -359,30 +363,38 @@ class ContextRuntime:
         bounds = source.instruction_bounds()
         if state["authorization"] is None:
             if bounds["first"] is None:
-                raise ContextRuntimeError("native history has no root user instruction")
+                raise MissingRootAuthorization("native history has no root user instruction")
             state["authorization"] = {"root_instruction_locator": bounds["first"],
                                       "latest_instruction_locator": bounds["last"]}
         elif bounds["last"] is not None:
             state["authorization"]["latest_instruction_locator"] = bounds["last"]
         return source
 
-    def _catalogue_source(self, state: dict[str, Any]) -> None:
+    def _catalogue_source(self, state: dict[str, Any], *, require_existing: bool = False) -> dict[str, Any] | None:
         """历史登记不依赖交接、用户首条输入或自动换窗是否可用。"""
         path = state.get("source_path")
         if path is None:
-            return
+            return None
+        if not isinstance(path, str):
+            raise ContextRuntimeError("native history catalogue source is invalid")
+        session_id = _uuid(state.get("session_id"), "catalogue session_id")
         native_path = Path(path)
-        if (not native_path.is_absolute() or native_path.name != f"{state['session_id']}.jsonl"
+        if (not native_path.is_absolute() or native_path.name != f"{session_id}.jsonl"
                 or native_path.resolve(strict=False) != native_path):
             raise ContextRuntimeError("native history catalogue source is invalid")
-        generation = state["window_generation"]
-        window = self.directory / "history" / f"{generation:08d}-{state['session_id']}.json"
-        binding = {"source_path": path, "session_id": state["session_id"], "generation": generation}
+        generation = state.get("window_generation")
+        if type(generation) is not int or generation < 0:
+            raise ContextRuntimeError("native history catalogue generation is invalid")
+        window = self.directory / "history" / f"{generation:08d}-{session_id}.json"
+        binding = {"source_path": path, "session_id": session_id, "generation": generation}
         if window.exists():
             if core.read_json(window) != binding:
                 raise ContextRuntimeError("native history catalogue drifted")
+        elif require_existing:
+            raise ContextRuntimeError("native history catalogue entry is unavailable")
         else:
             core.atomic(window, binding, exclusive=True)
+        return binding
 
     @staticmethod
     def _hook_output(state: dict[str, Any], name: str, context: str | None = None) -> dict[str, Any]:
@@ -461,6 +473,7 @@ class ContextRuntime:
         return result
 
     def _verify_authorization(self, state: dict[str, Any]) -> None:
+        """Verify exact native bytes and user-record classification for both authority locators."""
         auth = state["authorization"]
         if not isinstance(auth, dict):
             raise ContextRuntimeError("original native authorization references are unavailable")
@@ -469,9 +482,16 @@ class ContextRuntime:
             if not isinstance(locator, dict):
                 raise ContextRuntimeError("native authorization locator is incomplete")
             try:
-                _locator_source(locator).read(locator, limit=1)
-            except HistoryError as exc:
+                source = _source(locator["source_path"], _uuid(locator["session_id"], "authorization session_id"))
+                canonical = source.read(locator, limit=1)["locator"]
+                if canonical.get("source_kind") not in {"original_user", "verified_user_answer"}:
+                    raise ContextRuntimeError("native authorization locator is not a verified user instruction")
+                bounds = source.instruction_bounds()
+            except (KeyError, OSError, TypeError, HistoryError) as exc:
                 raise ContextRuntimeError("native authorization locator drifted") from exc
+            expected = bounds["first"] if key == "root_instruction_locator" else bounds["last"]
+            if expected != canonical:
+                raise ContextRuntimeError("native authorization locator drifted")
 
     def _latest_before_clear(self, state: dict[str, Any]) -> None:
         try:

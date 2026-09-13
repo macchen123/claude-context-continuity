@@ -197,6 +197,11 @@ ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-continuity/
 ### 4. 它改变了原生 Claude Code 的模型或工具能力吗？
 没有。你使用的仍然是原生 Claude Code，模型、系统提示词、MCP 工具以及权限系统均原封不动。
 
+### 5. “自动换窗已暂停”是什么意思？
+原生对话和 History/Notes 仍可使用，只暂停自动换窗。用 `claude-context tui-status --context-id <context-id>` 查看具体原因。`context-request` 回执为 `phase: paused` 时，退出码为 `2`。请求被接受不等于新窗口已经打开，应以实际阶段和原生确认记录为准。
+
+如果恢复窗口尚无真实用户指令，宿主会尝试核验已登记的早期指令，不会把接续消息当成新授权。找不到可复用的会话登记时，仍会跟踪已选中的原生会话，但不自动换窗；后续真实用户记录通过核验后，可以恢复自动换窗。
+
 ---
 
 <a id="contributing"></a>
