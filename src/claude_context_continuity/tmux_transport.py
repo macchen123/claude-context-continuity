@@ -18,6 +18,7 @@ from . import core
 
 TMUX = "tmux"
 SESSION_NAME = "continuity"
+TMUX_COMMAND_TIMEOUT_SECONDS = 5
 _CREATE_FORMAT = "#{pane_id}\t#{pane_pid}\t#{pid}\t#{session_name}\t#{pane_current_command}"
 _INSPECT_FORMAT = ("#{pane_id}\t#{pane_pid}\t#{pid}\t#{session_name}\t#{pane_dead}\t"
                    "#{cursor_x}\t#{cursor_y}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}")
@@ -209,6 +210,7 @@ def _run(command: list[str], *, cwd: Path | None = None,
         "encoding": "utf-8",
         "errors": "strict",
         "check": False,
+        "timeout": TMUX_COMMAND_TIMEOUT_SECONDS,
     }
     if cwd is not None:
         kwargs["cwd"] = str(cwd)
@@ -216,6 +218,8 @@ def _run(command: list[str], *, cwd: Path | None = None,
         kwargs["env"] = environment
     try:
         completed = subprocess.run(command, **kwargs)
+    except subprocess.TimeoutExpired:
+        _fail("tmux client 命令超时")
     except (OSError, subprocess.SubprocessError):
         _fail("tmux client 无法执行")
     if getattr(completed, "returncode", 1) != 0:

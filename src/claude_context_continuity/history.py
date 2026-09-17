@@ -354,12 +354,12 @@ class HistorySource:
         defer_incomplete_tail: bool = False,
         _report_deferred_tail: bool = False,
     ) -> list[_Record] | tuple[list[_Record], bool]:
-        """Read the canonical stream, with one index-only incomplete-tail mode.
+        """Read the canonical stream, with an opt-in incomplete-tail mode.
 
-        Ordinary public HistorySource operations retain strict JSONL behavior.  The
-        index projection is allowed to defer only an unterminated final append so
-        an actively written native transcript does not turn a prior valid prefix
-        into a false parser failure.  A complete malformed line remains an error.
+        Ordinary public HistorySource operations retain strict JSONL behavior. The
+        index and runtime snapshots may defer an unterminated final append so an
+        actively written transcript does not invalidate its complete prefix.
+        A complete malformed line remains an error.
         """
         if type(include_task_notifications) is not bool:
             raise HistoryError("include_task_notifications must be a boolean")
@@ -667,7 +667,10 @@ class HistorySource:
 
     def latest_usage(self) -> dict[str, Any]:
         """只投影准确主会话最后一次模型调用的用量，不返回文本或思考。"""
-        records = self._records()
+        return self._usage_from_records(self._records())
+
+    def _usage_from_records(self, records: list[_Record]) -> dict[str, Any]:
+        """复用本轮已验证的记录；不持有跨调用的全文缓存。"""
         for info in reversed(records):
             if info.kind != "assistant":
                 continue
@@ -738,7 +741,9 @@ class HistorySource:
 
     def instruction_bounds(self) -> dict[str, Any]:
         """只返回真实用户指令的首尾定位；没有指令与来源损坏分开处理。"""
-        records = self._records()
+        return self._bounds_from_records(self._records())
+
+    def _bounds_from_records(self, records: list[_Record]) -> dict[str, Any]:
         pairs = self._pairs(records)
         selected = [info for info in records if self._kind(info, pairs) in {"original_user", "verified_user_answer"}]
         if not selected:

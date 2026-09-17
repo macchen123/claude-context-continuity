@@ -73,6 +73,59 @@ class TmuxTransportTests(unittest.TestCase):
             "#{cursor_x}\t#{cursor_y}\t#{pane_width}\t#{pane_height}\t#{pane_current_command}",
         ]
 
+    def test_run_passes_bounded_timeout_and_preserves_success_behavior(self) -> None:
+        command = ["tmux", "-S", "mock.socket", "list-panes"]
+        environment = {"PATH": "/usr/bin", "MOCK_VALUE": "in-memory-only"}
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_run(args, **kwargs):
+            calls.append((list(args), kwargs))
+            return self._result(args, "one record\n")
+
+        with patch.object(tmux_transport.subprocess, "run", side_effect=fake_run):
+            output = tmux_transport._run(command, cwd=self.cwd, environment=environment)
+
+        self.assertEqual(tmux_transport.TMUX_COMMAND_TIMEOUT_SECONDS, 5)
+        self.assertEqual(output, "one record\n")
+        self.assertEqual(calls[0][0], command)
+        self.assertEqual(calls[0][1], {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "strict",
+            "check": False,
+            "timeout": tmux_transport.TMUX_COMMAND_TIMEOUT_SECONDS,
+            "cwd": str(self.cwd),
+            "env": environment,
+        })
+        self.assertIs(calls[0][1]["env"], environment)
+
+    def test_run_timeout_raises_distinct_sanitized_transport_error(self) -> None:
+        command = ["tmux", "-S", "mock-command-only-value", "capture-pane"]
+        environment = {"MOCK_ENV_ONLY": "mock-env-only-value"}
+        timeout = subprocess.TimeoutExpired(
+            command,
+            tmux_transport.TMUX_COMMAND_TIMEOUT_SECONDS,
+            output="mock-stdout-only-value",
+            stderr="mock-stderr-only-value",
+        )
+
+        with patch.object(tmux_transport.subprocess, "run", side_effect=timeout):
+            with self.assertRaises(tmux_transport.TmuxTransportError) as raised:
+                tmux_transport._run(command, environment=environment)
+
+        message = str(raised.exception)
+        self.assertEqual(message, "tmux client 命令超时")
+        for private_value in (command[2], *environment.values(), "mock-stdout-only-value", "mock-stderr-only-value"):
+            self.assertNotIn(private_value, message)
+
+        with patch.object(tmux_transport.subprocess, "run", side_effect=OSError("mock-os-error-only-value")):
+            with self.assertRaises(tmux_transport.TmuxTransportError) as generic_raised:
+                tmux_transport._run(command)
+        self.assertEqual(str(generic_raised.exception), "tmux client 无法执行")
+        self.assertNotEqual(message, str(generic_raised.exception))
+
     def test_create_uses_short_private_socket_and_one_shell_command(self) -> None:
         path = self._short_socket_path()
         environment = {"PATH": "/usr/bin", "TEST_ONLY_TOKEN": "kept-in-memory"}
@@ -102,6 +155,7 @@ class TmuxTransportTests(unittest.TestCase):
             self.assertEqual(kwargs["env"], environment)
             self.assertIsNot(kwargs["env"], environment)
             self.assertEqual(kwargs["cwd"], str(self.cwd))
+            self.assertEqual(kwargs["timeout"], tmux_transport.TMUX_COMMAND_TIMEOUT_SECONDS)
             self.assertNotIn("input", kwargs)
             self.assertNotIn("shell", kwargs)
         self.assertTrue(all(command[1:3] == ["-S", str(path)] for command, _ in calls))
@@ -202,6 +256,7 @@ class TmuxTransportTests(unittest.TestCase):
             "encoding": "utf-8",
             "errors": "strict",
             "check": False,
+            "timeout": tmux_transport.TMUX_COMMAND_TIMEOUT_SECONDS,
         })])
         self.assertEqual(tmux_transport.attach_argv(observed), [
             "tmux", "-S", str(path), "attach-session", "-t", "continuity",

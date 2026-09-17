@@ -190,7 +190,7 @@ def dispatch(args):
             return tui_runtime.attach(args.context_id)
         if args.action == "tui-recover":
             return tui_runtime.recover(args.context_id, args.session_id)
-        return tui_runtime.TuiRuntime.load(args.context_id).receipt()
+        return tui_runtime.status(args.context_id)
     if args.action == "context-run":
         from . import tui_runtime
         prompt = Path(args.prompt_file).read_text() if args.prompt_file else args.prompt

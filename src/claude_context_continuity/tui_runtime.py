@@ -386,15 +386,15 @@ class TuiRuntime(ContextRuntime):
         state.clear()
         state.update(candidate)
 
-    def _resume_flushed(self, state, source):
+    def _resume_flushed(self, state, source, records):
         """恢复后的首次清空只接受未被并发来源改写的精确历史快照。"""
         snapshot = state.get("resume_snapshot")
         if not isinstance(snapshot, dict):
             raise ContextRuntimeError("恢复安全边界缺少历史快照")
-        if source.instruction_bounds()["last"] != snapshot.get("instruction_head"):
+        if source._bounds_from_records(records)["last"] != snapshot.get("instruction_head"):
             self._pause(state, "恢复来源在首次安全边界前收到新的用户指令，不自动清空")
             return False
-        if source.latest_usage()["locator"] != snapshot.get("usage_locator"):
+        if source._usage_from_records(records)["locator"] != snapshot.get("usage_locator"):
             self._pause(state, "恢复来源在首次安全边界前发生新的模型活动，不自动清空")
             return False
         return True
@@ -767,7 +767,7 @@ class TuiRuntime(ContextRuntime):
             self._save(state)
             return self._receipt(state)
 
-    def _boundary_flushed(self, state, source):
+    def _boundary_flushed(self, state, source, records):
         if state.get("deferred_inputs"):
             return self._deferred_input_locators(state) is not None
         batch = state.get("tool_batch_boundary")
@@ -776,16 +776,15 @@ class TuiRuntime(ContextRuntime):
                     or batch["turn_generation"] != state.get("turn_generation", 0)):
                 state["at_turn_boundary"] = False
                 return False
-            return source.latest_usage()["locator"] == batch["usage_locator"]
-        return self._stop_flushed(state, source)
+            return source._usage_from_records(records)["locator"] == batch["usage_locator"]
+        return self._stop_flushed(state, source, records)
 
-    def _stop_flushed(self, state, source):
+    def _stop_flushed(self, state, source, records):
         from .history import _content, _texts
         if state.get("turn_generation", 0) != state.get("stop_turn_generation", 0):
             state["at_turn_boundary"] = False
             return False
-        records = source._records()
-        head = source.instruction_bounds()["last"]
+        head = source._bounds_from_records(records)["last"]
         if head != state.get("stop_snapshot", {}).get("instruction_head"):
             info = next((row for row in records if head is not None and row.message_id == head["message_id"]), None)
             if info is None or info.data.get("type") != "attachment":
@@ -845,9 +844,17 @@ class TuiRuntime(ContextRuntime):
             state["at_turn_boundary"] = False
         return observed
 
+    @staticmethod
+    def _history_stamp(state):
+        source = _source(state["source_path"], state["session_id"])
+        stat = source.path.stat()
+        return source, (str(source.path), source.session_id, stat.st_dev, stat.st_ino,
+                        stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
     def advance(self):
         from . import tmux_transport
         action = None
+        idle_stamp = None
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
             if state["phase"] in {"paused", "closed"} or not state.get("tmux"):
@@ -872,13 +879,21 @@ class TuiRuntime(ContextRuntime):
                         action = ("continue", text, control)
                 elif state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}:
                     if (state.get("at_turn_boundary") or state.get("resume_safe_boundary")) and state.get("source_path"):
-                        source = HistorySource(Path(state["source_path"]), state["session_id"])
+                        source, stamp = self._history_stamp(state)
+                        if getattr(self, "_idle_observation", None) == (stamp, core.digest(state)):
+                            return self._receipt(state)
+                        self._idle_observation = None
+                        records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
+                        if incomplete or self._history_stamp(state)[1] != stamp:
+                            self._save(state)
+                            return self._receipt(state)
                         resuming = bool(state.get("resume_safe_boundary"))
-                        stable = self._resume_flushed(state, source) if resuming else self._boundary_flushed(state, source)
+                        stable = (self._resume_flushed(state, source, records) if resuming
+                                  else self._boundary_flushed(state, source, records))
                         if not stable:
                             self._save(state)
                             return self._receipt(state)
-                        self._usage(state, True)
+                        self._usage(state, True, sample=source._usage_from_records(records))
                         self._automatic_rotation(state)
                         if state["rotation"]["request"]:
                             activity = source.activity()
@@ -899,6 +914,8 @@ class TuiRuntime(ContextRuntime):
                             state.pop("resume_safe_boundary", None)
                             state.pop("resume_snapshot", None)
                             state["at_turn_boundary"] = False
+                        if not state["rotation"]["request"]:
+                            idle_stamp = stamp
             except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
                 try:
                     os.kill(state["tmux"]["pane_pid"], 0)
@@ -908,6 +925,9 @@ class TuiRuntime(ContextRuntime):
                 else:
                     self._pause(state, redact(str(exc), core.secret_values())[:400])
             self._save(state)
+            # 只保留来源元数据和状态摘要，不跨轮持有历史正文。
+            if idle_stamp is not None and state["phase"] == "running":
+                self._idle_observation = (idle_stamp, core.digest(state))
         if action:
             try:
                 with core.lock(self.lock_path, wait_seconds=5):
@@ -969,23 +989,129 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
     return runtime
 
 
-def serve(context_id):
+def _pid_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return True
+
+
+def _controller_locked(runtime):
+    import fcntl
+    path = core.safe_path(runtime.directory, "controller.lock", exists=False)
+    try:
+        with path.open("r") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def _controller_diagnostic(runtime, status, error):
+    # 仅记录固定错误码，不记录异常文本、命令、环境或凭证。
+    try:
+        core.atomic(runtime.directory / "controller-diagnostic.json", {
+            "context_id": runtime.conversation_id, "controller_pid": os.getpid(),
+            "status": status, "last_error": error,
+        }, skip_unchanged=True)
+    except (OSError, ValueError):
+        print("cclaude 控制器诊断无法落盘；请用 tui-status 核对实际进程。", file=sys.stderr)
+
+
+def _health(runtime, state):
+    from . import tmux_transport
+    result = {"controller_pid_alive": _pid_alive(state.get("controller_pid")),
+              "pane_pid_alive": _pid_alive(state.get("owned_pid")),
+              "controller_lock_held": None, "tmux_ready": False, "control_socket_ready": False}
+    try:
+        result["controller_lock_held"] = _controller_locked(runtime)
+    except (OSError, ValueError):
+        pass
+    try:
+        tmux_transport.inspect(state["tmux"])
+        result["tmux_ready"] = True
+        result["control_socket_ready"] = native_control.ready(state["native_control"])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    try:
+        diagnostic_path = core.safe_path(runtime.directory, "controller-diagnostic.json", exists=False)
+        if diagnostic_path.exists():
+            diagnostic = core.read_json(diagnostic_path)
+            if (diagnostic["context_id"] != runtime.conversation_id
+                    or diagnostic["status"] not in {"waiting_for_state_lock", "running", "failed"}
+                    or diagnostic["last_error"] not in {"state_lock_busy", "state_or_io_failure"}
+                    or type(diagnostic["controller_pid"]) is not int):
+                raise ValueError
+            result["controller_diagnostic"] = {key: diagnostic[key] for key in (
+                "controller_pid", "status", "last_error")}
+    except (OSError, ValueError, KeyError, TypeError):
+        result["controller_diagnostic"] = {"status": "unavailable"}
+    if not result["tmux_ready"]:
+        result["status"] = "native_session_unavailable"
+    elif not result["controller_lock_held"] or result["controller_pid_alive"] is not True:
+        result["status"] = "controller_unavailable"
+    elif not result["control_socket_ready"]:
+        result["status"] = "control_channel_unavailable"
+    elif state["phase"] in {"paused", "closed"}:
+        result["status"] = "automation_paused"
+    else:
+        result["status"] = "healthy"
+    return result
+
+
+def status(context_id):
+    """只读核对保存的状态和实际进程；健康观测不回写业务状态。"""
     runtime = TuiRuntime.load(context_id)
+    with core.lock(runtime.lock_path, wait_seconds=5):
+        state = runtime._state()
+    return runtime._receipt(state) | {"health": _health(runtime, state)}
+
+
+def serve(context_id):
+    runtime = TuiRuntime(context_id)
     with core.lock(runtime.directory / "controller.lock", wait_seconds=5):
+        registered, waiting = False, False
         while True:
-            outcome = runtime.advance()
-            if outcome["phase"] == "closed":
-                return outcome
-            if outcome["phase"] == "paused":
-                try:
-                    os.kill(outcome["owned_pid"], 0)
-                except ProcessLookupError:
+            try:
+                if not registered:
+                    with core.lock(runtime.lock_path, wait_seconds=5):
+                        state = runtime._state()
+                        state["controller_pid"] = os.getpid()
+                        runtime._save(state)
+                    registered = True
+                outcome = runtime.advance()
+                if waiting:
+                    _controller_diagnostic(runtime, "running", "state_lock_busy")
+                    waiting = False
+                if outcome["phase"] == "closed":
+                    return outcome
+                if outcome["phase"] == "paused" and _pid_alive(outcome["owned_pid"]) is False:
                     with core.lock(runtime.lock_path, wait_seconds=5):
                         state = runtime._state()
                         state["phase"] = "closed"
                         state["native_process_exited"] = True
                         runtime._save(state)
-                    return runtime.receipt()
+                    return runtime._receipt(state)
+            except core.LockBusy:
+                if not waiting:
+                    _controller_diagnostic(runtime, "waiting_for_state_lock", "state_lock_busy")
+                    waiting = True
+            except Exception:
+                _controller_diagnostic(runtime, "failed", "state_or_io_failure")
+                try:
+                    return runtime._pause_external("控制器状态读取或写入失败；自动换窗已暂停，请用 tui-status 检查后恢复")
+                except Exception:
+                    return {"phase": "paused", "controller_error": "state_or_io_failure",
+                            "state_persisted": False, "context_id": runtime.conversation_id}
             time.sleep(0.25)
 
 
@@ -1024,6 +1150,9 @@ def recover(context_id, session_id):
                     or os.environ.get(native_control.SOCKET_ENV) != control["socket_path"]):
                 raise ContextRuntimeError("恢复需要对应受管终端的原生通道环境；不从其他会话接管")
             control_env = native_control.environment(control, os.environ.get(native_control.AUTH_ENV))
+            tmux_transport.inspect(state["tmux"])
+            if not native_control.ready(control):
+                raise ContextRuntimeError("原生控制通道不可用；保留现有终端，不启动控制器")
         runtime.recover_observation(session_id)
         with core.lock(runtime.lock_path, wait_seconds=5):
             state = runtime._state()
@@ -1044,5 +1173,11 @@ def attach(context_id):
     runtime = TuiRuntime.load(context_id)
     with core.lock(runtime.lock_path, wait_seconds=5):
         state = runtime._state()
-    tmux_transport.inspect(state["tmux"])
-    return {"returncode": subprocess.run(tmux_transport.attach_argv(state["tmux"]), check=False).returncode}
+    health = _health(runtime, state)
+    if not health["tmux_ready"]:
+        raise ContextRuntimeError("原生 tmux 会话不可用或身份不符；不能只靠 attach 恢复，请查看 tui-status")
+    if health["status"] != "healthy":
+        print("cclaude 自动换窗未就绪；attach 只连接原生终端，不重启控制器。"
+              "请在对应受管终端内检查 tui-status，再按准确 session_id 使用 tui-recover。", file=sys.stderr)
+    return {"returncode": subprocess.run(tmux_transport.attach_argv(state["tmux"]), check=False).returncode,
+            "health": health}
