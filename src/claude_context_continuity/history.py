@@ -22,7 +22,7 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CHARS, _MAX_RECORDS = 8_000, 20
 _MAX_UPDATE_RECORDS, _MAX_UPDATE_BYTES = 32, 64 * 1024
 _META = frozenset({"system", "file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "custom-title", "progress", "agent-progress", "session-start", "session-end", "context", "compaction", "hook", "notification", "meta"})
-_STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "cost-state"})
+_STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "cost-state", "pr-link"})
 _META = _META | _STATE_ONLY
 _RUNTIME = ("<system-reminder>", "<task-notification>", "[request interrupted", "<local-command-",
             "<cross-session-message", "<teammate-message", "[cross-session idle notice]",

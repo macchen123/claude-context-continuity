@@ -51,6 +51,37 @@ class HistorySourceTests(unittest.TestCase):
     def source(self) -> HistorySource:
         return HistorySource(self.path, self.SID)
 
+    def test_pr_link_metadata_without_uuid_preserves_history_and_usage(self) -> None:
+        original = self.record("user-1", "user", "continue the authorized task")
+        assistant = self.record("assistant-1", "assistant", "public result")
+        assistant["message"].update(model="native-model", usage={
+            "input_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        link = {"type": "pr-link", "sessionId": self.SID, "prNumber": 1,
+                "prUrl": "https://github.com/example/project/pull/1", "prRepository": "example/project",
+                "timestamp": "2026-09-18T00:00:00.000Z"}
+        self.write_records(original, assistant)
+        before = self.source().instruction_bounds()
+        with self.path.open("ab") as handle:
+            handle.write(self.line(link) * 2)
+        self.assertEqual(source_kind(link), "meta")
+        self.assertEqual(self.source().instruction_bounds(), before)
+        self.assertEqual(self.source().latest_usage()["total_input_tokens"], 125)
+        self.assertEqual(self.source().activity(), {"pending_tools": {}, "background_handles": {}})
+        self.assertEqual([record.message_id for record in self.source()._records()], ["user-1", "assistant-1"])
+        self.assertEqual(self.source().read(before["last"])["text"], "continue the authorized task")
+
+    def test_pr_link_still_checks_session_and_unknown_record_types_still_fail(self) -> None:
+        original = self.record("user-1", "user", "authorized task")
+        cases = [
+            ({"type": "pr-link", "sessionId": str(uuid4())}, "another session"),
+            ({"type": "future-unrecognized-record", "sessionId": self.SID}, "unknown record type"),
+        ]
+        for extra, reason in cases:
+            with self.subTest(record_type=extra["type"]):
+                self.write_records(original, extra)
+                with self.assertRaisesRegex(HistoryError, reason):
+                    self.source().instruction_bounds()
+
     def test_activity_settles_native_backgrounds_but_not_pasted_notices(self) -> None:
         launch = self.record("launch", "assistant", [{"type": "tool_use", "id": "call-1",
                             "name": "Agent", "input": {"prompt": "bounded task"}}])

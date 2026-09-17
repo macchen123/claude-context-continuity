@@ -77,6 +77,20 @@ class HistoryIndexTests(unittest.TestCase):
     def ids(result: dict[str, object]) -> list[str]:
         return [entry["locator"]["message_id"] for entry in result["entries"]]  # type: ignore[index]
 
+    def test_appended_pr_link_without_uuid_does_not_block_search_or_become_instruction(self) -> None:
+        spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "pr-link.sqlite") as index:
+            before = index.search([spec], "needle", source_kinds=("original_user",))
+            link = {"type": "pr-link", "sessionId": sid, "prNumber": 1,
+                    "prUrl": "https://github.com/example/pr-metadata-only/pull/1",
+                    "prRepository": "example/pr-metadata-only", "timestamp": "2026-09-18T00:00:00.000Z"}
+            self.append(path, link)
+            self.append(path, link)
+            after = index.search([spec], "needle", source_kinds=("original_user",))
+            self.assertEqual(self.ids(after), ["user-1"])
+            self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
+            self.assertEqual(index.search([spec], "pr-metadata-only")["entries"], [])
+
     def test_cross_window_browse_filters_order_pagination_and_stale_cursor(self) -> None:
         first, first_path, first_id = self.source(0, self.record("", "first", "user", "needle window zero"))
         second, _, second_id = self.source(1, self.record("", "second", "assistant", "needle window one"))
