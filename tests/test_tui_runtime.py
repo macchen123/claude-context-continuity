@@ -397,6 +397,28 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.receipt()["phase"], "paused")
         self.clear_mock.assert_not_called()
 
+    def test_resume_with_pr_link_metadata_binds_target_session(self):
+        runtime, startup_sid, _ = self.resume_runtime()
+        target_sid, target_source = self.resume_source(125)
+        with target_source.open("a") as handle:
+            handle.write(json.dumps({"type": "pr-link", "sessionId": target_sid, "prNumber": 1,
+                                     "prUrl": "https://github.com/example/project/pull/1",
+                                     "prRepository": "example/project", "timestamp": "2026-09-18T00:00:00.000Z"}) + "\n")
+        result = runtime.on_hook({"hook_event_name": "SessionStart", "source": "resume",
+                                  "session_id": target_sid, "cwd": str(self.cwd),
+                                  "transcript_path": str(target_source)})
+        self.assertNotIn("continue", result)
+        observed = runtime.receipt()
+        self.assertEqual(observed["phase"], "running")
+        self.assertNotEqual(observed["session_id"], startup_sid)
+        self.assertEqual(observed["session_id"], target_sid)
+        self.assertEqual(observed["source_path"], str(target_source))
+        self.assertEqual(observed["native_resume_confirmations"], 1)
+        self.assertEqual(observed["authorization"]["root_instruction_locator"]["session_id"], target_sid)
+        self.assertEqual(observed["usage"]["total_input_and_cache_tokens"], 125)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_resume_rebinds_actual_usage_and_honors_live_windows(self):
         runtime, initial_sid, _ = self.resume_runtime()
         old_sid, old_source = self.resume_source(800)
