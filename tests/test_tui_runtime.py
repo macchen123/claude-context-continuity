@@ -134,6 +134,182 @@ class TuiRuntimeTests(unittest.TestCase):
         self.usage(800)
         self.runtime.on_hook(self.hook("Stop"))
 
+    def test_idle_boundary_parses_once_and_does_not_rewrite_identical_state(self):
+        self.runtime.on_hook(self.hook("Stop"))
+        before = self.runtime.state_path.stat()
+        with patch.object(HistorySource, "_records", autospec=True, side_effect=HistorySource._records) as reads, \
+                patch.object(core.os, "fsync", wraps=os.fsync) as sync:
+            for _ in range(6):
+                self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.assertEqual(reads.call_count, 1)
+        sync.assert_not_called()
+        after = self.runtime.state_path.stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+        stamp, state_hash = self.runtime._idle_observation
+        self.assertEqual(len(stamp), 7)
+        self.assertEqual(len(state_hash), 64)
+        self.clear_mock.assert_not_called()
+
+    def test_idle_snapshot_invalidates_when_live_budget_changes(self):
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        self.config = {"hash": "smaller", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100"}}
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_idle_snapshot_detects_same_size_rewrite_even_with_restored_mtime(self):
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        before = self.source.stat()
+        content = self.source.read_text().replace('"input_tokens": 125', '"input_tokens": 800')
+        self.source.write_text(content)
+        os.utime(self.source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(self.source.stat().st_size, before.st_size)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_idle_snapshot_revalidates_replaced_source_identity(self):
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        before = self.source.stat()
+        replacement = self.root / "replacement.jsonl"
+        replacement.write_text(self.source.read_text().replace(self.sid, str(uuid4())))
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        replacement.replace(self.source)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.clear_mock.assert_not_called()
+
+    def test_idle_snapshot_detects_new_user_input_without_reusing_stop(self):
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        with self.source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+                                    "message": {"role": "user", "content": "停止之前的任务。"}}) + "\n")
+        self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.assertFalse(self.runtime._state()["at_turn_boundary"])
+        self.clear_mock.assert_not_called()
+
+    def test_incomplete_runtime_tail_waits_until_append_finishes(self):
+        self.threshold()
+        with self.source.open("a") as handle:
+            handle.write(json.dumps({"type": "progress", "uuid": str(uuid4()), "sessionId": self.sid})[:-1])
+        self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.clear_mock.assert_not_called()
+        with self.source.open("a") as handle:
+            handle.write("}\n")
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_complete_malformed_runtime_tail_is_not_deferred(self):
+        self.threshold()
+        with self.source.open("a") as handle:
+            handle.write("not-json\n")
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.clear_mock.assert_not_called()
+
+    def test_serve_survives_real_state_lock_contention_and_records_recovery(self):
+        lock = core.lock(self.runtime.lock_path)
+        lock.__enter__()
+        held = True
+        real_lock = core.lock
+        snapshots = []
+
+        def bounded_lock(path, **kwargs):
+            return real_lock(path, wait_seconds=0 if Path(path) == self.runtime.lock_path else 5)
+
+        def release(_):
+            nonlocal held
+            snapshots.append(json.loads((self.runtime.directory / "controller-diagnostic.json").read_text()))
+            self.assertTrue(tui_runtime._controller_locked(self.runtime))
+            lock.__exit__(None, None, None)
+            held = False
+
+        try:
+            with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
+                    patch.object(core, "lock", side_effect=bounded_lock), \
+                    patch.object(tui_runtime.time, "sleep", side_effect=release), \
+                    patch.object(self.runtime, "advance", return_value={"phase": "closed"}) as advance:
+                self.assertEqual(tui_runtime.serve(self.runtime.conversation_id)["phase"], "closed")
+        finally:
+            if held:
+                lock.__exit__(None, None, None)
+        advance.assert_called_once()
+        self.assertEqual(snapshots[0]["status"], "waiting_for_state_lock")
+        diagnostic = json.loads((self.runtime.directory / "controller-diagnostic.json").read_text())
+        self.assertEqual(diagnostic["status"], "running")
+        self.assertEqual(diagnostic["last_error"], "state_lock_busy")
+        self.assertFalse(tui_runtime._controller_locked(self.runtime))
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_serve_reports_io_failure_without_replaying_or_logging_exception_text(self):
+        with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
+                patch.object(self.runtime, "advance", side_effect=OSError("private-exception-value")) as advance:
+            outcome = tui_runtime.serve(self.runtime.conversation_id)
+        self.assertEqual(outcome["phase"], "paused")
+        advance.assert_called_once()
+        raw = (self.runtime.directory / "controller-diagnostic.json").read_text()
+        self.assertNotIn("private-exception-value", raw)
+        self.assertEqual(json.loads(raw)["last_error"], "state_or_io_failure")
+        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_serve_preserves_diagnostic_when_state_cannot_be_persisted(self):
+        with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
+                patch.object(self.runtime, "_save", side_effect=OSError("unwritable")):
+            outcome = tui_runtime.serve(self.runtime.conversation_id)
+        self.assertFalse(outcome["state_persisted"])
+        self.assertEqual(outcome["controller_error"], "state_or_io_failure")
+        self.assertTrue((self.runtime.directory / "controller-diagnostic.json").is_file())
+        self.assertFalse(tui_runtime._controller_locked(self.runtime))
+
+    def test_status_does_not_trust_running_or_live_pid_without_controller_lock(self):
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["controller_pid"] = state["owned_pid"] = os.getpid()
+            self.runtime._save(state)
+        before = self.runtime.state_path.read_bytes()
+        args = continuity.parser().parse_args(["tui-status", "--context-id", self.runtime.conversation_id])
+        outcome = continuity.dispatch(args)
+        self.assertEqual(outcome["phase"], "running")
+        self.assertEqual(outcome["health"]["status"], "controller_unavailable")
+        self.assertTrue(outcome["health"]["controller_pid_alive"])
+        self.assertFalse((self.runtime.directory / "controller.lock").exists())
+        with core.lock(self.runtime.directory / "controller.lock"):
+            self.assertEqual(continuity.dispatch(args)["health"]["status"], "healthy")
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+
+    def test_attach_warns_without_spawning_or_timing_out_interactive_client(self):
+        import io
+        from contextlib import redirect_stderr
+        with patch.object(tmux_transport, "attach_argv", return_value=["tmux", "attach"]), \
+                patch.object(tui_runtime.subprocess, "run") as attach, \
+                patch.object(tui_runtime.subprocess, "Popen") as spawn, redirect_stderr(io.StringIO()) as stderr:
+            attach.return_value.returncode = 0
+            result = tui_runtime.attach(self.runtime.conversation_id)
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["health"]["status"], "controller_unavailable")
+        self.assertIn("attach 只连接原生终端", stderr.getvalue())
+        attach.assert_called_once_with(["tmux", "attach"], check=False)
+        spawn.assert_not_called()
+        self.clear_mock.assert_not_called()
+
+    def test_unavailable_native_session_does_not_change_state_or_spawn_on_recovery(self):
+        self.runtime._pause_external("observation failed")
+        before = self.runtime.state_path.read_bytes()
+        environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)
+        environment["CLAUDE_CONTINUITY_ID"] = self.runtime.conversation_id
+        with patch.dict(os.environ, environment), \
+                patch.object(tmux_transport, "inspect", side_effect=tmux_transport.TmuxTransportError("unavailable")), \
+                patch.object(tui_runtime.subprocess, "Popen") as spawn:
+            with self.assertRaises(ValueError):
+                tui_runtime.recover(self.runtime.conversation_id, self.sid)
+        spawn.assert_not_called()
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        self.send_mock.assert_not_called()
+        self.clear_mock.assert_not_called()
+
     def test_durable_cron_startup_binding_survives_clear_and_resume(self):
         initial = self.runtime._state()["durable_cron_compat"]["scheduler_session_id"]
         sid, source = self.resume_source(150)

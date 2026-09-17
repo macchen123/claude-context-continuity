@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
@@ -34,6 +35,35 @@ class CoreUtilityTests(unittest.TestCase):
         updated = {"phase": "paused", "generation": 1}
         core.atomic(path, updated)
         self.assertEqual(core.read_json(path), updated)
+
+    def test_atomic_skip_unchanged_avoids_fsync_but_persists_changes(self) -> None:
+        path = self.root / "state.json"
+        initial = {"phase": "running"}
+        core.atomic(path, initial, skip_unchanged=True)
+        before = path.stat()
+        with patch.object(core.os, "fsync", wraps=core.os.fsync) as sync:
+            core.atomic(path, initial, skip_unchanged=True)
+            sync.assert_not_called()
+            self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+            core.atomic(path, {"phase": "paused"}, skip_unchanged=True)
+            self.assertEqual(sync.call_count, 2)
+        self.assertEqual(core.read_json(path), {"phase": "paused"})
+        with self.assertRaises(FileExistsError):
+            core.atomic(path, {"phase": "paused"}, exclusive=True, skip_unchanged=True)
+        alias = self.root / "alias.json"
+        alias.symlink_to(path)
+        with self.assertRaises(core.ContinuityError):
+            core.atomic(alias, {"phase": "paused"}, skip_unchanged=True)
+
+    def test_busy_lock_is_distinct_and_does_not_transfer_ownership(self) -> None:
+        path = self.root / ".lock"
+        with core.lock(path):
+            with self.assertRaises(core.LockBusy):
+                with core.lock(path):
+                    self.fail("a second owner acquired the held lock")
+        with core.lock(path):
+            pass
+        self.assertTrue(issubclass(core.LockBusy, core.ContinuityError))
 
     def test_atomic_and_safe_path_reject_symlink_aliases(self) -> None:
         regular = self.workspace / "regular.txt"

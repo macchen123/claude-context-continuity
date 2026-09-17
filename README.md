@@ -202,6 +202,19 @@ The native conversation and History/Notes remain available; only automatic switc
 
 If a resumed window has no genuine user instruction yet, the host tries to verify registered earlier instructions instead of treating its continuation message as new authorization. If no prior session is registered to reuse, it keeps observing the selected native session without switching automatically; a later genuine user record can restore automatic switching after validation.
 
+`PostToolBatch hook stopped continuation` together with the context-switch notice means the old turn is yielding to a new window, not that the task is finished. If no continuation follows, check `tui-status`.
+
+### 6. Does reconnecting a terminal restore automatic switching?
+Not necessarily. The `health` section of `tui-status` checks the controller process, exclusive lock, native tmux session, and control socket instead of relying only on the saved `phase`. `tui-attach` only reconnects the native terminal; it warns when the controller is unavailable and does not silently start a second controller.
+
+If the native terminal is still running but its controller has exited, run this within the corresponding managed terminal environment:
+
+```sh
+claude-context tui-recover --context-id <context-id> --session-id <session-id>
+```
+
+Use the exact IDs returned by `tui-status`. Recovery still verifies the native channel, session identity, and unsettled operations; it never forces ownership or replays an uncertain delivery when the required environment or confirmation is missing. If the native tmux session is also gone, neither attach nor controller recovery can bring that process back. Use native session resume instead, for example `cclaude --resume <session-id>`.
+
 ---
 
 <a id="contributing"></a>

@@ -45,6 +45,10 @@ class ContinuityError(ValueError):
     pass
 
 
+class LockBusy(ContinuityError):
+    """锁仍由另一个执行者持有；不表示状态损坏。"""
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      separators=(",", ":")).encode()).hexdigest()
@@ -71,13 +75,20 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def atomic(path, value, *, exclusive=False):
+def atomic(path, value, *, exclusive=False, skip_unchanged=False):
     path = Path(path)
     if path.is_symlink():
         raise ContinuityError("运营文件不得是 symlink")
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     if len(raw.encode()) > MAX_PACKET:
         raise ContinuityError("运营文件超过 64 KiB")
+    if skip_unchanged and not exclusive:
+        try:
+            with path.open("rb") as current:
+                if current.read(MAX_PACKET + 1) == raw.encode():
+                    return
+        except FileNotFoundError:
+            pass
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(prefix=".continuity-", dir=path.parent)
     try:
@@ -116,7 +127,7 @@ def lock(path, *, wait_seconds=0):
                 break
             except BlockingIOError as exc:
                 if not wait_seconds or time.monotonic() >= deadline:
-                    raise ContinuityError("已有执行者；不争抢、不自动重试") from exc
+                    raise LockBusy("已有执行者；不争抢、不自动重试") from exc
                 time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         try:
             yield

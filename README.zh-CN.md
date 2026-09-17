@@ -202,6 +202,19 @@ ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/session-continuity/
 
 如果恢复窗口尚无真实用户指令，宿主会尝试核验已登记的早期指令，不会把接续消息当成新授权。找不到可复用的会话登记时，仍会跟踪已选中的原生会话，但不自动换窗；后续真实用户记录通过核验后，可以恢复自动换窗。
 
+`PostToolBatch hook stopped continuation` 配合“正在自动切换上下文”表示旧回合正在让位给新窗口，不代表任务已经完成。如果一直没有接续，再检查 `tui-status`。
+
+### 6. 终端断开后，重新连接就恢复自动换窗了吗？
+不一定。`tui-status` 的 `health` 会核对实际控制器进程、独占锁、原生 tmux 和控制 socket，而不只看保存的 `phase`。`tui-attach` 只重新连接原生终端；控制器不可用时会明确提示，不会悄悄启动第二个控制器。
+
+原生终端仍在、控制器已退出时，在对应受管终端的环境内执行：
+
+```sh
+claude-context tui-recover --context-id <context-id> --session-id <session-id>
+```
+
+两个 ID 使用 `tui-status` 返回的准确值。恢复前仍须核对原生通道、会话身份和未结操作；缺少对应环境或投递结果未知时不会强行接管或重放。若原生 tmux 会话也已不存在，不能靠 `attach` 或控制器恢复命令找回该进程，应使用原生会话恢复入口，例如 `cclaude --resume <session-id>`。
+
 ---
 
 <a id="contributing"></a>

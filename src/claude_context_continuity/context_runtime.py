@@ -323,7 +323,7 @@ class ContextRuntime:
     def _save(self, state: dict[str, Any], exclusive: bool = False) -> None:
         try:
             core.no_secrets(state)
-            core.atomic(self.state_path, state, exclusive=exclusive)
+            core.atomic(self.state_path, state, exclusive=exclusive, skip_unchanged=not exclusive)
         except (OSError, ValueError, core.ContinuityError) as exc:
             raise ContextRuntimeError("runtime state cannot be persisted") from exc
 
@@ -410,14 +410,14 @@ class ContextRuntime:
             state.pop("pause_notice_key", None)
         return result
 
-    def _usage(self, state: dict[str, Any], required: bool
+    def _usage(self, state: dict[str, Any], required: bool, *, sample: dict[str, Any] | None = None
                ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
         if not isinstance(state["source_path"], str):
             if required:
                 raise ContextRuntimeError("current native history source is unavailable")
             return None
         try:
-            usage = HistorySource(Path(state["source_path"]), state["session_id"]).latest_usage()
+            usage = sample if sample is not None else HistorySource(Path(state["source_path"]), state["session_id"]).latest_usage()
         except (HistoryError, TypeError) as exc:
             if required:
                 raise ContextRuntimeError("actual native usage is unavailable") from exc
