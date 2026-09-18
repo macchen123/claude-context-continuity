@@ -100,6 +100,24 @@ class TuiRuntimeTests(unittest.TestCase):
                 "model": "native-model", "usage": {"input_tokens": value,
                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}) + "\n")
 
+    def batch_records(self, tool_ids, value=820):
+        request_id = str(uuid4())
+        assistant = {"type": "assistant", "uuid": str(uuid4()), "sessionId": self.sid,
+            "cwd": str(self.cwd), "message": {"id": request_id, "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_id, "name": "Read", "input": {}}
+                        for tool_id in tool_ids], "model": "native-model", "usage": {
+            "input_tokens": value, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}
+        results = [{"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                                        "content": "fixture result"}]}}
+                   for tool_id in tool_ids]
+        return assistant, results
+
+    def append_records(self, *records):
+        with self.source.open("a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
     def resume_runtime(self):
         sid = str(uuid4())
         source = self.root / f"{sid}.jsonl"
@@ -786,6 +804,77 @@ class TuiRuntimeTests(unittest.TestCase):
         packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
         self.assertEqual(packet["active_background_agents"], ["still-running"])
 
+    def test_batch_rotates_after_late_transcript_flush_without_another_prompt(self):
+        self.usage(800)
+        response = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "late"}]))
+        self.assertFalse(response["continue"])
+        captured = self.runtime._state()["tool_batch_boundary"]["usage_locator"]
+        assistant, results = self.batch_records(["late"])
+        self.append_records(assistant, *results)
+        self.assertNotEqual(HistorySource(self.source, self.sid).latest_usage()["locator"], captured)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_text("")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.runtime.advance()
+        text = self.send_mock.call_args.args[2]
+        with source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                                     "isMeta": True, "message": {"role": "user", "content": text}}) + "\n")
+        self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.assertTrue(self.runtime.receipt()["continuation_observed"])
+        self.send_mock.assert_called_once()
+
+    def test_batch_waits_for_every_call_and_result_to_reach_history(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
+            {"tool_use_id": "first"}, {"tool_use_id": "second"}]))
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        assistant, results = self.batch_records(["first", "second"], value=800)
+        self.append_records(assistant)
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.append_records(results[0])
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.append_records(results[1])
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_batch_accepts_later_record_from_the_same_model_response(self):
+        assistant, results = self.batch_records(["streamed"])
+        self.append_records(assistant)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "streamed"}]))
+        later = json.loads(json.dumps(assistant))
+        later["uuid"] = str(uuid4())
+        later["message"]["content"] = [{"type": "text", "text": "same response"}]
+        self.append_records(*results, later)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_batch_does_not_clear_after_an_unrelated_model_response(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "old-batch"}]))
+        assistant, results = self.batch_records(["old-batch"])
+        self.append_records(assistant, *results)
+        self.usage(850)
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.assertNotEqual(self.runtime.receipt()["phase"], "clear_sent")
+
+    def test_batch_rejects_changed_usage_anchor_even_after_tools_settle(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "bound"}]))
+        assistant, results = self.batch_records(["bound"])
+        self.append_records(assistant, *results)
+        self.source.write_text(self.source.read_text().replace('"input_tokens": 800', '"input_tokens": 801'))
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.clear_mock.assert_not_called()
+
     def test_batch_accounts_multiple_outputs_and_bounds_native_response(self):
         self.config = {"hash": "output-budget", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100000"}}
         with core.lock(self.runtime.lock_path):
@@ -810,6 +899,10 @@ class TuiRuntimeTests(unittest.TestCase):
         ]))
         self.assertFalse(result["continue"])
         self.assertEqual(self.runtime._state()["output_budget"]["total_text_bytes"], before)
+        assistant, results = self.batch_records(["out-one", "out-two"], value=60000)
+        for block in assistant["message"]["content"]:
+            block["name"] = "Bash"
+        self.append_records(assistant, *results)
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
 
     def test_native_image_bytes_do_not_force_repeated_fresh_window_resets(self):

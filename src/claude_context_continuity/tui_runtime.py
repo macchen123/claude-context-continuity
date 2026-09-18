@@ -557,7 +557,8 @@ class TuiRuntime(ContextRuntime):
         self._automatic_rotation(state)
         if state["rotation"]["request"]:
             state["tool_batch_boundary"] = {"session_id": state["session_id"],
-                "turn_generation": state.get("turn_generation", 0), "usage_locator": usage["usage_locator"]}
+                "turn_generation": state.get("turn_generation", 0), "usage_locator": usage["usage_locator"],
+                "tool_use_ids": sorted({call["tool_use_id"] for call in event["tool_calls"]})}
             state["at_turn_boundary"] = True
             result = dict(result)
             result["continue"] = False
@@ -776,7 +777,27 @@ class TuiRuntime(ContextRuntime):
                     or batch["turn_generation"] != state.get("turn_generation", 0)):
                 state["at_turn_boundary"] = False
                 return False
-            return source._usage_from_records(records)["locator"] == batch["usage_locator"]
+            latest = source._usage_from_records(records)
+            tool_ids = set(batch["tool_use_ids"])
+            if not tool_ids:
+                return latest["locator"] == batch["usage_locator"]
+            anchor = next((row for row in records
+                           if row.message_id == batch["usage_locator"]["message_id"]), None)
+            if anchor is None or source._locator(anchor, anchor.kind) != batch["usage_locator"]:
+                raise ContextRuntimeError("批次边界绑定的原生用量记录已改变，不自动清空")
+            # Hook 可以早于本轮历史落盘；以本批调用及回执确认结算，不要求最新用量仍是旧快照。
+            from .history import _blocks, _content, _results
+            observed, settled, requests = set(), set(), set()
+            for row in records:
+                if row.kind == "assistant":
+                    matches = {block.get("id") for block in _blocks(_content(row.data))
+                               if isinstance(block, dict) and block.get("type") == "tool_use"} & tool_ids
+                    if matches:
+                        observed.update(matches)
+                        requests.add(source._usage_from_records([row])["request_id"])
+                elif row.kind == "tool_result":
+                    settled.update(block["tool_use_id"] for block in _results(row.data))
+            return observed == tool_ids and tool_ids <= settled and requests == {latest["request_id"]}
         return self._stop_flushed(state, source, records)
 
     def _stop_flushed(self, state, source, records):
