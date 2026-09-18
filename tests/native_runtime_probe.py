@@ -1,6 +1,7 @@
 """显式运行的原生 TUI 集成探针；模型响应由本机固定脚本提供，不调用外部模型。"""
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,9 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from claude_context_continuity import core, native_control, tmux_transport, tui_runtime
-from claude_context_continuity.history import HistorySource, _content, _texts
+from claude_context_continuity.history import HistorySource, _blocks, _content, _results, _texts
 
 ROOT_INPUT = "NATIVE_FIXTURE_ONLY: run the isolated producer, then inspect history at later steps; no other work."
+BATCH_ONLY_INPUT = "NATIVE_BATCH_ONLY_FIXTURE: inspect the isolated fixture across automatic continuation; no other work."
 DEFERRED_INPUT = "NATIVE_DEFERRED_ONLY: inspect the existing result after switching; do not run the producer again."
 DRAFT = "NATIVE_UNSUBMITTED_DRAFT"
 CHECKPOINT = "NATIVE_OVERSIZED_RESULT\n" + "x" * 30000 + "\n"
@@ -43,8 +45,9 @@ def _json_values(value):
 
 
 class ScriptedModel:
-    def __init__(self, workspace):
+    def __init__(self, workspace, *, batch_only=False):
         self.workspace = workspace
+        self.batch_only = batch_only
         self.requests = []
         self.history_calls = []
         self.history_read_requests = {}
@@ -55,7 +58,26 @@ class ScriptedModel:
         self.done = False
         self.failed = None
         self.auxiliary_requests = 0
+        self.batch_only_tool_calls = []
+        self.blocked_batch_response_id = None
+        self.completion_response_id = None
         self.lock = threading.Lock()
+
+    def _batch_only_response(self, body):
+        continued = any(message.get("role") == "user" and any(
+            text.startswith("<continuity-host-event>") for text in _texts(message.get("content")))
+            for message in body.get("messages", []) if isinstance(message, dict))
+        if continued and self.batch_only_tool_calls:
+            self.done = True
+            self.completion_response_id = f"msg_native_probe_{len(self.requests)}"
+            return None, "NATIVE_BATCH_ONLY_DONE", 100
+        if len(self.batch_only_tool_calls) >= 4:
+            self.failed = "batch_only_continuation_not_received"
+            return None, "NATIVE_BATCH_ONLY_UNAVAILABLE", 100
+        self.stage += 1
+        self.batch_only_tool_calls.append("Read")
+        self.blocked_batch_response_id = f"msg_native_probe_{len(self.requests)}"
+        return "Read", {"file_path": str(self.workspace / "batch-only.txt")}, 95000
 
     def respond(self, body):
         with self.lock:
@@ -84,6 +106,8 @@ class ScriptedModel:
                             self.locator = locator
             self.requests.append({"stage": self.stage, "input_bytes": len(json.dumps(body).encode()),
                                   "tool_names": names if len(self.requests) < 2 else []})
+            if self.batch_only:
+                return self._batch_only_response(body)
             if self.stage == 0:
                 self.stage += 1
                 return "Bash", {"command": shlex.join([
@@ -204,7 +228,78 @@ def _submit_fixture_input(runtime, text):
                        json.dumps({"type": "reply", "text": text}) + "\n").encode())
 
 
-def main():
+def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_path, blocked_response_id):
+    initial_sessions, original_user_records = [], []
+    continued_session_binding = False
+    continuation_records = 0
+    response_sessions = {}
+    blocked_request_tool_ids, settled_tool_ids = set(), set()
+    stopped_response_ids, old_responses_after_stop = [], []
+    seen_sources = set()
+    for binding_path in (runtime.directory / "history").glob("*.json"):
+        binding = core.read_json(binding_path)
+        sid, source_path = binding["session_id"], binding["source_path"]
+        if (sid, source_path) in seen_sources:
+            continue
+        seen_sources.add((sid, source_path))
+        source = HistorySource(Path(source_path), sid)
+        if sid == continued_sid and source_path == continued_source_path:
+            continued_session_binding = True
+        for row in source._records():
+            text = None
+            if row.kind == "original_user" or row.data.get("type") == "user":
+                text = "\n".join(_texts(_content(row.data)))
+            if row.kind == "original_user":
+                original_user_records.append((sid, text))
+                if text == BATCH_ONLY_INPUT:
+                    initial_sessions.append(sid)
+            if (sid == continued_sid and isinstance(text, str)
+                    and text.startswith("<continuity-host-event>")):
+                continuation_records += 1
+            if row.kind == "assistant":
+                message = row.data.get("message", {})
+                response_id = message.get("id") if isinstance(message, dict) else None
+                if isinstance(response_id, str) and re.fullmatch(r"msg_native_probe_\d+", response_id):
+                    response_sessions.setdefault(response_id, set()).add(sid)
+                if response_id == blocked_response_id:
+                    blocked_request_tool_ids.update(
+                        block["id"] for block in _blocks(_content(row.data))
+                        if isinstance(block, dict) and block.get("type") == "tool_use"
+                        and isinstance(block.get("id"), str))
+            elif row.kind == "tool_result":
+                settled_tool_ids.update(block["tool_use_id"] for block in _results(row.data))
+        if sid == initial_sid:
+            latest_response_id = None
+            with Path(source_path).open() as handle:
+                for line in handle:
+                    row = json.loads(line)
+                    if row.get("type") == "assistant" and row.get("message", {}).get("model") != "<synthetic>":
+                        latest_response_id = row["message"].get("id")
+                        if stopped_response_ids and latest_response_id not in stopped_response_ids:
+                            old_responses_after_stop.append(latest_response_id)
+                    attachment = row.get("attachment", {})
+                    if (attachment.get("type") == "hook_stopped_continuation"
+                            and attachment.get("hookEvent") == "PostToolBatch"):
+                        stopped_response_ids.append(latest_response_id)
+    return {
+        "initial_fixture_user_records": len(initial_sessions),
+        "initial_fixture_records_in_initial_session": initial_sessions.count(initial_sid),
+        "original_user_record_count": len(original_user_records),
+        "continued_session_binding": continued_session_binding,
+        "continuation_records_in_new_session": continuation_records,
+        "response_sessions": {key: sorted(value) for key, value in response_sessions.items()},
+        "blocked_request_tool_ids": sorted(blocked_request_tool_ids),
+        "blocked_result_tool_ids": sorted(blocked_request_tool_ids & settled_tool_ids),
+        "stopped_response_ids": stopped_response_ids,
+        "old_responses_after_stop": old_responses_after_stop,
+    }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Run the isolated native TUI continuity probe.")
+    parser.add_argument("--batch-only", action="store_true",
+                        help="Exercise one Read-only PostToolBatch automatic rotation.")
+    batch_only = parser.parse_args(argv).batch_only
     # 短私有路径满足 macOS Unix socket 长度限制；不复用任何活动控制器目录。
     home = Path.home() / ".claude" / ("ct-" + uuid4().hex[:8])
     home.mkdir(mode=0o700)
@@ -213,18 +308,21 @@ def main():
     (workspace / ".claude").mkdir()
     (workspace / ".claude/settings.local.json").write_text(json.dumps({"env": {
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100000", "DISABLE_COMPACT": "1"}}))
-    (workspace / "checkpoint.txt").write_text(CHECKPOINT)
-    (workspace / "producer.py").write_text(
-        "from pathlib import Path\nimport time\nr=Path(__file__).resolve().parent\n"
-        "with (r/'producer.starts').open('a') as f:f.write('started\\n')\n"
-        "time.sleep(8)\n(r/'producer.done').write_text('producer finished exactly once\\n')\n")
+    if batch_only:
+        (workspace / "batch-only.txt").write_text("NATIVE_BATCH_ONLY_RESULT\n")
+    else:
+        (workspace / "checkpoint.txt").write_text(CHECKPOINT)
+        (workspace / "producer.py").write_text(
+            "from pathlib import Path\nimport time\nr=Path(__file__).resolve().parent\n"
+            "with (r/'producer.starts').open('a') as f:f.write('started\\n')\n"
+            "time.sleep(8)\n(r/'producer.done').write_text('producer finished exactly once\\n')\n")
     temporary = home / "tmp"
     temporary.mkdir()
     native_config = home / "native-config"
     native_config.mkdir()
     (native_config / ".claude.json").write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "dark",
         "projects": {str(workspace): {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}}}))
-    model = ScriptedModel(workspace)
+    model = ScriptedModel(workspace, batch_only=batch_only)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(model))
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -232,6 +330,8 @@ def main():
     runtime = None
     result = {"scope": "real native TUI and tools with scripted localhost model/usage, no external LLM",
               "fixture_home": str(home), "status": "failed"}
+    if batch_only:
+        result["mode"] = "batch-only"
     previous_home = core.HOME
     values = {
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{server.server_port}",
@@ -248,20 +348,36 @@ def main():
     try:
         with isolated_environment(values):
             core.HOME = home
+            allowed_tools = "Read" if batch_only else "Bash,Read"
             runtime = tui_runtime.create(workspace, width=140, height=40, native_args=(
                 "--setting-sources", "local",
                 "--model", "claude-sonnet-4-6", "--permission-mode", "default",
-                "--allowedTools", "Bash,Read"))
+                "--allowedTools", allowed_tools))
             initial_sid = None
             switched_before_finish = False
             submitted = deferred_submitted = draft_entered = False
+            initial_input = BATCH_ONLY_INPUT if batch_only else ROOT_INPUT
             while time.monotonic() - started < 100:
                 state = runtime._state()
                 if state.get("initial_session_started") and native_control.ready(state["native_control"]) and not submitted:
                     initial_sid = state["session_id"]
-                    _submit_fixture_input(runtime, ROOT_INPUT)
+                    _submit_fixture_input(runtime, initial_input)
                     submitted = True
                 if submitted:
+                    if batch_only:
+                        runtime.advance()
+                        state = runtime._state()
+                        if model.failed:
+                            break
+                        if (model.done and state.get("continuation_observed")
+                                and state["session_id"] != initial_sid and state.get("source_path")):
+                            records = HistorySource(Path(state["source_path"]), state["session_id"])._records(
+                                defer_incomplete_tail=True)
+                            if any(row.kind == "assistant" and row.data["message"].get("id")
+                                   == model.completion_response_id for row in records):
+                                break
+                        time.sleep(.05)
+                        continue
                     if not draft_entered and (workspace / "producer.starts").exists():
                         # 仅给自建探针输入未提交草稿；生产换窗通道不使用 send-keys。
                         subprocess.run(["tmux", "-S", state["tmux"]["socket_path"], "send-keys",
@@ -280,7 +396,7 @@ def main():
                     if model.done and state.get("continuation_observed") and (workspace / "producer.done").exists():
                         break
                 time.sleep(.05)
-            if (workspace / "producer.starts").exists():
+            if not batch_only and (workspace / "producer.starts").exists():
                 finish_deadline = time.monotonic() + 12
                 while not (workspace / "producer.done").exists() and time.monotonic() < finish_deadline:
                     runtime.advance()
@@ -303,6 +419,24 @@ def main():
                 if (isinstance(content, str) and content.rstrip("\n") == CHECKPOINT.rstrip("\n")
                         and core.sha(path) == path.stem):
                     archive_verified = True
+            batch_artifacts = None
+            post_tool_batch_stop_observed = False
+            old_session_model_requests_after_block = []
+            completion_bound_to_new_session = False
+            no_model_request_resumed_in_old_session = False
+            if batch_only:
+                batch_artifacts = _batch_only_artifacts(
+                    runtime, initial_sid, state["session_id"], state.get("source_path"),
+                    model.blocked_batch_response_id)
+                post_tool_batch_stop_observed = bool(
+                    batch_artifacts["stopped_response_ids"] == [model.blocked_batch_response_id]
+                    and batch_artifacts["blocked_request_tool_ids"]
+                    and batch_artifacts["blocked_request_tool_ids"] == batch_artifacts["blocked_result_tool_ids"])
+                old_session_model_requests_after_block = batch_artifacts["old_responses_after_stop"]
+                no_model_request_resumed_in_old_session = not old_session_model_requests_after_block
+                completion_bound_to_new_session = (
+                    model.completion_response_id is not None
+                    and batch_artifacts["response_sessions"].get(model.completion_response_id) == [state["session_id"]])
             result.update(native_version=state.get("native_cli_version"), phase=state["phase"],
                           pause_reason=state.get("pause_reason"), diagnostic=state.get("diagnostic"),
                           new_session_confirmed=state["session_id"] != initial_sid,
@@ -317,11 +451,40 @@ def main():
                           draft_preserved=draft_preserved, draft_submitted=DRAFT in submitted_inputs,
                           auxiliary_request_count=model.auxiliary_requests, fixture_failure=model.failed,
                           elapsed_seconds=round(time.monotonic() - started, 3))
-            success = (model.done and switched_before_finish and len(starts) == 1
-                       and state.get("continuation_observed") and len(model.successful_history_reads) == 2
-                       and archive_verified and model.bounded_tool_results
-                       and deferred_submitted and deferred_count == 1 and draft_preserved and DRAFT not in submitted_inputs
-                       and model.history_calls == ["history-windows", "history-search", "history", "history-search", "history"])
+            if batch_only:
+                result.update(
+                    post_tool_batch_stop_observed=post_tool_batch_stop_observed,
+                    post_tool_batch_tool_ids=batch_artifacts["blocked_request_tool_ids"],
+                    initial_fixture_user_records=batch_artifacts["initial_fixture_user_records"],
+                    initial_fixture_records_in_initial_session=batch_artifacts["initial_fixture_records_in_initial_session"],
+                    original_user_record_count=batch_artifacts["original_user_record_count"],
+                    continued_session_binding=batch_artifacts["continued_session_binding"],
+                    continuation_records_in_new_session=batch_artifacts["continuation_records_in_new_session"],
+                    scripted_read_calls=model.batch_only_tool_calls,
+                    scripted_main_request_count=len(model.requests),
+                    blocked_batch_response_id=model.blocked_batch_response_id,
+                    completion_response_id=model.completion_response_id,
+                    scripted_response_sessions=batch_artifacts["response_sessions"],
+                    old_session_model_requests_after_block=old_session_model_requests_after_block,
+                    no_model_request_resumed_in_old_session=no_model_request_resumed_in_old_session,
+                    completion_bound_to_new_session=completion_bound_to_new_session)
+            if batch_only:
+                success = (model.done and model.failed is None and state["session_id"] != initial_sid
+                           and state.get("continuation_observed") and post_tool_batch_stop_observed
+                           and no_model_request_resumed_in_old_session and completion_bound_to_new_session
+                           and batch_artifacts["initial_fixture_records_in_initial_session"] == 1
+                           and batch_artifacts["original_user_record_count"] == 1
+                           and batch_artifacts["continued_session_binding"]
+                           and batch_artifacts["continuation_records_in_new_session"] == 1
+                           and set(model.batch_only_tool_calls) == {"Read"}
+                           and len(model.requests) == len(model.batch_only_tool_calls) + 1
+                           and not starts and not deferred_submitted and not draft_entered)
+            else:
+                success = (model.done and switched_before_finish and len(starts) == 1
+                           and state.get("continuation_observed") and len(model.successful_history_reads) == 2
+                           and archive_verified and model.bounded_tool_results
+                           and deferred_submitted and deferred_count == 1 and draft_preserved and DRAFT not in submitted_inputs
+                           and model.history_calls == ["history-windows", "history-search", "history", "history-search", "history"])
             result["status"] = "passed" if success else "failed"
             if not success:
                 # 只保留固定探针终端；不捕获或查看用户活动窗口。
