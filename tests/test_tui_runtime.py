@@ -866,6 +866,63 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.assertNotEqual(self.runtime.receipt()["phase"], "clear_sent")
 
+    def test_stop_replaces_batch_after_queued_tool_free_reply(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "old-batch"}]))
+        assistant, results = self.batch_records(["old-batch"])
+        queued = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+                  "message": {"role": "user", "content": "List the remaining tasks."}}
+        self.append_records(assistant, *results, queued)
+        self.usage(850)
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.runtime.on_hook(self.hook("Stop"))
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.assertNotIn("tool_batch_boundary", self.runtime._state())
+        self.runtime.advance()
+        self.clear_mock.assert_called_once()
+        self.assertEqual(self.runtime._state()["authorization"]["latest_instruction_locator"]["message_id"],
+                         queued["uuid"])
+
+    def test_stop_after_batch_waits_for_queued_reply_to_flush(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "old-batch"}]))
+        assistant, results = self.batch_records(["old-batch"])
+        self.append_records(assistant, *results, {
+            "type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+            "message": {"role": "user", "content": "List the remaining tasks."}})
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.usage(850)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_stop_after_batch_requires_matching_text_and_settled_tools(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "old-batch"}]))
+        assistant, results = self.batch_records(["old-batch"])
+        self.append_records(assistant, *results)
+        self.usage(850)
+        self.runtime.on_hook(self.hook("Stop", last_assistant_message="not the actual final reply"))
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="unfinished"))
+        pending, results = self.batch_records(["unfinished"], value=850)
+        self.append_records(pending)
+        self.usage(850)
+        self.runtime.on_hook(self.hook("Stop"))
+        self.assertEqual(self.runtime.advance()["phase"], "waiting_safe_boundary")
+        self.clear_mock.assert_not_called()
+        self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="unfinished"))
+        self.append_records(*results)
+        self.runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.usage(850)
+        self.runtime.on_hook(self.hook("Stop"))
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
     def test_batch_rejects_changed_usage_anchor_even_after_tools_settle(self):
         self.usage(800)
         self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "bound"}]))

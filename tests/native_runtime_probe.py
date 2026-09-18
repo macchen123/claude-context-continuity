@@ -24,6 +24,8 @@ from claude_context_continuity.history import HistorySource, _blocks, _content, 
 
 ROOT_INPUT = "NATIVE_FIXTURE_ONLY: run the isolated producer, then inspect history at later steps; no other work."
 BATCH_ONLY_INPUT = "NATIVE_BATCH_ONLY_FIXTURE: inspect the isolated fixture across automatic continuation; no other work."
+QUEUED_STOP_INPUT = "NATIVE_QUEUED_STOP_FIXTURE: list the remaining fixture tasks without using tools."
+QUEUED_STOP_REPLY = "NATIVE_QUEUED_REPLY_DONE"
 DEFERRED_INPUT = "NATIVE_DEFERRED_ONLY: inspect the existing result after switching; do not run the producer again."
 DRAFT = "NATIVE_UNSUBMITTED_DRAFT"
 CHECKPOINT = "NATIVE_OVERSIZED_RESULT\n" + "x" * 30000 + "\n"
@@ -45,9 +47,13 @@ def _json_values(value):
 
 
 class ScriptedModel:
-    def __init__(self, workspace, *, batch_only=False):
+    def __init__(self, workspace, *, batch_only=False, queued_stop=False):
         self.workspace = workspace
         self.batch_only = batch_only
+        self.queued_stop = queued_stop
+        self.waiting_for_queued_input = threading.Event()
+        self.queued_input_observed = threading.Event()
+        self.queued_reply_response_id = None
         self.requests = []
         self.history_calls = []
         self.history_read_requests = {}
@@ -71,13 +77,27 @@ class ScriptedModel:
             self.done = True
             self.completion_response_id = f"msg_native_probe_{len(self.requests)}"
             return None, "NATIVE_BATCH_ONLY_DONE", 100
+        if self.queued_stop:
+            if not self.batch_only_tool_calls:
+                self.waiting_for_queued_input.set()
+                if not self.queued_input_observed.wait(20):
+                    self.failed = "queued_input_not_persisted"
+                    return None, "NATIVE_QUEUED_STOP_UNAVAILABLE", 100
+            else:
+                queued = any(QUEUED_STOP_INPUT in text for message in body.get("messages", [])
+                             if isinstance(message, dict) for text in _texts(message.get("content")))
+                if not queued or self.queued_reply_response_id is not None:
+                    self.failed = "queued_reply_request_unexpected"
+                    return None, "NATIVE_QUEUED_STOP_UNAVAILABLE", 100
+                self.queued_reply_response_id = f"msg_native_probe_{len(self.requests)}"
+                return None, QUEUED_STOP_REPLY, 60000
         if len(self.batch_only_tool_calls) >= 4:
             self.failed = "batch_only_continuation_not_received"
             return None, "NATIVE_BATCH_ONLY_UNAVAILABLE", 100
         self.stage += 1
         self.batch_only_tool_calls.append("Read")
         self.blocked_batch_response_id = f"msg_native_probe_{len(self.requests)}"
-        return "Read", {"file_path": str(self.workspace / "batch-only.txt")}, 95000
+        return "Read", {"file_path": str(self.workspace / "batch-only.txt")}, 60000 if self.queued_stop else 95000
 
     def respond(self, body):
         with self.lock:
@@ -219,13 +239,33 @@ def isolated_environment(values):
         os.environ.update(previous)
 
 
-def _submit_fixture_input(runtime, text):
-    control = runtime._state()["native_control"]
+def _submit_fixture_input(runtime, text, *, keyboard=False):
+    state = runtime._state()
+    if keyboard:
+        binding = state["tmux"]
+        command = ["tmux", "-S", binding["socket_path"], "send-keys", "-t", binding["pane_id"]]
+        subprocess.run([*command, "-l", text], capture_output=True, check=True, timeout=5)
+        subprocess.run([*command, "Enter"], capture_output=True, check=True, timeout=5)
+        return
+    control = state["native_control"]
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(5)
         client.connect(control["socket_path"])
         client.sendall((json.dumps({"role": "attacher", "auth": runtime._control_auth}) + "\n" +
                        json.dumps({"type": "reply", "text": text}) + "\n").encode())
+
+
+def _queued_fixture_input_observed(native_config, session_id):
+    for path in native_config.glob(f"projects/*/{session_id}.jsonl"):
+        with path.open() as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    continue
+                row = json.loads(line)
+                if (row.get("type") == "queue-operation" and row.get("operation") == "enqueue"
+                        and row.get("content") == QUEUED_STOP_INPUT):
+                    return True
+    return False
 
 
 def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_path, blocked_response_id):
@@ -234,7 +274,8 @@ def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_
     continuation_records = 0
     response_sessions = {}
     blocked_request_tool_ids, settled_tool_ids = set(), set()
-    stopped_response_ids, old_responses_after_stop = [], []
+    stopped_response_ids, old_responses_after_stop, final_stop_response_ids = [], [], []
+    queued_before_batch_stop = False
     seen_sources = set()
     for binding_path in (runtime.directory / "history").glob("*.json"):
         binding = core.read_json(binding_path)
@@ -270,9 +311,13 @@ def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_
                 settled_tool_ids.update(block["tool_use_id"] for block in _results(row.data))
         if sid == initial_sid:
             latest_response_id = None
+            queued_seen = False
             with Path(source_path).open() as handle:
                 for line in handle:
                     row = json.loads(line)
+                    if (row.get("type") == "queue-operation" and row.get("operation") == "enqueue"
+                            and row.get("content") == QUEUED_STOP_INPUT):
+                        queued_seen = True
                     if row.get("type") == "assistant" and row.get("message", {}).get("model") != "<synthetic>":
                         latest_response_id = row["message"].get("id")
                         if stopped_response_ids and latest_response_id not in stopped_response_ids:
@@ -281,7 +326,13 @@ def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_
                     if (attachment.get("type") == "hook_stopped_continuation"
                             and attachment.get("hookEvent") == "PostToolBatch"):
                         stopped_response_ids.append(latest_response_id)
+                        queued_before_batch_stop = queued_seen
+                    if attachment.get("type") == "hook_success" and attachment.get("hookEvent") == "Stop":
+                        final_stop_response_ids.append(latest_response_id)
     return {
+        "queued_fixture_records_in_initial_session": original_user_records.count((initial_sid, QUEUED_STOP_INPUT)),
+        "queued_before_batch_stop": queued_before_batch_stop,
+        "final_stop_response_ids": final_stop_response_ids,
         "initial_fixture_user_records": len(initial_sessions),
         "initial_fixture_records_in_initial_session": initial_sessions.count(initial_sid),
         "original_user_record_count": len(original_user_records),
@@ -297,9 +348,14 @@ def _batch_only_artifacts(runtime, initial_sid, continued_sid, continued_source_
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run the isolated native TUI continuity probe.")
-    parser.add_argument("--batch-only", action="store_true",
-                        help="Exercise one Read-only PostToolBatch automatic rotation.")
-    batch_only = parser.parse_args(argv).batch_only
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--batch-only", action="store_true",
+                       help="Exercise one Read-only PostToolBatch automatic rotation.")
+    modes.add_argument("--queued-stop", action="store_true",
+                       help="Exercise a queued tool-free reply and Stop before advancing the rotation.")
+    args = parser.parse_args(argv)
+    queued_stop = args.queued_stop
+    batch_only = args.batch_only or queued_stop
     # 短私有路径满足 macOS Unix socket 长度限制；不复用任何活动控制器目录。
     home = Path.home() / ".claude" / ("ct-" + uuid4().hex[:8])
     home.mkdir(mode=0o700)
@@ -309,7 +365,9 @@ def main(argv=None):
     (workspace / ".claude/settings.local.json").write_text(json.dumps({"env": {
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100000", "DISABLE_COMPACT": "1"}}))
     if batch_only:
-        (workspace / "batch-only.txt").write_text("NATIVE_BATCH_ONLY_RESULT\n")
+        # 排队场景靠待处理输出触发预算保护，同时给原生客户端留出执行排队回答的空间。
+        payload = "NATIVE_BATCH_ONLY_RESULT\n" + ("x" * 20000 if queued_stop else "")
+        (workspace / "batch-only.txt").write_text(payload)
     else:
         (workspace / "checkpoint.txt").write_text(CHECKPOINT)
         (workspace / "producer.py").write_text(
@@ -322,7 +380,7 @@ def main(argv=None):
     native_config.mkdir()
     (native_config / ".claude.json").write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "dark",
         "projects": {str(workspace): {"hasTrustDialogAccepted": True, "hasCompletedProjectOnboarding": True}}}))
-    model = ScriptedModel(workspace, batch_only=batch_only)
+    model = ScriptedModel(workspace, batch_only=batch_only, queued_stop=queued_stop)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _handler(model))
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -331,7 +389,7 @@ def main(argv=None):
     result = {"scope": "real native TUI and tools with scripted localhost model/usage, no external LLM",
               "fixture_home": str(home), "status": "failed"}
     if batch_only:
-        result["mode"] = "batch-only"
+        result["mode"] = "queued-stop" if queued_stop else "batch-only"
     previous_home = core.HOME
     values = {
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{server.server_port}",
@@ -356,6 +414,8 @@ def main(argv=None):
             initial_sid = None
             switched_before_finish = False
             submitted = deferred_submitted = draft_entered = False
+            queued_submitted = queued_reply_stop_observed = False
+            queued_stop_observed_at = None
             initial_input = BATCH_ONLY_INPUT if batch_only else ROOT_INPUT
             while time.monotonic() - started < 100:
                 state = runtime._state()
@@ -365,9 +425,31 @@ def main(argv=None):
                     submitted = True
                 if submitted:
                     if batch_only:
+                        if model.failed:
+                            break
+                        if queued_stop and not queued_reply_stop_observed:
+                            if state.get("deferred_inputs"):
+                                model.failed = "queued_input_deferred_instead_of_executed"
+                                break
+                            if model.waiting_for_queued_input.is_set() and not queued_submitted:
+                                _submit_fixture_input(runtime, QUEUED_STOP_INPUT, keyboard=True)
+                                queued_submitted = True
+                            if queued_submitted and not model.queued_input_observed.is_set():
+                                if _queued_fixture_input_observed(native_config, initial_sid):
+                                    model.queued_input_observed.set()
+                            # 只控制探针的轮询次序，让真实排队输入先执行并收到 Stop；不改运行状态。
+                            if (state["session_id"] == initial_sid and state.get("stop_serial", 0) > 0
+                                    and state.get("stop_text_hash") == core.digest(QUEUED_STOP_REPLY)):
+                                queued_reply_stop_observed = True
+                                queued_stop_observed_at = time.monotonic()
+                            else:
+                                time.sleep(.05)
+                                continue
                         runtime.advance()
                         state = runtime._state()
-                        if model.failed:
+                        if (queued_stop_observed_at is not None and state["session_id"] == initial_sid
+                                and time.monotonic() - queued_stop_observed_at > 10):
+                            model.failed = "queued_stop_rotation_timeout"
                             break
                         if (model.done and state.get("continuation_observed")
                                 and state["session_id"] != initial_sid and state.get("source_path")):
@@ -468,16 +550,33 @@ def main(argv=None):
                     old_session_model_requests_after_block=old_session_model_requests_after_block,
                     no_model_request_resumed_in_old_session=no_model_request_resumed_in_old_session,
                     completion_bound_to_new_session=completion_bound_to_new_session)
+            if queued_stop:
+                queued_path_verified = (
+                    queued_submitted and queued_reply_stop_observed and batch_artifacts["queued_before_batch_stop"]
+                    and batch_artifacts["queued_fixture_records_in_initial_session"] == 1
+                    and model.queued_reply_response_id is not None
+                    and set(old_session_model_requests_after_block) == {model.queued_reply_response_id}
+                    and batch_artifacts["final_stop_response_ids"] == [model.queued_reply_response_id]
+                    and batch_artifacts["original_user_record_count"] == 2)
+                result.update(
+                    controller_advance_held_until_queued_stop=True,
+                    queued_before_batch_stop=batch_artifacts["queued_before_batch_stop"],
+                    queued_fixture_records_in_initial_session=batch_artifacts["queued_fixture_records_in_initial_session"],
+                    queued_reply_response_id=model.queued_reply_response_id,
+                    queued_reply_stop_observed=queued_reply_stop_observed,
+                    final_stop_response_ids=batch_artifacts["final_stop_response_ids"],
+                    no_additional_prompt_after_queued_reply=queued_path_verified)
             if batch_only:
                 success = (model.done and model.failed is None and state["session_id"] != initial_sid
                            and state.get("continuation_observed") and post_tool_batch_stop_observed
-                           and no_model_request_resumed_in_old_session and completion_bound_to_new_session
+                           and (queued_path_verified if queued_stop else no_model_request_resumed_in_old_session)
+                           and completion_bound_to_new_session
                            and batch_artifacts["initial_fixture_records_in_initial_session"] == 1
-                           and batch_artifacts["original_user_record_count"] == 1
+                           and batch_artifacts["original_user_record_count"] == (2 if queued_stop else 1)
                            and batch_artifacts["continued_session_binding"]
                            and batch_artifacts["continuation_records_in_new_session"] == 1
                            and set(model.batch_only_tool_calls) == {"Read"}
-                           and len(model.requests) == len(model.batch_only_tool_calls) + 1
+                           and len(model.requests) == len(model.batch_only_tool_calls) + (2 if queued_stop else 1)
                            and not starts and not deferred_submitted and not draft_entered)
             else:
                 success = (model.done and switched_before_finish and len(starts) == 1

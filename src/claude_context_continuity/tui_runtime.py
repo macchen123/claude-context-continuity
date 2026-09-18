@@ -478,6 +478,8 @@ class TuiRuntime(ContextRuntime):
                     state["stop_serial"] = state.get("stop_serial", 0) + 1
                     state["stop_turn_generation"] = state.get("turn_generation", 0)
                     state["stop_snapshot"] = {"instruction_head": source.instruction_bounds()["last"]}
+                    # 新 Stop 改由最终响应与输入快照核验，不再沿用旧工具批次的响应身份。
+                    state.pop("tool_batch_boundary", None)
                     self._save(state)
                 if state["phase"] != "paused" and state.get("continuation_hash"):
                     self._confirm_continuation(state)
