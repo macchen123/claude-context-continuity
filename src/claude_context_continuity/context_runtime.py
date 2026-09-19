@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -20,6 +21,12 @@ _BUDGET_FIELDS = ("bootstrap_input_tokens", "last_input_tokens", "max_positive_g
                   "handoff_reported", "last_sample_id")
 RUNTIME_SIGNAL = "<continuity-host-event>"
 
+
+@dataclass
+class _HookHistorySnapshot:
+    """One transient, validated history read shared only within one hook call."""
+
+    records: list[Any] | None = None
 
 
 def _runtime_message(text):
@@ -351,7 +358,8 @@ class ContextRuntime:
         with core.lock(self.lock_path, wait_seconds=5):
             return self._receipt(self._state())
 
-    def _bind(self, state: dict[str, Any], event: dict[str, Any]) -> HistorySource:
+    def _bind(self, state: dict[str, Any], event: dict[str, Any], *,
+              snapshot: _HookHistorySnapshot | None = None) -> HistorySource:
         if _sid(event, True) != state["session_id"]:
             raise ContextRuntimeError("hook session drifted")
         _event_cwd(event, state["cwd"], True)
@@ -360,7 +368,10 @@ class ContextRuntime:
             raise ContextRuntimeError("native history source drifted")
         state["source_path"] = str(source.path)
         self._catalogue_source(state)
-        bounds = source.instruction_bounds()
+        records = source._records()
+        bounds = source._bounds_from_records(records)
+        if snapshot is not None:
+            snapshot.records = records
         if state["authorization"] is None:
             if bounds["first"] is None:
                 raise MissingRootAuthorization("native history has no root user instruction")
@@ -410,14 +421,18 @@ class ContextRuntime:
             state.pop("pause_notice_key", None)
         return result
 
-    def _usage(self, state: dict[str, Any], required: bool, *, sample: dict[str, Any] | None = None
-               ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    def _usage(self, state: dict[str, Any], required: bool, *, sample: dict[str, Any] | None = None,
+               records: list[Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
         if not isinstance(state["source_path"], str):
             if required:
                 raise ContextRuntimeError("current native history source is unavailable")
             return None
         try:
-            usage = sample if sample is not None else HistorySource(Path(state["source_path"]), state["session_id"]).latest_usage()
+            if sample is not None:
+                usage = sample
+            else:
+                source = HistorySource(Path(state["source_path"]), state["session_id"])
+                usage = source._usage_from_records(records) if records is not None else source.latest_usage()
         except (HistoryError, TypeError) as exc:
             if required:
                 raise ContextRuntimeError("actual native usage is unavailable") from exc
@@ -502,8 +517,8 @@ class ContextRuntime:
             raise ContextRuntimeError("current native history cannot be verified") from exc
         self._verify_authorization(state)
 
-    def _context(self, state: dict[str, Any]) -> str | None:
-        observed = self._usage(state, False)
+    def _context(self, state: dict[str, Any], *, records: list[Any] | None = None) -> str | None:
+        observed = self._usage(state, False, records=records)
         if observed is None:
             return None
         usage, decision = observed
@@ -643,7 +658,8 @@ class ContextRuntime:
                     elif agent in handles:
                         handles.remove(agent)
                 else:
-                    self._bind(state, event)
+                    history = _HookHistorySnapshot()
+                    self._bind(state, event, snapshot=history)
                     self._window(state, event)
                     tool = event.get("tool_use_id")
                     if name == "PostToolBatch":
@@ -666,7 +682,9 @@ class ContextRuntime:
                         state["pending_tool_ids"].remove(tool)
                         if name == "PostToolUse":
                             self._settle_task_hook(state, event)
-                    context = self._context(state)
+                    if history.records is None:
+                        raise ContextRuntimeError("hook history snapshot is unavailable")
+                    context = self._context(state, records=history.records)
                 if (state["phase"] == "paused" and state.get("observation_only_pause") and context is not None
                         and not state["rotation"]["clear"] and not state.get("continuation_hash")):
                     state["last_observation_pause"] = {"reason": state["pause_reason"],

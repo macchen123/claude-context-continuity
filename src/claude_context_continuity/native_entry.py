@@ -76,13 +76,36 @@ def _native_cli_shape() -> tuple[frozenset[str], dict[str, tuple[str, bool]]] | 
     return (frozenset(commands), option_forms) if commands else None
 
 
-def _native_invocation(args: list[str]) -> bool:
+def _option_end(args: list[str], index: int, form: tuple[str, bool]) -> int | None:
+    if "=" in args[index]:
+        return index + 1
+    mode, variadic = form
+    next_index = index + 1
+    if mode == "none":
+        return next_index
+    if variadic:
+        if next_index >= len(args) or args[next_index] == "--" or _option_token(args[next_index]):
+            return None if mode == "required" else next_index
+        while next_index < len(args) and args[next_index] != "--" and not _option_token(args[next_index]):
+            next_index += 1
+        return next_index
+    if mode == "required":
+        if next_index >= len(args) or args[next_index] == "--":
+            return None
+        return next_index + 1
+    if next_index < len(args) and args[next_index] != "--" and not _option_token(args[next_index]):
+        return next_index + 1
+    return next_index
+
+
+def _native_invocation(args: list[str], *, parsed_options=None) -> bool:
     """Return whether the untouched argv must bypass the managed interactive TUI.
 
     One help-derived token walk recognizes actual options only: ``--`` ends
     option processing, required values may begin with ``-``, optional values do
     not consume the next option, and variadic operands consume their declared
-    non-option tail.  It does not rewrite, validate, or authorize argv.
+    non-option tail.  It does not rewrite, validate, or authorize argv.  Managed
+    launch checks may collect the same parsed options without a second parser.
     """
     shape = _native_cli_shape()
     if shape is None:
@@ -102,35 +125,13 @@ def _native_invocation(args: list[str]) -> bool:
                 return True
             if option in _NATIVE_DIRECT_OPTIONS:
                 return True
-            if "=" in token:
-                index += 1
-                continue
-
-            mode, variadic = form
-            next_index = index + 1
-            if mode == "none":
-                index = next_index
-                continue
-            if variadic:
-                if next_index >= len(args) or args[next_index] == "--" or _option_token(args[next_index]):
-                    return mode == "required"
-                while next_index < len(args) and args[next_index] != "--" and not _option_token(args[next_index]):
-                    next_index += 1
-                index = next_index
-                continue
-            if mode == "required":
-                if next_index >= len(args) or args[next_index] == "--":
-                    return True
-                # A required native option may itself take an option-shaped
-                # value, such as --system-prompt --print.
-                index = next_index + 1
-                continue
-            # An optional operand belongs to this option only when it is not
-            # another option and does not cross the explicit end marker.
-            if next_index < len(args) and args[next_index] != "--" and not _option_token(args[next_index]):
-                index = next_index + 1
-            else:
-                index = next_index
+            next_index = _option_end(args, index, form)
+            if next_index is None:
+                return True
+            if parsed_options is not None:
+                values = (token.split("=", 1)[1],) if "=" in token else tuple(args[index + 1:next_index])
+                parsed_options.append((option, values))
+            index = next_index
             continue
         if not saw_noncommand_positional and token in commands:
             return True
@@ -162,9 +163,13 @@ def main() -> int:
     args = sys.argv[1:]
     if _direct_native(args):
         return _exec_native(args)
-    from .tui_runtime import run
+    from .tui_runtime import SessionOwnerError, run
 
-    run(os.getcwd(), native_args=args)
+    try:
+        run(os.getcwd(), native_args=args)
+    except SessionOwnerError as exc:
+        print(f"cclaude: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
