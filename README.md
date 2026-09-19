@@ -215,6 +215,10 @@ claude-context tui-recover --context-id <context-id> --session-id <session-id>
 
 Use the exact IDs returned by `tui-status`. Recovery still verifies the native channel, session identity, and unsettled operations; it never forces ownership or replays an uncertain delivery when the required environment or confirmation is missing. If the native tmux session is also gone, neither attach nor controller recovery can bring that process back. Use native session resume instead, for example `cclaude --resume <session-id>`.
 
+Interactive `cclaude --resume <session-id>` (or `-r`) first checks whether that managed session is still running. When exactly one live instance can be verified, it reconnects to that instance without starting another native process or controller, or upgrading an already-running process. A resume command that also supplies a new prompt, model, permission mode, or other launch options is rejected rather than silently ignoring options or delivering input twice.
+
+Multiple live instances, unverifiable identity, or an uncertain prior launch are not resolved by automatically choosing, stopping, or restarting an instance. When this directory has a live instance, `--continue`, `--resume` without an ID, and session names are not guessed; use the complete session ID or `tui-attach`. Explicit `--fork-session` retains native independent-session behavior.
+
 ---
 
 <a id="contributing"></a>

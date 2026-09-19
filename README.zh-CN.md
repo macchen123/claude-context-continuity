@@ -215,6 +215,10 @@ claude-context tui-recover --context-id <context-id> --session-id <session-id>
 
 两个 ID 使用 `tui-status` 返回的准确值。恢复前仍须核对原生通道、会话身份和未结操作；缺少对应环境或投递结果未知时不会强行接管或重放。若原生 tmux 会话也已不存在，不能靠 `attach` 或控制器恢复命令找回该进程，应使用原生会话恢复入口，例如 `cclaude --resume <session-id>`。
 
+交互式 `cclaude --resume <session-id>`（或 `-r`）会先检查该受管会话是否仍在运行。只有一个可确认的存活实例时，直接连接它，不另开原生进程或控制器，也不升级已经运行的旧进程。若命令还带有新提示、模型或权限等启动选项，则明确拒绝，避免静默忽略选项或重复投递输入。
+
+发现多个存活实例、身份无法核验或上次启动结果不明时，不自动挑选、终止或重开。当前目录有存活实例时，`--continue`、无 ID 的 `--resume` 或会话名称也不会被猜测成某个实例；请改用完整 session ID 或 `tui-attach`。显式 `--fork-session` 仍按原生语义创建独立会话。
+
 ---
 
 <a id="contributing"></a>

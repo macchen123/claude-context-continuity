@@ -102,7 +102,8 @@ class TuiRuntime(ContextRuntime):
         return ContextRuntime._receipt(state) | {key: state.get(key) for key in (
             "transport", "initial_session_started", "native_clear_confirmations",
             "native_resume_confirmations", "continuation_observed", "manual_clear_count", "controller_pid",
-            "durable_cron_compat", "native_cli_version", "native_control", "output_budget")}
+            "durable_cron_compat", "native_cli_version", "native_control", "output_budget",
+            "native_session_uncertain", "launch_session_ids", "launch_pending")}
 
     def _verify_config(self, state):
         # 只读取实时预算；模型、权限和其他设置不属于本层管控范围。
@@ -730,8 +731,19 @@ class TuiRuntime(ContextRuntime):
                 if event.get("model") is not None:
                     state["native_session_model"] = event["model"]
                 state["session_start_source"] = source
+                if source in {"resume", "clear"} or sid in state.get("launch_session_ids", []):
+                    state.pop("launch_session_ids", None)
+                    state.pop("native_session_uncertain", None)
             except (ValueError, OSError, KeyError, TypeError) as exc:
                 state = previous
+                # A live pane is not proof that it still owns the old session.
+                # Reserve the reported ID without adopting its authorization.
+                state["native_session_uncertain"] = True
+                try:
+                    reported_sid = _uuid(event.get("session_id"), "native session_id")
+                    state["launch_session_ids"] = sorted(set(state.get("launch_session_ids", [])) | {reported_sid})
+                except (ValueError, TypeError):
+                    pass
                 self._pause(state, redact(str(exc), core.secret_values())[:400])
             result = self._hook_output(state, "SessionStart", context_prompt())
             self._save(state)
@@ -974,7 +986,107 @@ class TuiRuntime(ContextRuntime):
         return self.receipt()
 
 
+class SessionOwnerError(ContextRuntimeError):
+    """A new native launch cannot safely share an existing session."""
+
+
+def _launch_request(native_args):
+    from .native_entry import _native_invocation
+    options = []
+    _native_invocation(list(native_args), parsed_options=options)
+    fork = any(name == "--fork-session" for name, _ in options)
+    targets, ambiguous = set(), False
+    for name, values in options:
+        if name == "--session-id" or (not fork and name in {"--resume", "-r", "--continue", "-c"}):
+            try:
+                targets.add(core.uuid(values[0]) if len(values) == 1 else core.uuid(None))
+            except ValueError:
+                ambiguous = True
+    attach_sid = None
+    if not fork and len(targets) == 1 and not ambiguous:
+        sid = next(iter(targets))
+        if list(native_args) in (["--resume", sid], ["-r", sid], [f"--resume={sid}"], [f"-r={sid}"]):
+            attach_sid = sid
+    return targets, ambiguous, attach_sid
+
+
+def _live_launch_owner(cwd, targets, ambiguous):
+    """Use canonical context state plus real process checks, never a second owner registry."""
+    if not targets and not ambiguous:
+        return None
+    root = core.safe_path(core.HOME, "runtime/contexts", exists=False)
+    if not root.exists():
+        return None
+    owners = []
+    for directory in sorted(root.iterdir(), key=lambda path: path.name):
+        try:
+            core.uuid(directory.name)
+        except ValueError:
+            continue
+        if not directory.is_dir():
+            continue
+        try:
+            runtime = TuiRuntime(directory.name)
+            if not runtime.state_path.exists():
+                continue
+            with core.lock(runtime.lock_path, wait_seconds=5):
+                state = runtime._state()
+                requested = state.get("launch_session_ids", [])
+                uncertain = state.get("native_session_uncertain", False)
+                matches = state.get("session_id") in targets or bool(targets.intersection(requested))
+                if not matches and not ((ambiguous or uncertain) and state.get("cwd") == str(cwd)):
+                    continue
+                health = _health(runtime, state)
+                if not health["tmux_ready"]:
+                    pid = state.get("owned_pid")
+                    binding = state.get("tmux")
+                    invalid_pid = binding is not None and (type(pid) is not int or pid <= 0
+                                  or not isinstance(binding, dict) or binding.get("pane_pid") != pid)
+                    if health["pane_pid_alive"] is not False or invalid_pid or state.get("launch_pending"):
+                        raise SessionOwnerError("既有原生会话的存活状态或启动结果不明；保留现场，不另开实例")
+                    continue
+                if uncertain:
+                    raise SessionOwnerError("存活原生进程的会话身份尚未确认；请检查原受管终端，不连接旧身份或另开实例")
+                if state.get("cwd") != str(cwd):
+                    raise SessionOwnerError("该原生会话仍在其他工作目录运行；请连接原受管终端")
+                owners.append((runtime, state))
+        except FileNotFoundError:
+            continue
+        except SessionOwnerError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise SessionOwnerError("无法核验既有 context 身份；不另开可能重复的原生会话") from exc
+    if len(owners) > 1:
+        raise SessionOwnerError("该恢复请求对应多个存活实例；请用 tui-status 核对，不自动挑选或终止实例")
+    if owners and ambiguous:
+        raise SessionOwnerError("当前目录已有存活实例；请用完整 session ID 恢复，或用 tui-attach 连接，不能猜测会话选择结果")
+    return owners[0] if owners else None
+
+
+def _launch(cwd, *, prompt=None, width=120, height=40, native_args=(), reuse=False):
+    cwd = Path(cwd).resolve(strict=True)
+    targets, ambiguous, attach_sid = _launch_request(native_args)
+    # Serialize discovery and native creation; reservations stay in the same
+    # context state so a second launch cannot race the first SessionStart hook.
+    launch_lock = core.safe_path(core.HOME, "runtime/native-launch.lock", exists=False)
+    with core.lock(launch_lock, wait_seconds=5):
+        owner = _live_launch_owner(cwd, targets, ambiguous)
+        if owner is not None:
+            runtime, state = owner
+            if not reuse or attach_sid != state["session_id"] or prompt is not None:
+                raise SessionOwnerError("原生会话仍在运行；只可用不附加参数或新提示的 --resume <session-id> 连接，不会忽略启动选项或重复投递输入")
+            return runtime, True
+        return _create(cwd, prompt=prompt, width=width, height=height, native_args=native_args,
+                       launch_session_ids=sorted(targets), unresolved_resume=ambiguous), False
+
+
 def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
+    runtime, _ = _launch(cwd, prompt=prompt, width=width, height=height, native_args=native_args)
+    return runtime
+
+
+def _create(cwd, *, prompt=None, width=120, height=40, native_args=(), launch_session_ids=(),
+            unresolved_resume=False):
     from . import tmux_transport
     _durable_cron_compat_enabled()
     native_version = native_control.require_supported_cli()
@@ -1000,6 +1112,13 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
     if prompt is not None:
         argv.append(prompt)
     socket = Path(core.HOME) / "runtime" / "tmux" / f"{context_id}.sock"
+    with core.lock(runtime.lock_path, wait_seconds=5):
+        state = runtime._state()
+        state["launch_session_ids"] = list(launch_session_ids)
+        state["launch_pending"] = True
+        if unresolved_resume:
+            state["native_session_uncertain"] = True
+        runtime._save(state)
     binding = tmux_transport.create(socket, cwd, argv, env, width=width, height=height)
     with core.lock(runtime.lock_path, wait_seconds=5):
         state = runtime._state()
@@ -1008,6 +1127,7 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
         state["native_control"] = control
         state["native_cli_version"] = native_version
         state["owned_pid"] = binding["pane_pid"]
+        state["launch_pending"] = False
         runtime._save(state)
     return runtime
 
@@ -1143,7 +1263,14 @@ def run(cwd, *, prompt=None, detached=False, native_args=()):
     if not detached and not sys.stdin.isatty():
         raise ContextRuntimeError("原生 TUI 需从终端启动；隔离验证可显式使用 --detached")
     size = os.get_terminal_size() if sys.stdin.isatty() else os.terminal_size((120, 40))
-    runtime = create(cwd, prompt=prompt, width=size.columns, height=size.lines, native_args=native_args)
+    runtime, reused = _launch(cwd, prompt=prompt, width=size.columns, height=size.lines,
+                              native_args=native_args, reuse=True)
+    if reused:
+        result = {"health": status(runtime.conversation_id)["health"]} if detached else attach(runtime.conversation_id)
+        return {"status": "reused", "context_id": runtime.conversation_id,
+                "interface": "native_claude_tui_in_private_tmux", "state_path": str(runtime.state_path),
+                "attach_command": shlex.join(core.module_argv(
+                    "tui-attach", "--context-id", runtime.conversation_id)), **result}
     controller_env = {**os.environ, native_control.AUTH_ENV: runtime._control_auth,
                       "CLAUDE_CONTINUITY_ID": runtime.conversation_id}
     process = subprocess.Popen(core.module_argv("tui-serve", "--context-id", runtime.conversation_id),
