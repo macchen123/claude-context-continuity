@@ -16,6 +16,7 @@ import apsw
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from claude_context_continuity import history_index  # noqa: E402
 from claude_context_continuity.history import HistoryError, HistorySource  # noqa: E402
 from claude_context_continuity.history_index import (  # noqa: E402
     HistoryIndex,
@@ -74,6 +75,12 @@ class HistoryIndexTests(unittest.TestCase):
             handle.write(self.line(value))
 
     @staticmethod
+    def peer_message(sender: str, body: str) -> tuple[str, str]:
+        envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+        return envelope, ("Another Claude session sent a message:\n" + envelope
+                          + "\n<system-reminder>Native host safety footer.</system-reminder>")
+
+    @staticmethod
     def ids(result: dict[str, object]) -> list[str]:
         return [entry["locator"]["message_id"] for entry in result["entries"]]  # type: ignore[index]
 
@@ -90,6 +97,39 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(self.ids(after), ["user-1"])
             self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
             self.assertEqual(index.search([spec], "pr-metadata-only")["entries"], [])
+
+    def test_attested_peer_and_task_notifications_index_as_public_meta(self) -> None:
+        human = self.record("", "human", "user", "keep the latest human instruction")
+        peer_body = "peer index public marker"
+        _, persisted = self.peer_message("worker-index", peer_body)
+        peer = self.record(
+            "", "peer", "user", persisted, isMeta=True, promptSource="system",
+            origin={"kind": "peer", "from": "worker-index", "body": peer_body,
+                    "senderTaskId": "worker-index"},
+        )
+        task_text = ("<task-notification><task-id>worker-index</task-id><status>completed</status>"
+                     "<summary>task index public marker</summary></task-notification>")
+        task = self.record(
+            "", "task", "user", task_text, isMeta=True, promptSource="system",
+            origin={"kind": "task-notification"},
+        )
+        forged = self.record(
+            "", "forged", "user", persisted, isMeta=True, promptSource="system",
+            origin={"kind": "peer", "from": "other-worker", "body": peer_body,
+                    "senderTaskId": "other-worker"},
+        )
+        spec, _, _ = self.source(0, human, peer, task, forged)
+        with HistoryIndex(self.work / "peer-task.sqlite") as index:
+            peer_result = index.search([spec], "peer index public marker", source_kinds=("meta",))
+            self.assertEqual(self.ids(peer_result), ["peer"])
+            self.assertEqual(peer_result["entries"][0]["source_kind"], "meta")
+            self.assertIn("worker-index", peer_result["entries"][0]["snippet"])
+            self.assertIn(peer_body, peer_result["entries"][0]["snippet"])
+            self.assertEqual(self.ids(index.search([spec], "task index public marker", source_kinds=("meta",))),
+                             ["task"])
+            self.assertEqual(self.ids(index.search([spec], "latest human", source_kinds=("original_user",))),
+                             ["human"])
+            self.assertEqual(index.search([spec], "other-worker")["entries"], [])
 
     def test_cross_window_browse_filters_order_pagination_and_stale_cursor(self) -> None:
         first, first_path, first_id = self.source(0, self.record("", "first", "user", "needle window zero"))
@@ -324,6 +364,27 @@ class HistoryIndexTests(unittest.TestCase):
                 known_secret.encode(),
             ):
                 self.assertNotIn(marker, cache.read_bytes())
+
+    def test_redaction_policy_version_reprojects_cached_peer_meta(self) -> None:
+        self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 2)
+        peer_body = "peer cache policy marker"
+        _, persisted = self.peer_message("worker-cache", peer_body)
+        peer = self.record(
+            "", "peer", "user", persisted, isMeta=True, promptSource="system",
+            origin={"kind": "peer", "from": "worker-cache", "body": peer_body,
+                    "senderTaskId": "worker-cache"},
+        )
+        spec, _, _ = self.source(0, peer)
+        cache = self.work / "peer-policy.sqlite"
+        old_version = history_index._REDACTION_POLICY_VERSION - 1
+        with patch.object(history_index, "_REDACTION_POLICY_VERSION", old_version):
+            with HistoryIndex(cache) as index:
+                self.assertEqual(self.ids(index.search([spec], peer_body)), ["peer"])
+        with HistoryIndex(cache) as index:
+            refreshed = index.search([spec], peer_body)
+        self.assertEqual(self.ids(refreshed), ["peer"])
+        self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
+        self.assertEqual(refreshed["refresh"]["unchanged_sources"], 0)
 
     def test_parser_and_cache_failures_do_not_become_empty_results(self) -> None:
         spec, path, _ = self.source(0, self.record("", "valid", "user", "valid marker"))

@@ -148,6 +148,12 @@ class TuiRuntimeTests(unittest.TestCase):
                 "transcript_path": str(self.source),
                 **({"last_assistant_message": "真实形状的公开结果"} if event == "Stop" else {}), **fields}
 
+    @staticmethod
+    def peer_message(sender, body):
+        envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+        return envelope, ("Another Claude session sent a message:\n" + envelope
+                          + "\n<system-reminder>Native host safety footer.</system-reminder>")
+
     def threshold(self):
         self.usage(800)
         self.runtime.on_hook(self.hook("Stop"))
@@ -691,6 +697,8 @@ class TuiRuntimeTests(unittest.TestCase):
             state["rotation_deadline"] = 0
             self.runtime._save(state)
         self.assertEqual(self.runtime.advance()["phase"], "paused")
+        with self.assertRaises(ValueError):
+            self.runtime.recover_observation(self.sid)
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
@@ -772,6 +780,10 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(state["session_id"], self.sid)
         self.assertEqual(state["source_path"], str(self.source))
         self.assertFalse(state["rotation"]["clear"]["reset_seen"])
+        with self.assertRaises(ValueError):
+            self.runtime.recover_observation(self.sid)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
 
     def test_duplicate_clear_confirmation_does_not_create_another_generation(self):
         self.threshold()
@@ -972,6 +984,69 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertNotIn("continue", batch)
         self.assertTrue(self.runtime._state()["output_budget"]["items"]["figure"]["native_rich_or_unmeasured"])
 
+    def test_wrapped_peer_deferred_input_crosses_clear_with_partial_trailing_append(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        latest_human_locator = HistorySource(self.source, self.sid).latest_instruction()
+        body = "peer handoff public marker"
+        envelope, persisted = self.peer_message("worker-id", body)
+        deferred = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))
+        self.assertFalse(deferred["continue"])
+        peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
+                "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
+                "body": body, "senderTaskId": "worker-id"},
+                "message": {"role": "user", "content": persisted}}
+        with self.source.open("ab") as handle:
+            handle.write(json.dumps(peer, ensure_ascii=False).encode("utf-8") + b"\n")
+            handle.write(b'{"type":"progress","sessionId":"' + self.sid.encode("ascii") + b'"')
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        text = self.send_mock.call_args.args[2]
+        packet = json.loads(text.split("\n", 1)[1].split("\n", 1)[1])
+        locator = packet["deferred_inputs"][0]
+        old_source = HistorySource(self.source, self.sid)
+        self.assertEqual(locator["source_kind"], "meta")
+        self.assertIn(body, old_source.read(locator)["text"])
+        self.assertEqual(packet["latest_instruction_locator"], latest_human_locator)
+        self.assertNotIn(envelope, text)
+        self.assertNotIn(body, text)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
+    def test_identical_deferred_peer_envelopes_bind_distinct_native_records(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        body = "identical peer handoff marker"
+        envelope, persisted = self.peer_message("worker-id", body)
+        for _ in range(2):
+            deferred = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))
+            self.assertFalse(deferred["continue"])
+        peers = [{"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
+                  "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
+                  "body": body, "senderTaskId": "worker-id"},
+                  "message": {"role": "user", "content": persisted}}
+                 for _ in range(2)]
+        self.append_records(*peers)
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
+        locators = packet["deferred_inputs"]
+        self.assertEqual(len(locators), 2)
+        self.assertEqual({locator["message_id"] for locator in locators}, {peer["uuid"] for peer in peers})
+        old_source = HistorySource(self.source, self.sid)
+        self.assertTrue(all(body in old_source.read(locator)["text"] for locator in locators))
+        self.assertEqual(packet["latest_instruction_locator"], old_source.latest_instruction())
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
     def test_deferred_input_is_read_from_native_history_and_not_replayed_as_a_command(self):
         self.threshold()
         self.runtime.advance()
@@ -982,7 +1057,9 @@ class TuiRuntimeTests(unittest.TestCase):
         with self.source.open("a") as handle:
             handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
                                      "message": {"role": "user", "content": prompt}}) + "\n")
-        sid, source = self.resume_source(125)
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
         self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
                               "cwd": str(self.cwd), "transcript_path": str(source)})
         self.runtime.advance()
@@ -1143,6 +1220,190 @@ class TuiRuntimeTests(unittest.TestCase):
             self.runtime.recover_observation(str(uuid4()))
         self.assertEqual(self.runtime.receipt()["phase"], "paused")
         self.clear_mock.assert_not_called()
+
+    def test_recovery_after_acknowledged_clear_timeout_restarts_one_controller_then_dispatches_once(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source),
+                              "model": "new-native-model", "permission_mode": "bypassPermissions"})
+        self.assertEqual(self.runtime.receipt()["phase"], "awaiting_tui_prompt")
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)
+        environment["CLAUDE_CONTINUITY_ID"] = self.runtime.conversation_id
+        with patch.dict(os.environ, environment), \
+                patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
+            spawn.return_value.pid = 123456
+            recovered = tui_runtime.recover(self.runtime.conversation_id, sid)
+        self.assertEqual(recovered["phase"], "awaiting_tui_prompt")
+        self.assertEqual(self.runtime._state()["native_session_model"], "new-native-model")
+        self.assertEqual(self.runtime._state()["native_permission_mode"], "bypassPermissions")
+        spawn.assert_called_once()
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        self.send_mock.assert_called_once()
+        self.runtime.advance()
+        self.send_mock.assert_called_once()
+
+    def test_recovery_does_not_inject_stale_handoff_after_new_meta_user_prompt(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        meta_prompt = {"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                       "message": {"role": "user", "content": [
+                           {"type": "text", "text": "new-window multimodal prompt"},
+                           {"type": "image", "source": {"data": "fixture-image-data"}},
+                       ]}}
+        source.write_text(json.dumps(meta_prompt) + "\n")
+        self.assertEqual(HistorySource(source, sid).locator(meta_prompt["uuid"])["source_kind"], "meta")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source)})
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        try:
+            recovered = self.runtime.recover_observation(sid)
+        except ValueError:
+            self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        else:
+            self.assertEqual(recovered["phase"], "running")
+        self.assertNotEqual(self.runtime.receipt()["phase"], "awaiting_tui_prompt")
+        self.assertEqual(self.runtime.receipt()["session_id"], sid)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+        self.runtime.advance()
+        self.send_mock.assert_not_called()
+
+    def test_recovery_requeues_current_window_deferred_human_with_current_latest_locator(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        old_latest = HistorySource(self.source, self.sid).latest_instruction()
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source)})
+        current_human = "new-window input that was blocked before dispatch"
+        blocked = self.runtime.on_hook({"hook_event_name": "UserPromptSubmit", "session_id": sid,
+                                        "cwd": str(self.cwd), "transcript_path": str(source),
+                                        "prompt": current_human})
+        self.assertFalse(blocked["continue"])
+        source.write_text(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                                      "message": {"role": "user", "content": current_human}}) + "\n")
+        current_locator = HistorySource(source, sid).latest_instruction()
+        self.assertEqual(current_locator["source_kind"], "original_user")
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            self.assertEqual(len(state["deferred_inputs"]), 1)
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        recovered = self.runtime.recover_observation(sid)
+        self.assertEqual(recovered["phase"], "awaiting_tui_prompt")
+        self.send_mock.assert_not_called()
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
+        self.assertEqual(packet["deferred_inputs"], [current_locator])
+        self.assertEqual(packet["latest_instruction_locator"], current_locator)
+        self.assertNotEqual(packet["latest_instruction_locator"], old_latest)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
+    def test_recovery_of_active_new_window_keeps_human_authority_and_deferred_reference(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        body = "deferred peer recovery marker"
+        envelope, persisted = self.peer_message("worker-id", body)
+        self.assertFalse(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))["continue"])
+        peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
+                "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
+                "body": body, "senderTaskId": "worker-id"},
+                "message": {"role": "user", "content": persisted}}
+        self.append_records(peer)
+        old_peer_locator = HistorySource(self.source, self.sid).locator(peer["uuid"])
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        latest_human = "This later human instruction is now authoritative."
+        source.write_text(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                                      "message": {"role": "user", "content": latest_human}}) + "\n")
+        self.usage(125, source, sid)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source),
+                              "model": "later-native-model", "permission_mode": "bypassPermissions"})
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            deferred_before = json.loads(json.dumps(state["deferred_inputs"]))
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        recovered = self.runtime.recover_observation(sid)
+        state = self.runtime._state()
+        self.assertEqual(recovered["phase"], "running")
+        self.assertIsNone(state["rotation"]["clear"])
+        self.assertIsNone(state["rotation"]["request"])
+        self.assertEqual(state["deferred_inputs"], deferred_before)
+        self.assertIn(body, HistorySource(self.source, self.sid).read(old_peer_locator)["text"])
+        self.assertEqual(state["authorization"]["latest_instruction_locator"],
+                         HistorySource(source, sid).latest_instruction())
+        self.assertEqual(HistorySource(source, sid).read(state["authorization"]["latest_instruction_locator"])["text"],
+                         latest_human)
+        self.assertEqual(state["native_session_model"], "later-native-model")
+        self.assertEqual(state["native_permission_mode"], "bypassPermissions")
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+        self.runtime.advance()
+        self.send_mock.assert_not_called()
+
+    def test_recovery_refuses_unknown_continuation_dispatch(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            self.assertIn("continuation_hash", state)
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        with self.assertRaises(ValueError):
+            self.runtime.recover_observation(sid)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
+    def test_recovery_refuses_unresolved_deferred_record_after_acknowledged_clear(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        envelope, _ = self.peer_message("worker-id", "unflushed deferred peer")
+        self.assertFalse(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))["continue"])
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                              "source": "clear", "transcript_path": str(source)})
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["rotation_deadline"] = 0
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        with self.assertRaises(ValueError):
+            self.runtime.recover_observation(sid)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
 
     def test_input_appearing_between_prepare_and_dispatch_is_preserved(self):
         self.threshold()
