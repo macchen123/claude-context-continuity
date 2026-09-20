@@ -26,7 +26,7 @@ _STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-o
 _META = _META | _STATE_ONLY
 _RUNTIME = ("<system-reminder>", "<task-notification>", "[request interrupted", "<local-command-",
             "<cross-session-message", "<teammate-message", "[cross-session idle notice]",
-            "<continuity-host-event>")
+            "<agent-message", "another claude session sent a message:", "<continuity-host-event>")
 _PATH_FIELDS = ("saved_output", "saved_output_path", "persisted_output", "persisted_output_path", "output_path", "output_file", "file_path", "path")
 _ASSIGNMENT = re.compile(r"(?ix)(?P<key>\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|secret|client[_-]?secret|private[_-]?key|token)\b)(?P<sep>\s*(?:=|:)\s*)(?P<value>(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:bearer\s+)?[^\s,;]+))")
 _BEARER = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}")
@@ -136,6 +136,48 @@ def _queued_user_text(record: Mapping[str, Any]) -> str | None:
     return text
 
 
+def _peer_message_envelope(record: Mapping[str, Any]) -> str | None:
+    """只还原结构化原生 peer 来源，不把正文里的相似标签当传输身份。"""
+    if (record.get("type") != "user" or record.get("promptSource") != "system"
+            or record.get("isSidechain") or record.get("sourceToolAssistantUUID")):
+        return None
+    origin = record.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "peer":
+        return None
+    sender, body = origin.get("from"), origin.get("body")
+    if (not isinstance(sender, str) or not sender or any(c in sender for c in '<>"\r\n')
+            or not isinstance(body, str) or origin.get("senderTaskId") not in (None, sender)):
+        return None
+    envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+    text = _plain_user_text(record)
+    if text is None:
+        return None
+    text = text.strip()
+    for prefix in (envelope, "Another Claude session sent a message:\n" + envelope):
+        if text == prefix:
+            return envelope
+        if text.startswith(prefix + "\n"):
+            suffix = text[len(prefix):]
+            if "<agent-message" not in suffix and "</agent-message>" not in suffix:
+                return envelope
+    return None
+
+
+def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
+    """原生输入的精确公开形态；不模糊搜索或重建用户正文。"""
+    if record.get("isSidechain"):
+        return ()
+    if record.get("type") == "user":
+        if _results(record):
+            return ()
+        text = "\n".join(_texts(_content(record))).strip()
+        envelope = _peer_message_envelope(record)
+        return (text, envelope) if envelope is not None and envelope != text else (text,)
+    if _task_notice(record) is not None:
+        return ("\n".join(_texts(record["attachment"]["prompt"])).strip(),)
+    return ()
+
+
 def source_kind(record: Mapping[str, Any]) -> str:
     """Classify a record without promoting tool prose to user authorization."""
     if not isinstance(record, Mapping) or not isinstance(record.get("type"), str) or not record["type"]:
@@ -166,6 +208,10 @@ def source_kind(record: Mapping[str, Any]) -> str:
         return "meta" if _flag(record, "isMeta") else "assistant"
     if _results(record):  # tool_result wins even when quoted text is also present
         return "tool_result"
+    origin = record.get("origin")
+    if (isinstance(origin, dict) and origin.get("kind") in {"peer", "task-notification"}
+            and record.get("promptSource") == "system"):
+        return "meta"
     if _flag(record, "isMeta") or str(record.get("userType", "")).lower() in {"internal", "system", "meta"}:
         return "meta"
     text = _plain_user_text(record)
@@ -350,7 +396,7 @@ class HistorySource:
     def _records(
         self,
         *,
-        include_task_notifications: bool = False,
+        include_task_notifications: bool = True,
         defer_incomplete_tail: bool = False,
         _report_deferred_tail: bool = False,
     ) -> list[_Record] | tuple[list[_Record], bool]:
@@ -487,6 +533,9 @@ class HistorySource:
             text = "\n\n".join(f"Question: {question}\nAnswer: {answer}" for question, answer in pairs[info.message_id].selections)
         elif kind == "original_user" and info.data.get("type") == "attachment":
             text = _queued_user_text(info.data)
+        elif kind == "meta" and (_peer_message_envelope(info.data) is not None or _task_notice(info.data) is not None):
+            content = info.data["attachment"]["prompt"] if info.data.get("type") == "attachment" else _content(info.data)
+            text = "\n".join(_texts(content))
         elif kind in {"meta", "sidechain", "local_command"}:
             text = ""
         elif kind == "summary" and isinstance(info.data.get("summary"), str):
@@ -698,8 +747,12 @@ class HistorySource:
 
     def activity(self) -> dict[str, Any]:
         """从准确原生日志重建未结算工具和后台句柄，不复制业务状态。"""
+        return self._activity_from_records(self._records(include_task_notifications=True))
+
+    @staticmethod
+    def _activity_from_records(records: list[_Record]) -> dict[str, Any]:
         tools, results, backgrounds, controls = {}, set(), {}, {}
-        for info in self._records(include_task_notifications=True):
+        for info in records:
             notice = _task_notice(info.data)
             if notice is not None:
                 backgrounds.pop(notice[0], None)

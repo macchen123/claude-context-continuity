@@ -204,6 +204,8 @@ If a resumed window has no genuine user instruction yet, the host tries to verif
 
 `PostToolBatch hook stopped continuation` together with the context-switch notice means the old turn is yielding to a new window, not that the task is finished. If no continuation follows, check `tui-status`.
 
+Native peer messages and background-task completion notices arriving during a switch remain readable through History in the new window. They remain non-authoritative notifications, not new human instructions or approvals.
+
 ### 6. Does reconnecting a terminal restore automatic switching?
 Not necessarily. The `health` section of `tui-status` checks the controller process, exclusive lock, native tmux session, and control socket instead of relying only on the saved `phase`. `tui-attach` only reconnects the native terminal; it warns when the controller is unavailable and does not silently start a second controller.
 
@@ -214,6 +216,8 @@ claude-context tui-recover --context-id <context-id> --session-id <session-id>
 ```
 
 Use the exact IDs returned by `tui-status`. Recovery still verifies the native channel, session identity, and unsettled operations; it never forces ownership or replays an uncertain delivery when the required environment or confirmation is missing. If the native tmux session is also gone, neither attach nor controller recovery can bring that process back. Use native session resume instead, for example `cclaude --resume <session-id>`.
+
+If a clear was confirmed but the handoff was never dispatched, recovery does not clear again. It continues that one pending handoff only while the new window has not started a conversation; otherwise it restores observation without inserting the old handoff. Deferred inputs remain preserved, and uncertain deliveries are never resent.
 
 Interactive `cclaude --resume <session-id>` (or `-r`) first checks whether that managed session is still running. When exactly one live instance can be verified, it reconnects to that instance without starting another native process or controller, or upgrading an already-running process. A resume command that also supplies a new prompt, model, permission mode, or other launch options is rejected rather than silently ignoring options or delivering input twice.
 
