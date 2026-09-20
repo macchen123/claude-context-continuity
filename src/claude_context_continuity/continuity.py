@@ -183,7 +183,15 @@ def dispatch(args):
         if args.action == "tui-hook":
             if os.environ.get("CLAUDE_CONTINUITY_ID") != args.context_id:
                 raise core.ContinuityError("TUI hook 不属于当前自有进程")
-            return tui_runtime.TuiRuntime.load(args.context_id).on_hook(json.load(sys.stdin))
+            event = json.load(sys.stdin)
+            # A real managed native hook inherits the in-memory rendezvous
+            # credential.  It is the only automatic repair entry; attach never
+            # obtains or persists that credential.
+            # Bind the native epoch and invalidate old turn boundaries before
+            # allowing a repaired observer to act on this process's state.
+            result = tui_runtime.TuiRuntime.load(args.context_id).on_hook(event)
+            tui_runtime.repair_controller_from_hook(args.context_id, event)
+            return result
         if args.action == "tui-serve":
             return tui_runtime.serve(args.context_id)
         if args.action == "tui-attach":
@@ -238,7 +246,7 @@ def main():
             try:
                 from .context_runtime import ContextRuntime
                 if os.environ.get("CLAUDE_CONTINUITY_ID") == args.context_id:
-                    ContextRuntime.load(args.context_id)._pause_external("hook_observation_failed")
+                    ContextRuntime.load(args.context_id)._wait_external("hook_observation_failed")
             except (ValueError, OSError, KeyError, TypeError):
                 pass
             print("{}")

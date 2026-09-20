@@ -8,6 +8,10 @@ import subprocess
 import sys
 
 
+class NativeInvocationError(ValueError):
+    """An interactive invocation cannot be routed without losing monitoring."""
+
+
 # These native options own their own lifecycle or terminal/stream contract.
 _NATIVE_DIRECT_OPTIONS = frozenset({
     "-h", "--help", "-v", "--version", "-p", "--print", "--bare", "--safe-mode",
@@ -36,9 +40,9 @@ def _option_token(value: str) -> bool:
 def _native_cli_shape() -> tuple[frozenset[str], dict[str, tuple[str, bool]]] | None:
     """Read local help only to recognize current native commands and operands.
 
-    This never starts a model session.  If the native CLI cannot describe its
-    argv shape, callers preserve its invocation directly rather than guessing
-    that an unknown command or option belongs in the continuity TUI.
+    This never starts a model session. If the native CLI cannot describe its
+    argv shape, only explicit native modes bypass monitoring; ambiguous
+    interactive work fails visibly instead of silently becoming unmanaged.
     """
     try:
         completed = subprocess.run(
@@ -109,7 +113,11 @@ def _native_invocation(args: list[str], *, parsed_options=None) -> bool:
     """
     shape = _native_cli_shape()
     if shape is None:
-        return bool(args)
+        if not args or args[0] == "--":
+            return False
+        if args[0].split("=", 1)[0] in _NATIVE_DIRECT_OPTIONS:
+            return True
+        raise NativeInvocationError("无法读取原生 CLI 参数说明；未启动无监测的交互会话，请先检查 claude --help。")
     commands, option_forms = shape
     index = 0
     saw_noncommand_positional = False
@@ -161,7 +169,12 @@ def _exec_native(args: list[str]) -> int:
 
 def main() -> int:
     args = sys.argv[1:]
-    if _direct_native(args):
+    try:
+        direct = _direct_native(args)
+    except NativeInvocationError as exc:
+        print(f"cclaude: {exc}", file=sys.stderr)
+        return 2
+    if direct:
         return _exec_native(args)
     from .tui_runtime import SessionOwnerError, run
 

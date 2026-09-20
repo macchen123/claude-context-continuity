@@ -211,8 +211,10 @@ class NativeLaunchOwnerTests(unittest.TestCase):
             state = self.runtime._state()
             state["pending_tool_ids"] = ["unsettled-call"]
             self.runtime._save(state)
+        # Historical pending tools no longer make a genuine restore fail.  Use
+        # an actual SID/path mismatch to retain the failed-identity owner check.
         result = self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "resume",
-                                       "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)})
+                                       "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(self.source)})
         self.assertEqual(self.runtime._state()["session_id"], self.sid)
         self.assertNotIn("continue", result)
         self.assertNotIn("decision", result)

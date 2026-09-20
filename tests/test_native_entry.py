@@ -123,9 +123,29 @@ class NativeEntryTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(self._entry(argv), [("claude", ["claude", *argv])])
 
-    def test_unreadable_native_help_preserves_an_arg_bearing_native_invocation(self):
-        argv = ["future-native-command", "argument"]
-        self.assertEqual(self._entry(argv, shape=None), [("claude", ["claude", *argv])])
+    def test_unreadable_help_does_not_silently_launch_unmanaged_work(self):
+        import io
+
+        for argv in (["--resume", str(uuid4())], ["--continue"], ["normal task"],
+                     ["future-native-command", "argument"]):
+            with self.subTest(argv=argv), \
+                    patch.object(native_entry.sys, "argv", ["cclaude", *argv]), \
+                    patch.object(native_entry.sys, "stdin", _TTY()), \
+                    patch.object(native_entry.sys, "stdout", _TTY()), \
+                    patch.object(native_entry.sys, "stderr", io.StringIO()) as errors, \
+                    patch.object(native_entry, "_native_cli_shape", return_value=None), \
+                    patch.object(native_entry.os, "execvp") as execute, \
+                    patch("claude_context_continuity.tui_runtime.run") as run:
+                self.assertEqual(native_entry.main(), 2)
+                self.assertIn("无监测", errors.getvalue())
+                execute.assert_not_called()
+                run.assert_not_called()
+
+    def test_unreadable_help_keeps_explicit_native_modes_and_empty_tui(self):
+        for argv in (["--help"], ["--version"], ["--print", "hello"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._entry(argv, shape=None), [("claude", ["claude", *argv])])
+        self._managed_entry([], shape=None)
 
     def test_end_marker_and_required_operand_keep_print_literal_in_tui(self):
         shape = self._shape(required=("--system-prompt",))
