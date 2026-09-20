@@ -8,17 +8,24 @@ import re
 import socket
 import stat
 import subprocess
+import time
 
 from . import core
 
 AUTH_ENV = "CLAUDE_BG_RV_AUTH"
 SOCKET_ENV = "CLAUDE_BG_RENDEZVOUS_SOCK"
+HOOK_AUTH_ENV = "CCLAUDE_CONTROL_AUTH_TOKEN"
+HOOK_SOCKET_ENV = "CCLAUDE_CONTROL_SOCKET"
 PROTOCOL = "claude-background-rendezvous.v1"
 _MAX_PACKET_BYTES = 2 * core.MAX_PACKET
 
 
 class NativeControlError(core.ContinuityError):
     pass
+
+
+class NativeControlNotSent(NativeControlError):
+    """No command bytes were written; the caller may retry after readiness returns."""
 
 
 def require_supported_cli() -> str:
@@ -54,6 +61,10 @@ def environment(control: dict[str, str], auth: str) -> dict[str, str]:
         "CLAUDE_BG_BACKEND": "daemon",
         SOCKET_ENV: str(path),
         AUTH_ENV: auth,
+        # Native consumes its own background variables before launching hooks.
+        # Keep the same capability in memory, scoped to this managed context.
+        HOOK_SOCKET_ENV: str(path),
+        HOOK_AUTH_ENV: auth,
     }
 
 
@@ -85,23 +96,60 @@ def ready(control: dict[str, str]) -> bool:
     return True
 
 
+def _await_transport_barrier(client: socket.socket) -> None:
+    # The native server handles these frames in order.  Keep the connection
+    # alive until it reaches the redraw after our reply; this is NOT a clear
+    # or continuation acknowledgement.  SessionStart/history still decides that.
+    deadline = time.monotonic() + 5
+    pending = b""
+    received = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise NativeControlError("原生通道顺序回执未到达")
+        client.settimeout(remaining)
+        chunk = client.recv(8192)
+        if not chunk:
+            raise NativeControlError("原生通道在顺序回执之前关闭")
+        received += len(chunk)
+        if received > 65536:
+            raise NativeControlError("原生通道回执超过有界大小")
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if not line:
+                continue
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise NativeControlError("原生通道回执格式不符")
+            if message.get("type") in {"auth-rejected", "reply-rejected"}:
+                raise NativeControlError("原生通道拒绝投递；未确认执行")
+            if message.get("type") == "repaint-done":
+                return
+
+
 def _send(control: dict[str, str], auth: str, text: str) -> None:
-    _auth(auth)
-    if not ready(control):
-        raise NativeControlError("原生控制通道尚未就绪")
-    path = _path(control)
-    packet = "\n".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in (
-        {"role": "attacher", "auth": auth}, {"type": "reply", "text": text})) + "\n"
-    encoded = packet.encode("utf-8")
-    if len(encoded) > _MAX_PACKET_BYTES:
-        raise NativeControlError("原生控制消息超过有界交接大小")
-    # sendall 只证明写入本地通道；真正成功仍由 SessionStart/原生历史确认。
+    writing = False
     try:
+        _auth(auth)
+        if not ready(control):
+            raise NativeControlError("原生控制通道尚未就绪")
+        path = _path(control)
+        packet = "\n".join(json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in (
+            {"role": "attacher", "auth": auth}, {"type": "reply", "text": text}, {"type": "repaint"})) + "\n"
+        encoded = packet.encode("utf-8")
+        if len(encoded) > _MAX_PACKET_BYTES:
+            raise NativeControlError("原生控制消息超过有界交接大小")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5)
             client.connect(str(path))
+            # 开始 sendall 后，异常不能证明写入了零字节；仍以原生事件确认成功。
+            writing = True
             client.sendall(encoded)
-    except (OSError, ValueError) as exc:
+            _await_transport_barrier(client)
+    except (OSError, ValueError, core.ContinuityError) as exc:
+        if not writing:
+            raise NativeControlNotSent("原生消息尚未写出；等待通道或输入条件恢复") from exc
         raise NativeControlError("原生消息投递结果未知，不自动重发") from exc
 
 

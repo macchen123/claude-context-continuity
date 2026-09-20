@@ -15,7 +15,7 @@ from uuid import uuid4
 from . import core, native_control, __version__
 from .context_runtime import (ContextRuntime, ContextRuntimeError, _safe_note, _source, _uuid,
                               context_prompt, _runtime_message, _event_context_window)
-from .history import HistorySource, redact
+from .history import HistoryError, HistorySource, redact
 
 
 DURABLE_CRON_COMPAT_ENV = "CCLAUDE_DURABLE_CRON_COMPAT"
@@ -73,13 +73,13 @@ disable-model-invocation: true
 {request} --handoff '简短且真实的目标、进展、约束、来源和下一步'
 ```
 
-4. 查看返回的 phase/pause_reason。rotation_requested 或 waiting_safe_boundary 只表示请求/等待，不能宣称换窗已成功；若已存在请求，不重复提交，可用下面的只读命令核对：
+4. 查看返回的 phase/reconciliation。rotation_requested 或 waiting_safe_boundary 只表示请求/等待，不能宣称换窗已成功；若已存在请求，不重复提交，可用下面的只读命令核对：
 
 ```sh
 {status}
 ```
 
-5. 请求被接受后结束当前回合；宿主在当前直接工具调用结算后通过原生队列换窗。后台任务继续运行，已提交输入在新窗口处理，输入框草稿保持原样。若暂停则说明实际原因，不清状态、不盲目重试。
+5. 请求被接受后结束当前回合；宿主在当前直接工具调用结算后通过原生队列换窗。后台任务继续运行，已提交输入在新窗口处理，输入框草稿保持原样。若等待则说明实际原因，观察与恢复会继续；不清状态、不盲目重试。
 
 不要自行执行 /clear、向终端注入内容、创建新控制器或修改全局设置。新上下文由既有自动接续机制加载交接与 History/Notes。
 """
@@ -103,7 +103,9 @@ class TuiRuntime(ContextRuntime):
             "transport", "initial_session_started", "native_clear_confirmations",
             "native_resume_confirmations", "continuation_observed", "manual_clear_count", "controller_pid",
             "durable_cron_compat", "native_cli_version", "native_control", "output_budget",
-            "native_session_uncertain", "launch_session_ids", "launch_pending")}
+            "native_session_uncertain", "launch_session_ids", "launch_pending", "controller_managed",
+            "controller_expected", "controller_starting", "pending_session_start", "superseded_lifecycle",
+            "resume_historical_pending_tool_ids")}
 
     def _verify_config(self, state):
         # 只读取实时预算；模型、权限和其他设置不属于本层管控范围。
@@ -121,12 +123,20 @@ class TuiRuntime(ContextRuntime):
             state["native_context_window"] = observed
 
     @staticmethod
-    def _resume_eligible(state, sid):
-        """用户可在任意正常回合恢复；未结自动输入仍不能重放。"""
-        if (state["rotation"].get("clear") is not None
-                or state.get("continuation_hash") is not None
-                or state["pending_tool_ids"]):
-            raise ContextRuntimeError("仍有未结活动；保留原生恢复，仅暂停自动换窗")
+    def _superseded_lifecycle(state):
+        """Keep old receipts for audit, never as commands to replay in a resume."""
+        rotation = state.get("rotation") if isinstance(state.get("rotation"), dict) else {}
+        authorization = state.get("authorization")
+        return {
+            "session_id": state.get("session_id"), "source_path": state.get("source_path"),
+            "cwd": state.get("cwd"), "window_generation": state.get("window_generation"),
+            "phase": state.get("phase"), "pending_tool_ids": list(state.get("pending_tool_ids", [])),
+            "active_child_handles": list(state.get("active_child_handles", [])),
+            "rotation_generation": rotation.get("generation"),
+            "rotation_pending": bool(rotation.get("request")), "clear_pending": bool(rotation.get("clear")),
+            "continuation_hash": state.get("continuation_hash"),
+            "authorization": deepcopy(authorization) if isinstance(authorization, dict) else None,
+        }
 
     @staticmethod
     def _same_resume_binding(state, sid, source_path, cwd):
@@ -177,11 +187,10 @@ class TuiRuntime(ContextRuntime):
             entries.append(binding)
         return sorted(entries, key=lambda entry: (entry["generation"], entry["session_id"], entry["source_path"]))
 
-    def _resume_candidate(self, state, incoming_state, source, sid):
-        """Reset only transient ownership while retaining the target event identity on a deep copy."""
+    def _resume_candidate(self, state, incoming_state, sid, source_path):
+        """Adopt a validated native epoch before its JSONL has finished appearing."""
         entries = self._catalogue_entries(self)
         floor = self._catalogue_floor(state, entries)
-        source_path = str(source.path)
         known = [entry["generation"] for entry in entries
                  if (entry["session_id"], entry["source_path"]) == (sid, source_path)]
         incoming_generation = incoming_state.get("window_generation") if isinstance(incoming_state, dict) else None
@@ -192,20 +201,26 @@ class TuiRuntime(ContextRuntime):
         else:
             generation = floor + 1
         candidate = deepcopy(state)
+        candidate["superseded_lifecycle"] = self._superseded_lifecycle(state)
         candidate["phase"], candidate["pause_reason"] = "running", None
         candidate["rotation"] = {"generation": max(floor, generation), "request": None, "clear": None}
         candidate["window_generation"] = generation
-        candidate["session_id"], candidate["source_path"], candidate["authorization"] = sid, None, None
+        candidate["session_id"], candidate["source_path"], candidate["authorization"] = sid, source_path, None
         candidate["native_context_window"] = None
         candidate["usage"], candidate["budget_stream"], candidate["budget_handoff_signal"] = None, None, None
         candidate["budget"] = {}
-        candidate["deferred_inputs"] = []
+        # Receipts reference persisted submitted inputs; a resume is not proof
+        # that those inputs were consumed.  Preserve them without replaying text.
+        candidate["deferred_inputs"] = deepcopy(state.get("deferred_inputs", []))
+        candidate["pending_tool_ids"], candidate["active_child_handles"], candidate["background_tool_ids"] = [], [], []
         candidate["at_turn_boundary"] = False
         for key in ("output_budget", "tool_batch_boundary", "rotation_model", "rotation_permission",
-                    "rotation_deadline", "continuation_hash", "continuation_observed", "diagnostic",
-                    "observation_only_pause", "pause_notice_key", "last_observation_pause", "stop_observed_at",
-                    "stop_text_hash", "stop_serial", "stop_turn_generation", "stop_snapshot",
-                    "settlement_stop_serial", "resume_safe_boundary", "resume_snapshot"):
+                    "rotation_deadline", "continuation_hash", "continuation_observed", "continuation_input_receipts",
+                    "continuation_stop_serial", "diagnostic",
+                    "observation_only_pause", "pause_notice_key", "wait_notice_key", "last_observation_pause",
+                    "stop_observed_at", "stop_text_hash", "stop_serial", "stop_turn_generation", "stop_snapshot",
+                    "settlement_stop_serial", "resume_safe_boundary", "resume_snapshot",
+                    "resume_historical_pending_tool_ids", "reconciliation"):
             candidate.pop(key, None)
         return candidate
 
@@ -254,12 +269,10 @@ class TuiRuntime(ContextRuntime):
             rotation = owner_state.get("rotation")
             if not isinstance(rotation, dict) or type(owner_state.get("window_generation")) is not int:
                 raise ContextRuntimeError("恢复 owner 状态无效")
-            if (rotation.get("request") is not None or rotation.get("clear") is not None
-                    or owner_state.get("continuation_hash") is not None
-                    or owner_state.get("pending_tool_ids")
-                    or owner_state.get("phase") in {"clear_sent", "awaiting_tui_prompt",
-                                                    "continuation_dispatching", "awaiting_continuation"}):
-                raise ContextRuntimeError("恢复 owner 仍有未结自动操作")
+            # Authority lineage is a verified historical fact.  A stale clear,
+            # direct tool receipt, or continuation marker decides only whether an
+            # old command may run; it must not prevent binding the real resumed
+            # native epoch.
             owner._catalogue_source(owner_state, require_existing=True)
             authorization = owner_state.get("authorization")
             if authorization is None:
@@ -271,6 +284,17 @@ class TuiRuntime(ContextRuntime):
             }, self._lineage_catalogue_entries(owner, owner_state, authorization)))
 
         consider(self, incoming_state)
+        # Once this manager has adopted the new epoch, its prior exact owner
+        # receipt lives here rather than in the mutable current fields.
+        prior = incoming_state.get("superseded_lifecycle") if isinstance(incoming_state, dict) else None
+        if isinstance(prior, dict) and isinstance(prior.get("authorization"), dict):
+            prior_owner = {
+                "session_id": prior.get("session_id"), "source_path": prior.get("source_path"),
+                "cwd": prior.get("cwd"), "window_generation": prior.get("window_generation"),
+                "rotation": {"generation": prior.get("rotation_generation"), "request": None, "clear": None},
+                "authorization": prior["authorization"],
+            }
+            consider(self, prior_owner)
         root = self.directory.parent
         try:
             directories = sorted(root.iterdir(), key=lambda path: path.name)
@@ -335,68 +359,125 @@ class TuiRuntime(ContextRuntime):
         candidate["window_generation"] = target_generation
         candidate["rotation"]["generation"] = max(candidate["rotation"]["generation"], floor, target_generation)
 
-    def _bind_resume(self, state, event, sid, *, incoming_state=None):
-        """Bind an exact native resume source, including a verified prior owner for host-only windows."""
-        self._resume_eligible(state, sid)
-        source = _source(event.get("transcript_path"), sid)
-        activity, latest = source.activity(), source.latest_usage()
-        if latest["cwd"] != state["cwd"]:
+    @staticmethod
+    def _resume_binding(event, sid, cwd):
+        """Persist only the exact SessionStart identity needed for re-observation."""
+        path = event.get("transcript_path")
+        if not isinstance(path, str):
+            raise ContextRuntimeError("SessionStart 缺少准确原生历史路径")
+        return {"hook_event_name": "SessionStart", "source": "resume", "session_id": sid,
+                "cwd": cwd, "transcript_path": path}
+
+    def _complete_resume_binding(self, candidate, binding, *, incoming_state=None):
+        """Complete a previously accepted resume only from a readable exact prefix."""
+        sid = binding["session_id"]
+        source = _source(binding["transcript_path"], sid)
+        records = source._records(defer_incomplete_tail=True)
+        latest = source._usage_from_records(records)
+        if latest["cwd"] != candidate["cwd"]:
             raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
-        if activity["pending_tools"]:
-            raise ContextRuntimeError("恢复来源仍有未结算的直接工具调用，不自动接管")
-        incoming_state = state if incoming_state is None else incoming_state
-        candidate = self._resume_candidate(state, incoming_state, source, sid)
         candidate["source_path"] = str(source.path)
-        bounds = source.instruction_bounds()
-        if bounds["first"] is None:
-            selected = self._resolve_resume_authorization(incoming_state, source, sid, state["cwd"])
-            if selected is None:
-                self._catalogue_source(candidate)
-                self._window(candidate, event)
-                observed = self._usage(candidate, True)
-                if observed is None:
-                    raise ContextRuntimeError("恢复来源没有可用的实际原生用量")
-                usage, _ = observed
-                candidate["native_session_model"] = usage["actual_model"]
-                candidate["phase"] = "paused"
-                candidate["pause_reason"] = "native history has no root user instruction"
-                candidate["observation_only_pause"] = True
-                state.clear()
-                state.update(candidate)
-                return
-            authorization, references = selected
-            candidate["authorization"] = deepcopy(authorization)
-            self._verify_authorization(candidate)
-            self._adopt_lineage_catalogue(candidate, incoming_state, source, references)
-            source = self._bind(candidate, event)
-        else:
-            source = self._bind(candidate, event)
-        self._verify_authorization(candidate)
-        self._window(candidate, event)
-        observed = self._usage(candidate, True)
+        self._catalogue_source(candidate)
+        self._observe_authorization_records(candidate, source, records)
+        activity = source._activity_from_records(records)
+        # Calls already present in the resumed transcript belong to the prior
+        # execution epoch.  Preserve their exact IDs for diagnostics, but do not
+        # let them reintroduce an old deadlock or replay them.  New current-epoch
+        # calls are tracked by subsequent real hooks in ``pending_tool_ids``.
+        if "resume_historical_pending_tool_ids" not in candidate:
+            candidate["resume_historical_pending_tool_ids"] = sorted(activity["pending_tools"])
+            candidate["active_child_handles"] = sorted(activity["background_handles"])
+        bounds = source._bounds_from_records(records)
+        self._window(candidate, binding)
+        observed = self._usage(candidate, True, sample=latest)
         if observed is None:
             raise ContextRuntimeError("恢复来源没有可用的实际原生用量")
         usage, _ = observed
         candidate["native_session_model"] = usage["actual_model"]
-        candidate["resume_safe_boundary"] = True
-        candidate["resume_snapshot"] = {
-            "instruction_head": source.instruction_bounds()["last"],
-            "usage_locator": usage["usage_locator"],
-        }
+        owner_state = candidate if incoming_state is None else incoming_state
+        if bounds["first"] is None:
+            selected = self._resolve_resume_authorization(owner_state, source, sid, candidate["cwd"])
+            if selected is None:
+                self._wait(candidate, "native_root_authorization_pending")
+                return False
+            authorization, references = selected
+            candidate["authorization"] = deepcopy(authorization)
+            self._verify_authorization(candidate)
+            self._adopt_lineage_catalogue(candidate, owner_state, source, references)
+        self._verify_authorization(candidate)
+        if not binding.get("activity_observed"):
+            candidate["resume_safe_boundary"] = True
+            candidate["resume_snapshot"] = {
+                "instruction_head": source._bounds_from_records(records)["last"],
+                "usage_locator": usage["usage_locator"],
+            }
         candidate["native_resume_confirmations"] = candidate.get("native_resume_confirmations", 0) + 1
+        return True
+
+    def _bind_resume(self, state, event, sid, *, incoming_state=None):
+        """Accept a validated native epoch before waiting for its history prefix."""
+        incoming_state = state if incoming_state is None else incoming_state
+        binding = self._resume_binding(event, sid, state["cwd"])
+        if Path(binding["transcript_path"]).is_file():
+            try:
+                source = _source(binding["transcript_path"], sid)
+                latest = source._usage_from_records(source._records(defer_incomplete_tail=True))
+            except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError):
+                pass  # The validated native path may still be awaiting its prefix.
+            else:
+                if latest["cwd"] != state["cwd"]:
+                    raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
+        candidate = self._resume_candidate(state, incoming_state, sid, binding["transcript_path"])
+        candidate["pending_session_start"] = binding
+        self._catalogue_source(candidate)
+        self._window(candidate, event)
+        if event.get("model") is not None:
+            candidate["native_session_model"] = event["model"]
+        try:
+            complete = self._complete_resume_binding(candidate, binding, incoming_state=incoming_state)
+        except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+            self._wait(candidate, "resume_history_prefix_pending")
+            candidate["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+        else:
+            if complete:
+                candidate.pop("pending_session_start", None)
+                self._clear_wait(candidate)
         state.clear()
         state.update(candidate)
 
+    def _reconcile_pending_session_start(self, state):
+        binding = state.get("pending_session_start")
+        if not isinstance(binding, dict) or binding.get("source") != "resume":
+            return False
+        if binding.get("session_id") != state.get("session_id") or binding.get("cwd") != state.get("cwd"):
+            self._wait(state, "resume_binding_identity_drift")
+            return False
+        try:
+            complete = self._complete_resume_binding(state, binding, incoming_state=state)
+        except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+            self._wait(state, "resume_history_prefix_pending")
+            state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+            return False
+        if complete:
+            state.pop("pending_session_start", None)
+            self._clear_wait(state)
+            return True
+        return False
+
     def _resume_flushed(self, state, source, records):
-        """恢复后的首次清空只接受未被并发来源改写的精确历史快照。"""
+        """A fresh resumed turn invalidates only the old boundary, never observation."""
         snapshot = state.get("resume_snapshot")
         if not isinstance(snapshot, dict):
-            raise ContextRuntimeError("恢复安全边界缺少历史快照")
+            self._invalidate_resume_boundary(state, "resume_boundary_snapshot_missing")
+            self._wait(state, "resume_boundary_stale_waiting_for_next_boundary")
+            return False
         if source._bounds_from_records(records)["last"] != snapshot.get("instruction_head"):
-            self._pause(state, "恢复来源在首次安全边界前收到新的用户指令，不自动清空")
+            self._invalidate_resume_boundary(state, "fresh_user_activity_after_resume")
+            self._wait(state, "resume_boundary_stale_waiting_for_next_boundary")
             return False
         if source._usage_from_records(records)["locator"] != snapshot.get("usage_locator"):
-            self._pause(state, "恢复来源在首次安全边界前发生新的模型活动，不自动清空")
+            self._invalidate_resume_boundary(state, "fresh_model_activity_after_resume")
+            self._wait(state, "resume_boundary_stale_waiting_for_next_boundary")
             return False
         return True
 
@@ -436,20 +517,25 @@ class TuiRuntime(ContextRuntime):
         if not isinstance(event, dict):
             return super().on_hook(event)
         name = event.get("hook_event_name")
-        if event.get("agent_id") or event.get("agentId"):
-            if name not in {"SubagentStart", "SubagentStop", "PreCompact"}:
-                return {}
-        if name == "Stop":
-            try:
-                self.recover_observation(event.get("session_id"))
-            except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
-                pass  # 本轮仍无法确认时，只保留自动换窗暂停。
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
+            self._normalize_legacy_pause(state)
+            if self._settle_superseded_hook(state, event):
+                self._save(state)
+                return {}
+            pending = state.get("pending_session_start")
+            if (isinstance(pending, dict) and event.get("session_id") == state["session_id"]
+                    and name in {"UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop"}
+                    and not (event.get("agent_id") or event.get("agentId"))):
+                pending["activity_observed"] = True
+                self._save(state)
             permission = event.get("permission_mode")
             if permission is not None:
                 state["native_permission_mode"] = permission
                 self._save(state)
+        if event.get("agent_id") or event.get("agentId"):
+            if name not in {"SubagentStart", "SubagentStop", "PreCompact"}:
+                return {}
         if name == "UserPromptSubmit":
             return self._user_prompt(event)
         if name != "SessionStart":
@@ -457,7 +543,7 @@ class TuiRuntime(ContextRuntime):
                 with core.lock(self.lock_path, wait_seconds=5):
                     state = self._state()
                     if event.get("session_id") != state["session_id"]:
-                        self._pause(state, "TUI Stop 会话身份不符")
+                        self._wait(state, "stop_session_identity_pending")
                     else:
                         state["at_turn_boundary"] = False
                         state["stop_observed_at"] = time.monotonic()
@@ -473,17 +559,22 @@ class TuiRuntime(ContextRuntime):
                         result = self._finish_batch(state, event, result)
                 if name == "Stop" and event.get("session_id") == state["session_id"] and state.get("source_path"):
                     source = HistorySource(Path(state["source_path"]), state["session_id"])
+                    records = source._records(defer_incomplete_tail=True)
                     final_text = event.get("last_assistant_message")
                     state["stop_text_hash"] = core.digest(final_text.strip()) if isinstance(final_text, str) else None
                     state["at_turn_boundary"] = True
                     state["stop_serial"] = state.get("stop_serial", 0) + 1
                     state["stop_turn_generation"] = state.get("turn_generation", 0)
-                    state["stop_snapshot"] = {"instruction_head": source.instruction_bounds()["last"]}
+                    state["stop_snapshot"] = {"instruction_head": source._bounds_from_records(records)["last"]}
                     # 新 Stop 改由最终响应与输入快照核验，不再沿用旧工具批次的响应身份。
                     state.pop("tool_batch_boundary", None)
                     self._save(state)
-                if state["phase"] != "paused" and state.get("continuation_hash"):
-                    self._confirm_continuation(state)
+                if state.get("continuation_hash"):
+                    try:
+                        self._confirm_continuation(state)
+                    except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                        self._wait(state, "continuation_history_confirmation_pending")
+                        state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
                 result = self._repair_durable_cron(state, event, result)
                 self._save(state)
             return result
@@ -543,20 +634,48 @@ class TuiRuntime(ContextRuntime):
         accounting["total_text_bytes"] += model_bytes
         return result
 
+    @staticmethod
+    def _waiting_budget_stop(result):
+        result = dict(result)
+        result["continue"] = False
+        result["stopReason"] = "cclaude 正在等待原生确认；为保留上下文，已暂缓下一次模型请求。"
+        return result
+
+    @staticmethod
+    def _defer_submitted_input(state, event, prompt):
+        # continue:false 保留原生 user 记录但不调用模型；这里只记来源与哈希，不另造输入队列。
+        path = event.get("transcript_path") or state.get("source_path")
+        receipt = {"session_id": state["session_id"], "source_path": path,
+                   "prompt_hash": core.digest(prompt.strip()),
+                   "after_byte": Path(path).stat().st_size if path and Path(path).is_file() else 0,
+                   "turn_generation": state["turn_generation"]}
+        state.setdefault("deferred_inputs", []).append(receipt)
+        state["at_turn_boundary"] = True
+
     def _finish_batch(self, state, event, result):
-        if state["phase"] == "paused" or not state.get("usage"):
+        context = result.get("hookSpecificOutput", {}).get("additionalContext", "")
+        usage = state.get("usage")
+        if not isinstance(usage, dict):
+            return result
+        if self._waiting(state) and not context:
+            return result  # 当前来源未给出新的可信观察，不能用旧状态编造预算事实。
+        budget = state.get("budget", {})
+        if (type(usage.get("total_input_and_cache_tokens")) is not int
+                or type(usage.get("native_context_window")) is not int
+                or type(budget.get("guard_tokens")) is not int):
             return result
         for call in event["tool_calls"]:
             self._observe_output(state, call, {}, can_replace=False)
         accounting = self._output_accounting(state)
-        usage = state["usage"]
         projected = (usage["total_input_and_cache_tokens"] + usage.get("output_tokens", 0)
-                     + accounting["total_text_bytes"]
-                     + len(result.get("hookSpecificOutput", {}).get("additionalContext", "").encode("utf-8")))
-        if (projected >= usage["native_context_window"] - state["budget"]["guard_tokens"]
-                or any(item["defer"] for item in accounting["items"].values())):
+                     + accounting["total_text_bytes"] + len(context.encode("utf-8")))
+        over_budget = (projected >= usage["native_context_window"] - budget["guard_tokens"]
+                       or any(item["defer"] for item in accounting["items"].values()))
+        if over_budget:
             state["budget_handoff_signal"] = {"generation": state["window_generation"],
                 "reason": "pending_tool_output_budget", "projected_text_budget": projected}
+        if self._waiting(state):
+            return self._waiting_budget_stop(result) if over_budget else result
         self._automatic_rotation(state)
         if state["rotation"]["request"]:
             state["tool_batch_boundary"] = {"session_id": state["session_id"],
@@ -568,72 +687,93 @@ class TuiRuntime(ContextRuntime):
             result["stopReason"] = "正在自动切换上下文；后台任务继续运行，后续输入和结果在新窗口处理。"
         return result
 
-    def _recover_prompt_observation(self, state, event):
-        """Let a genuine newly persisted user record restore an observation-only paused source."""
-        if state["phase"] != "paused" or not state.get("observation_only_pause"):
-            return False
-        if state["rotation"]["clear"] or state.get("continuation_hash") or state["pending_tool_ids"]:
-            return False
+    def _hold_input_while_waiting(self, state, event, prompt, result):
+        """Keep the existing receipt-only budget hold active during reconciliation."""
         try:
-            self._verify_config(state)
-            self._bind(state, event)
-            self._verify_authorization(state)
-            self._window(state, event)
-            if self._usage(state, True) is None:
-                raise ContextRuntimeError("恢复来源没有可用的实际原生用量")
-        except (OSError, TypeError, ValueError, KeyError) as exc:
-            state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
-            return False
-        state["last_observation_pause"] = {"reason": state["pause_reason"],
-                                           "diagnostic": state.get("diagnostic")}
-        state["phase"] = "rotation_requested" if state["rotation"]["request"] else "running"
-        state["pause_reason"] = None
-        state.pop("diagnostic", None)
-        state.pop("observation_only_pause", None)
-        state["background_tool_ids"] = []
-        state["at_turn_boundary"] = False
-        state.pop("resume_safe_boundary", None)
-        state.pop("resume_snapshot", None)
-        state.pop("tool_batch_boundary", None)
-        state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
-        return True
+            observed = self._usage(state, False)
+        except (OSError, TypeError, ValueError, KeyError, ContextRuntimeError):
+            observed = None
+        if observed is None:
+            return result
+        usage, _ = observed
+        accounting = self._output_accounting(state)
+        budget = state.get("budget", {})
+        if not (isinstance(accounting, dict)
+                and type(usage.get("total_input_and_cache_tokens")) is int
+                and type(usage.get("native_context_window")) is int
+                and type(budget.get("guard_tokens")) is int):
+            return result
+        projected = (usage["total_input_and_cache_tokens"] + usage.get("output_tokens", 0)
+                     + accounting["total_text_bytes"] + len(prompt.encode("utf-8")))
+        over_budget = (projected >= usage["native_context_window"] - budget["guard_tokens"]
+                       or any(item["defer"] for item in accounting["items"].values()))
+        if over_budget:
+            self._defer_submitted_input(state, event, prompt)
+            return self._waiting_budget_stop(result)
+        return result
 
     def _user_prompt(self, event):
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
+            self._normalize_legacy_pause(state)
             name = "UserPromptSubmit"
+            if self._settle_superseded_hook(state, event):
+                self._save(state)
+                return {}
+            self._reconcile_pending_session_start(state)
             if event.get("session_id") != state["session_id"]:
-                self._pause(state, "输入所属会话不符")
+                self._wait(state, "input_session_identity_pending")
                 result = self._hook_output(state, name)
                 self._save(state)
                 return result
-            self._recover_prompt_observation(state, event)
+            try:
+                self._verify_config(state)
+                self._bind(state, event)
+                self._window(state, event)
+                observed = self._usage(state, False)
+                if (observed is not None and self._waiting(state)
+                        and state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}
+                        and not state.get("pending_session_start") and not state.get("native_session_uncertain")
+                        and state.get("authorization")):
+                    self._clear_wait(state)
+            except (OSError, TypeError, ValueError, HistoryError, core.ContinuityError, ContextRuntimeError) as exc:
+                self._wait(state, "prompt_history_prefix_pending")
+                state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
             prompt = event.get("prompt", "")
             own_input = isinstance(prompt, str) and core.digest(prompt.strip()) == state.get("continuation_hash")
             if state.get("continuation_hash") and not own_input:
-                self._confirm_continuation(state)
-            state.pop("resume_safe_boundary", None)
-            state.pop("resume_snapshot", None)
+                try:
+                    self._confirm_continuation(state)
+                except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                    self._wait(state, "continuation_history_confirmation_pending")
+                    state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+            if not own_input and state.get("resume_safe_boundary"):
+                self._invalidate_resume_boundary(state, "fresh_user_activity_after_resume")
+                self._wait(state, "resume_boundary_stale_waiting_for_next_boundary")
             state.pop("tool_batch_boundary", None)
             state["at_turn_boundary"] = False
             state["turn_generation"] = state.get("turn_generation", 0) + 1
             result = self._hook_output(state, name)
-            if not own_input and state["phase"] != "paused" and prompt.strip() != "/clear":
-                self._usage(state, False)
-                self._automatic_rotation(state)
-                switching = state["rotation"]["request"] is not None or state["phase"] in {
-                    "clear_sent", "awaiting_tui_prompt", "continuation_dispatching", "awaiting_continuation"}
+            if not own_input and isinstance(prompt, str) and prompt.strip() != "/clear":
+                switching = bool(state["rotation"]["request"] or state["rotation"]["clear"]) or state["phase"] in {
+                    "clear_sent", "awaiting_tui_prompt", "continuation_dispatching"}
+                # A confirmed or delivery-unknown rotation must retain every
+                # submitted input first, even while its diagnostics are waiting.
                 if switching:
-                    # continue:false 保留原生 user 记录但不调用模型；这里只记来源与哈希，不另造输入队列。
-                    path = event.get("transcript_path") or state.get("source_path")
-                    receipt = {"session_id": state["session_id"], "source_path": path,
-                               "prompt_hash": core.digest(prompt.strip()),
-                               "after_byte": Path(path).stat().st_size if path and Path(path).is_file() else 0,
-                               "turn_generation": state["turn_generation"]}
-                    state.setdefault("deferred_inputs", []).append(receipt)
-                    state["at_turn_boundary"] = True
-                    result["continue"] = False
-                    result["stopReason"] = "正在切换上下文；刚提交的内容将在新窗口处理，后台任务照常运行。"
+                    self._defer_submitted_input(state, event, prompt)
+                    if self._waiting(state):
+                        result = self._waiting_budget_stop(result)
+                    else:
+                        result["continue"] = False
+                        result["stopReason"] = "正在切换上下文；刚提交的内容将在新窗口处理，后台任务照常运行。"
+                elif self._waiting(state):
+                    result = self._hold_input_while_waiting(state, event, prompt, result)
+                else:
+                    self._automatic_rotation(state)
+                    if state["rotation"]["request"] is not None:
+                        self._defer_submitted_input(state, event, prompt)
+                        result["continue"] = False
+                        result["stopReason"] = "正在切换上下文；刚提交的内容将在新窗口处理，后台任务照常运行。"
             self._save(state)
         return result
 
@@ -660,10 +800,64 @@ class TuiRuntime(ContextRuntime):
             locators.append(source.locator(found.message_id))
         return locators
 
+    def _confirmed_clear_activity(self, state):
+        """Return whether a confirmed new window started work beyond deferred input."""
+        from .history import _peer_message_envelope, _task_notice
+        clear, request = state["rotation"].get("clear"), state["rotation"].get("request")
+        if not isinstance(clear, dict) or not isinstance(request, dict):
+            return False
+        if not (clear.get("reset_seen") is True and clear.get("new_session_id") == state.get("session_id")
+                and clear.get("old_session_id") == request.get("session_id")
+                and clear.get("generation") == request.get("generation")):
+            return False
+        # Native clear is independently confirmed by SessionStart.  Some host
+        # versions publish the new JSONL path only after accepting the queued
+        # continuation; absent path is not evidence of concurrent activity.
+        if not state.get("source_path"):
+            return False
+        source = _source(state.get("source_path"), state["session_id"])
+        records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
+        if incomplete:
+            return None
+        deferred = self._deferred_input_locators(state)
+        if deferred is None:
+            return None
+        deferred_ids = {(item["source_path"], item["session_id"], item["message_id"]) for item in deferred}
+        for row in records:
+            identity = (str(source.path), source.session_id, row.message_id)
+            if identity in deferred_ids:
+                continue
+            if row.kind == "original_user":
+                return True
+            if row.kind == "assistant" and row.data.get("message", {}).get("model") != "<synthetic>":
+                return True
+            if (row.data.get("type") == "user" and row.kind not in {"tool_result", "sidechain", "local_command"}
+                    and (not row.data.get("isMeta") or _peer_message_envelope(row.data) is not None
+                         or _task_notice(row.data) is not None)):
+                return True
+        return False
+
+    def _cancel_stale_confirmed_clear(self, state, reason):
+        clear = state["rotation"].get("clear")
+        state["last_stale_rotation"] = {
+            "reason": reason,
+            "generation": clear.get("generation") if isinstance(clear, dict) else None,
+            "new_session_id": state.get("session_id"),
+        }
+        state["rotation"]["request"] = state["rotation"]["clear"] = None
+        state.pop("continuation_hash", None)
+        state.pop("rotation_model", None)
+        state.pop("rotation_permission", None)
+        state["phase"] = "running"
+        state["at_turn_boundary"] = False
+        state.pop("tool_batch_boundary", None)
+        self._clear_wait(state)
+
     def _session_start(self, event):
-        """原生换窗事实始终可观测；暂停只约束后续自动输入。"""
+        """Accept native epochs first, then reconcile their exact history prefix."""
         with core.lock(self.lock_path, wait_seconds=5):
             previous = self._state()
+            self._normalize_legacy_pause(previous)
             state = deepcopy(previous)
             try:
                 self._verify_config(state)
@@ -678,7 +872,9 @@ class TuiRuntime(ContextRuntime):
                             or native_path.resolve(strict=False) != native_path):
                         raise ContextRuntimeError("SessionStart 的原生历史路径不符")
                 old_sid, source = state["session_id"], event.get("source")
-                duplicate = (state["phase"] != "created" and sid == old_sid
+                # A SID/source pair is not a resume-event identity: the user can
+                # genuinely restore that same session after intervening work.
+                duplicate = (state["phase"] != "created" and sid == old_sid and source != "resume"
                              and source == state.get("session_start_source"))
                 if duplicate and path is not None and state.get("source_path") not in {None, path}:
                     raise ContextRuntimeError("重复 SessionStart 的原生历史路径不符")
@@ -691,7 +887,7 @@ class TuiRuntime(ContextRuntime):
                     state["phase"] = "running"
                     state["initial_session_started"] = True
                 elif duplicate:
-                    pass
+                    self._reconcile_pending_session_start(state)
                 elif source == "resume":
                     self._bind_resume(state, event, sid, incoming_state=previous)
                 elif source == "clear" and sid != old_sid:
@@ -704,8 +900,10 @@ class TuiRuntime(ContextRuntime):
                         state["phase"] = "awaiting_tui_prompt"
                         state["rotation_deadline"] = time.monotonic() + 45
                         state["native_clear_confirmations"] = state.get("native_clear_confirmations", 0) + 1
+                        self._clear_wait(state)
                     else:
-                        # 手动 /clear 只绑定新的空上下文，不复活旧任务或旧交接。
+                        # 手动 /clear 只 binds a fresh native epoch; old
+                        # requests are never revived or replayed.
                         state["authorization"] = None
                         state["deferred_inputs"] = []
                         state["window_generation"] = max(state["window_generation"], state["rotation"]["generation"]) + 1
@@ -715,10 +913,7 @@ class TuiRuntime(ContextRuntime):
                         state.pop("continuation_hash", None)
                         state.pop("rotation_model", None)
                         state.pop("rotation_permission", None)
-                    if previous["phase"] == "paused":
-                        state["last_observation_pause"] = {
-                            "reason": previous["pause_reason"], "diagnostic": previous.get("diagnostic")}
-                    state["pause_reason"], state["diagnostic"] = None, None
+                        self._clear_wait(state)
                     state["session_id"], state["source_path"] = sid, None
                     state["native_context_window"] = None
                     state["budget"], state["budget_handoff_signal"] = {}, None
@@ -726,7 +921,8 @@ class TuiRuntime(ContextRuntime):
                     state.pop("output_budget", None)
                     state.pop("tool_batch_boundary", None)
                     state["at_turn_boundary"] = False
-                    for key in ("resume_safe_boundary", "resume_snapshot", "stop_snapshot", "stop_text_hash"):
+                    for key in ("resume_safe_boundary", "resume_snapshot", "resume_historical_pending_tool_ids",
+                                "stop_snapshot", "stop_text_hash"):
                         state.pop(key, None)
                 else:
                     raise ContextRuntimeError("未安排的会话切换；保留状态，不自动接管")
@@ -740,98 +936,51 @@ class TuiRuntime(ContextRuntime):
                 if source in {"resume", "clear"} or sid in state.get("launch_session_ids", []):
                     state.pop("launch_session_ids", None)
                     state.pop("native_session_uncertain", None)
-            except (ValueError, OSError, KeyError, TypeError) as exc:
+            except (OSError, TypeError, ValueError, KeyError, HistoryError, core.ContinuityError, ContextRuntimeError) as exc:
                 state = previous
-                # A live pane is not proof that it still owns the old session.
-                # Reserve the reported ID without adopting its authorization.
+                # A malformed event is not adopted, but a later genuine native
+                # SessionStart may still provide the exact source.
                 state["native_session_uncertain"] = True
                 try:
                     reported_sid = _uuid(event.get("session_id"), "native session_id")
                     state["launch_session_ids"] = sorted(set(state.get("launch_session_ids", [])) | {reported_sid})
                 except (ValueError, TypeError):
                     pass
-                self._pause(state, redact(str(exc), core.secret_values())[:400])
+                self._wait(state, "session_start_identity_or_history_pending")
+                state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
             result = self._hook_output(state, "SessionStart", context_prompt())
             self._save(state)
         return result
 
     def recover_observation(self, session_id):
-        """重读准确会话；已确认且未投递的换窗可恢复，不重发未知操作。"""
+        """Manually request one safe re-observation; it never replays a command."""
         from . import tmux_transport
-        from .history import _peer_message_envelope, _task_notice
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
+            self._normalize_legacy_pause(state)
             if session_id != state["session_id"] or state.get("transport") != "tmux_tui":
                 raise ContextRuntimeError("恢复目标不是准确的原生会话")
-            if state["phase"] != "paused":
-                return self._receipt(state)
             tmux_transport.inspect(state["tmux"])
-            if state.get("continuation_hash") or state["pending_tool_ids"]:
-                raise ContextRuntimeError("自动输入结果或活动尚未结算；不重放")
-            clear, request = state["rotation"]["clear"], state["rotation"]["request"]
-            deferred = []
-            if clear:
-                if (not isinstance(request, dict) or clear.get("reset_seen") is not True
-                        or clear.get("new_session_id") != session_id
-                        or clear.get("old_session_id") != request.get("session_id")
-                        or clear.get("old_session_id") == session_id
-                        or clear.get("generation") != request.get("generation")
-                        or clear.get("generation") != state["window_generation"]
-                        or clear.get("generation") != state["rotation"]["generation"]):
-                    raise ContextRuntimeError("clear 尚未准确确认或换窗身份不符；不重放")
-                deferred = self._deferred_input_locators(state)
-                if deferred is None:
-                    raise ContextRuntimeError("延后输入尚未准确定位；保留待交接记录")
-            source = _source(state["source_path"], session_id)
-            activity = source.activity()
-            if activity["pending_tools"]:
-                raise ContextRuntimeError("原生来源仍有未结算的直接工具调用；不恢复自动换窗")
-            records = source._records()
-            deferred_ids = {(item["source_path"], item["session_id"], item["message_id"]) for item in deferred}
-
-            def active_input(row):
-                if (str(source.path), source.session_id, row.message_id) in deferred_ids:
-                    return False  # continue:false 留存的输入尚未开始模型回合。
-                if row.kind == "original_user":
-                    return True
-                return (row.data.get("type") == "user" and row.kind not in {"tool_result", "sidechain", "local_command"}
-                        and (not row.data.get("isMeta") or _peer_message_envelope(row.data) is not None
-                             or _task_notice(row.data) is not None))
-
-            active_session = any(active_input(row) or (
-                row.kind == "assistant" and row.data.get("message", {}).get("model") != "<synthetic>")
-                for row in records)
             self._verify_config(state)
-            self._bind(state, {"session_id": session_id, "cwd": state["cwd"],
-                               "transcript_path": state["source_path"]})
-            next_phase = "running"
-            if clear and not active_session:
-                prior = _source(request["source_path"], request["session_id"])
-                latest = prior.instruction_bounds()["last"]
-                if latest is not None and source._bounds_from_records(records)["last"] is None:
-                    state["authorization"]["latest_instruction_locator"] = latest
-                next_phase = "awaiting_tui_prompt"
-                state["rotation_deadline"] = time.monotonic() + 45
-            else:
-                self._usage(state, True)
-            self._verify_authorization(state)
-            state["last_observation_pause"] = {
-                "reason": state["pause_reason"], "diagnostic": state.get("diagnostic"),
-                "confirmed_clear": deepcopy(clear), "recovered_phase": next_phase}
-            if clear and active_session:
-                # 新窗口已有人类输入或模型工作：仅恢复观测，不注入过时交接。
-                # 延后消息仍保留原始定位，下一次正常换窗携带，不另造内容队列。
-                state["rotation"]["request"] = state["rotation"]["clear"] = None
-                state.pop("rotation_model", None)
-                state.pop("rotation_permission", None)
-            state["phase"], state["pause_reason"] = next_phase, None
-            state["diagnostic"] = None
-            state["background_tool_ids"] = []
-            state["at_turn_boundary"] = False
-            state.pop("resume_safe_boundary", None)
-            state.pop("resume_snapshot", None)
-            state.pop("tool_batch_boundary", None)
-            state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
+            self._reconcile_pending_session_start(state)
+            if state.get("continuation_hash"):
+                try:
+                    self._confirm_continuation(state)
+                except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                    self._wait(state, "continuation_history_confirmation_pending")
+                    state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+            elif state["phase"] not in {"clear_sent", "awaiting_tui_prompt", "continuation_dispatching"}:
+                try:
+                    source, records = self._refresh_bound_source(state)
+                    self._usage(state, True, sample=source._usage_from_records(records))
+                    if state.get("authorization"):
+                        self._verify_authorization(state)
+                except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                    self._wait(state, "manual_observation_prefix_pending")
+                    state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+                else:
+                    if not state.get("pending_session_start"):
+                        self._clear_wait(state)
             self._save(state)
             return self._receipt(state)
 
@@ -929,16 +1078,37 @@ class TuiRuntime(ContextRuntime):
         if not path or not Path(path).exists() or not state.get("continuation_hash"):
             return False
         source = _source(path, state["session_id"])
+        # A complete continuation record remains decisive even while native is
+        # appending a later record.  Never infer delivery from the transport.
         observed = any(core.digest("\n".join(_texts(_content(info.data)))) == state["continuation_hash"]
-                       for info in source._records() if info.data.get("type") == "user")
+                       for info in source._records(defer_incomplete_tail=True) if info.data.get("type") == "user")
         if observed:
             state["continuation_observed"] = True
             state.pop("continuation_hash", None)
             state.pop("rotation_model", None)
             state.pop("rotation_permission", None)
-            state["deferred_inputs"] = []
+            covered = list(state.pop("continuation_input_receipts", []))
+            remaining = []
+            for receipt in state.get("deferred_inputs", []):
+                digest = core.digest(receipt)
+                if digest in covered:
+                    covered.remove(digest)
+                else:
+                    remaining.append(receipt)
+            state["deferred_inputs"] = remaining
+            # Only receipts encoded in this handoff are consumed.  Inputs held
+            # after dispatch stay ordered and become a new rotation at the next
+            # real batch/Stop boundary; the original handoff is never replayed.
+            # The original request and clear receipt remain durable until this
+            # exact native-history confirmation, then settle together once.
+            state["rotation"]["request"] = state["rotation"]["clear"] = None
             state["phase"] = "running"
-            state["at_turn_boundary"] = False
+            # A held input alone is not the running continuation's safe boundary.
+            # Preserve only a later real batch/Stop, never clear active thinking.
+            dispatch_stop = state.pop("continuation_stop_serial", state.get("stop_serial", 0))
+            state["at_turn_boundary"] = bool(state.get("at_turn_boundary") and (
+                state.get("tool_batch_boundary") or state.get("stop_serial", 0) > dispatch_stop))
+            self._clear_wait(state)
         return observed
 
     @staticmethod
@@ -948,48 +1118,120 @@ class TuiRuntime(ContextRuntime):
         return source, (str(source.path), source.session_id, stat.st_dev, stat.st_ino,
                         stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
+    @staticmethod
+    def _current_epoch_pending(state, activity):
+        historical = set(state.get("resume_historical_pending_tool_ids", []))
+        return set(activity["pending_tools"]) - historical
+
+    def _reconcile_normal_observation(self, state):
+        """Retry only a known current binding; no synthetic hook or input is made."""
+        if (not state.get("source_path") or state.get("pending_session_start")
+                or state.get("native_session_uncertain")):
+            return False
+        source, records = self._refresh_bound_source(state)
+        observed = self._usage(state, False, sample=source._usage_from_records(records))
+        if observed is None:
+            raise ContextRuntimeError("current native usage is not yet available")
+        if state.get("authorization"):
+            self._verify_authorization(state)
+            self._clear_wait(state)
+            return True
+        self._wait(state, "native_root_authorization_pending")
+        return False
+
+    def _deadline_wait(self, state):
+        deadline = state.get("rotation_deadline")
+        if not isinstance(deadline, (int, float)) or time.monotonic() <= deadline:
+            return
+        phase = state.get("phase")
+        if phase == "clear_sent":
+            self._wait(state, "clear_confirmation_deadline_elapsed")
+        elif phase == "awaiting_tui_prompt":
+            self._wait(state, "continuation_dispatch_deadline_elapsed")
+        elif phase in {"continuation_dispatching", "awaiting_continuation"}:
+            self._wait(state, "continuation_history_confirmation_deadline_elapsed")
+
+    def _rollback_not_sent(self, state, action):
+        """Only NativeControlNotSent proves the pre-send stage remains safe."""
+        if action == "clear":
+            state["rotation"]["clear"] = None
+            state["phase"] = "rotation_requested"
+        else:
+            state.pop("continuation_hash", None)
+            state.pop("continuation_input_receipts", None)
+            state.pop("continuation_stop_serial", None)
+            state["continuation_observed"] = False
+            state["phase"] = "awaiting_tui_prompt"
+        self._wait(state, "native_control_prewrite_not_sent")
+
     def advance(self):
         from . import tmux_transport
         action = None
         idle_stamp = None
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
-            if state["phase"] in {"paused", "closed"} or not state.get("tmux"):
+            self._normalize_legacy_pause(state)
+            if state["phase"] == "closed" or not state.get("tmux"):
+                self._save(state)
                 return self._receipt(state)
             try:
                 tmux_transport.inspect(state["tmux"])
                 self._verify_config(state)
+                if state.get("native_session_uncertain"):
+                    self._wait(state, "native_session_identity_pending")
+                    self._save(state)
+                    return self._receipt(state)
                 control = state.get("native_control")
                 if not control:
-                    raise ContextRuntimeError("当前控制器未建立原生消息通道；不回退到输入框注入")
-                if state["phase"] == "awaiting_continuation":
-                    self._confirm_continuation(state)
-                if state["phase"] in {"clear_sent", "awaiting_tui_prompt", "awaiting_continuation"}:
-                    if time.monotonic() > state["rotation_deadline"]:
-                        if state["phase"] == "awaiting_tui_prompt":
-                            if not native_control.ready(control):
-                                detail = "原生接续通道未就绪"
-                            elif self._deferred_input_locators(state) is None:
-                                detail = "延后输入尚未准确定位"
-                            else:
-                                detail = "投递前的确认期限已过"
-                            raise ContextRuntimeError("新会话已确认，交接尚未投递：" + detail)
-                        raise ContextRuntimeError("未收到准确的新会话或输入接收确认；不按延迟猜测成功")
+                    self._wait(state, "native_control_binding_pending")
+                else:
+                    self._reconcile_pending_session_start(state)
+                    if state.get("continuation_hash"):
+                        try:
+                            self._confirm_continuation(state)
+                        except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                            self._wait(state, "continuation_history_confirmation_pending")
+                            state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+                    self._deadline_wait(state)
                 if state["phase"] == "awaiting_tui_prompt":
-                    if native_control.ready(control) and self._deferred_input_locators(state) is not None:
+                    activity = self._confirmed_clear_activity(state)
+                    if activity is True:
+                        source, records = self._refresh_bound_source(state)
+                        if state.get("authorization"):
+                            self._verify_authorization(state)
+                        self._cancel_stale_confirmed_clear(state, "new_window_activity_before_continuation")
+                    elif activity is None:
+                        self._wait(state, "new_window_history_prefix_pending")
+                    elif control and native_control.ready(control) and self._deferred_input_locators(state) is not None:
                         text = _runtime_message(self._continuation(state))
                         state["continuation_hash"] = core.digest(text)
+                        state["continuation_input_receipts"] = [core.digest(item)
+                                                                for item in state.get("deferred_inputs", [])]
+                        state["continuation_stop_serial"] = state.get("stop_serial", 0)
                         state["continuation_observed"] = False
                         state["phase"] = "continuation_dispatching"
                         action = ("continue", text, control)
+                elif state["phase"] == "continuation_dispatching":
+                    # An interrupted controller cannot prove that no command bytes
+                    # were written after it staged this dispatch.
+                    state["phase"] = "awaiting_continuation"
+                    self._wait(state, "continuation_dispatch_outcome_unknown")
                 elif state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}:
-                    if (state.get("at_turn_boundary") or state.get("resume_safe_boundary")) and state.get("source_path"):
+                    if self._waiting(state):
+                        try:
+                            self._reconcile_normal_observation(state)
+                        except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                            self._wait(state, "native_history_prefix_pending")
+                            state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+                    if (not self._waiting(state) and (state.get("at_turn_boundary")
+                            or state.get("resume_safe_boundary")) and state.get("source_path")):
                         source, stamp = self._history_stamp(state)
                         if getattr(self, "_idle_observation", None) == (stamp, core.digest(state)):
                             return self._receipt(state)
                         self._idle_observation = None
                         records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
                         if incomplete or self._history_stamp(state)[1] != stamp:
+                            self._wait(state, "native_history_prefix_appending")
                             self._save(state)
                             return self._receipt(state)
                         resuming = bool(state.get("resume_safe_boundary"))
@@ -1001,8 +1243,8 @@ class TuiRuntime(ContextRuntime):
                         self._usage(state, True, sample=source._usage_from_records(records))
                         self._automatic_rotation(state)
                         if state["rotation"]["request"]:
-                            activity = source.activity()
-                            if activity["pending_tools"] or state["pending_tool_ids"]:
+                            activity = source._activity_from_records(records)
+                            if self._current_epoch_pending(state, activity) or state["pending_tool_ids"]:
                                 state["phase"] = "waiting_safe_boundary"
                             elif native_control.ready(control):
                                 self._latest_before_clear(state)
@@ -1022,38 +1264,50 @@ class TuiRuntime(ContextRuntime):
                             state["at_turn_boundary"] = False
                         if not state["rotation"]["request"]:
                             idle_stamp = stamp
-            except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            except (ValueError, OSError, KeyError, TypeError, HistoryError, core.ContinuityError,
+                    ContextRuntimeError, subprocess.SubprocessError) as exc:
                 try:
                     os.kill(state["tmux"]["pane_pid"], 0)
                 except ProcessLookupError:
                     state["phase"] = "closed"
                     state["native_process_exited"] = True
                 else:
-                    self._pause(state, redact(str(exc), core.secret_values())[:400])
+                    self._wait(state, "advance_state_or_io_pending")
+                    state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
             self._save(state)
             # 只保留来源元数据和状态摘要，不跨轮持有历史正文。
-            if idle_stamp is not None and state["phase"] == "running":
+            if idle_stamp is not None and state["phase"] == "running" and not self._waiting(state):
                 self._idle_observation = (idle_stamp, core.digest(state))
         if action:
             try:
                 with core.lock(self.lock_path, wait_seconds=5):
                     state = self._state()
+                    self._normalize_legacy_pause(state)
                     expected = "clear_sent" if action[0] == "clear" else "continuation_dispatching"
                     if state["phase"] != expected:
                         return self._receipt(state)
-                    tmux_transport.inspect(state["tmux"])
-                    auth = getattr(self, "_control_auth", None) or os.environ.get(native_control.AUTH_ENV)
-                    if action[0] == "clear":
-                        native_control.send_clear(action[2], auth)
-                    else:
-                        native_control.send_continuation(action[2], auth, action[1])
+                    # Once continuation dispatch begins, every non-NotSent fault
+                    # is delivery-unknown, including a controller interruption.
+                    if action[0] == "continue":
                         state["phase"] = "awaiting_continuation"
                         state["rotation_deadline"] = time.monotonic() + 45
-                        state["rotation"]["request"] = state["rotation"]["clear"] = None
                         state["at_turn_boundary"] = False
                         self._save(state)
-            except Exception as exc:
-                self._pause_external("原生消息投递结果未知，不重发：" + redact(str(exc), core.secret_values())[:200])
+                    try:
+                        tmux_transport.inspect(state["tmux"])
+                        auth = getattr(self, "_control_auth", None) or os.environ.get(native_control.AUTH_ENV)
+                        if action[0] == "clear":
+                            native_control.send_clear(action[2], auth)
+                        else:
+                            native_control.send_continuation(action[2], auth, action[1])
+                    except native_control.NativeControlNotSent:
+                        self._rollback_not_sent(state, action[0])
+                    except Exception as exc:
+                        self._wait(state, "native_control_delivery_unknown")
+                        state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+                    self._save(state)
+            except (OSError, TypeError, ValueError, KeyError, core.ContinuityError, ContextRuntimeError):
+                self._wait_external("native_control_delivery_unknown")
         return self.receipt()
 
 
@@ -1134,7 +1388,7 @@ def _live_launch_owner(cwd, targets, ambiguous):
     return owners[0] if owners else None
 
 
-def _launch(cwd, *, prompt=None, width=120, height=40, native_args=(), reuse=False):
+def _launch(cwd, *, prompt=None, width=120, height=40, native_args=(), reuse=False, controller_managed=False):
     cwd = Path(cwd).resolve(strict=True)
     targets, ambiguous, attach_sid = _launch_request(native_args)
     # Serialize discovery and native creation; reservations stay in the same
@@ -1148,7 +1402,8 @@ def _launch(cwd, *, prompt=None, width=120, height=40, native_args=(), reuse=Fal
                 raise SessionOwnerError("原生会话仍在运行；只可用不附加参数或新提示的 --resume <session-id> 连接，不会忽略启动选项或重复投递输入")
             return runtime, True
         return _create(cwd, prompt=prompt, width=width, height=height, native_args=native_args,
-                       launch_session_ids=sorted(targets), unresolved_resume=ambiguous), False
+                       launch_session_ids=sorted(targets), unresolved_resume=ambiguous,
+                       controller_managed=controller_managed), False
 
 
 def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
@@ -1157,7 +1412,7 @@ def create(cwd, *, prompt=None, width=120, height=40, native_args=()):
 
 
 def _create(cwd, *, prompt=None, width=120, height=40, native_args=(), launch_session_ids=(),
-            unresolved_resume=False):
+            unresolved_resume=False, controller_managed=False):
     from . import tmux_transport
     _durable_cron_compat_enabled()
     native_version = native_control.require_supported_cli()
@@ -1187,6 +1442,12 @@ def _create(cwd, *, prompt=None, width=120, height=40, native_args=(), launch_se
         state = runtime._state()
         state["launch_session_ids"] = list(launch_session_ids)
         state["launch_pending"] = True
+        # Mark the expected observer before the native process can emit a hook.
+        # Public create()/manual advance keeps this explicit/manual by default.
+        state["controller_managed"] = bool(controller_managed)
+        state["controller_expected"] = bool(controller_managed)
+        state["controller_starting"] = False
+        state["native_control"] = control
         if unresolved_resume:
             state["native_session_uncertain"] = True
         runtime._save(state)
@@ -1228,6 +1489,103 @@ def _controller_locked(runtime):
     except FileNotFoundError:
         pass
     return False
+
+
+def _controller_environment(runtime, state, environment, *, automatic):
+    """Validate only the live managed process environment; never persist it."""
+    if automatic and state.get("controller_managed") is not True:
+        raise ContextRuntimeError("当前 context 未标记为受管控制器；不自动接管手动 fixture")
+    control = state.get("native_control")
+    if not isinstance(control, dict):
+        raise ContextRuntimeError("当前 context 没有原生控制绑定")
+    native_pair = (environment.get(native_control.SOCKET_ENV), environment.get(native_control.AUTH_ENV))
+    owned_pair = (environment.get(native_control.HOOK_SOCKET_ENV), environment.get(native_control.HOOK_AUTH_ENV))
+    native_present = any(name in environment for name in (native_control.SOCKET_ENV, native_control.AUTH_ENV))
+    owned_present = any(name in environment for name in (native_control.HOOK_SOCKET_ENV, native_control.HOOK_AUTH_ENV))
+    # Claude Code consumes its rendezvous variables before spawning hooks.  The
+    # cclaude aliases retain that same launch capability in memory, not a new
+    # credential or control channel.  Never mix incomplete or conflicting pairs.
+    for present, pair in ((native_present, native_pair), (owned_present, owned_pair)):
+        if present and any(not isinstance(value, str) or not value for value in pair):
+            raise ContextRuntimeError("控制器通道环境不完整")
+    if native_present and owned_present and native_pair != owned_pair:
+        raise ContextRuntimeError("原生与受管控制器通道环境冲突")
+    socket_path, auth = owned_pair if owned_present else native_pair
+    if (environment.get("CLAUDE_CONTINUITY_ID") != runtime.conversation_id
+            or control.get("context_id") != runtime.conversation_id
+            or socket_path != control.get("socket_path")):
+        raise ContextRuntimeError("控制器环境不属于当前受管原生会话")
+    return native_control.environment(control, auth)
+
+
+def _start_controller(runtime, *, environment=None, automatic=False):
+    """The sole observer spawn path for run, hook repair, and manual recover."""
+    from . import tmux_transport
+    supplied = dict(os.environ if environment is None else environment)
+    with core.lock(runtime.directory / "controller-start.lock", wait_seconds=5):
+        try:
+            with core.lock(runtime.directory / "controller.lock", wait_seconds=0):
+                with core.lock(runtime.lock_path, wait_seconds=5):
+                    state = runtime._state()
+                    runtime._normalize_legacy_pause(state)
+                    control_env = _controller_environment(runtime, state, supplied, automatic=automatic)
+                    if state.get("native_session_uncertain"):
+                        runtime._wait(state, "native_session_identity_pending")
+                        runtime._save(state)
+                        return runtime._receipt(state)
+                    pending = state.get("controller_starting") is True
+                    alive = _pid_alive(state.get("controller_pid")) if pending else False
+                    if pending and alive is not False:
+                        runtime._save(state)
+                        return runtime._receipt(state)
+                    if pending:
+                        state["controller_starting"] = False
+                    tmux_transport.inspect(state["tmux"])
+                    # Do not require a ready control socket here.  The observer
+                    # must survive and reconcile connection uncertainty itself.
+                    process = subprocess.Popen(
+                        core.module_argv("tui-serve", "--context-id", runtime.conversation_id),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True, env={**os.environ, **supplied, **control_env},
+                    )
+                    state["controller_pid"] = process.pid
+                    state["controller_starting"] = True
+                    if automatic:
+                        state["controller_expected"] = True
+                    runtime._save(state)
+                    return runtime._receipt(state)
+        except core.LockBusy:
+            # The actual observer owns the lock or another hook is spawning it.
+            return None
+
+
+def repair_controller_from_hook(context_id, event):
+    """Restore a dead expected observer from a genuine credential-bearing hook."""
+    if not isinstance(event, dict) or event.get("hook_event_name") not in {
+        "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop",
+    }:
+        return None
+    runtime = TuiRuntime.load(context_id)
+    try:
+        with core.lock(runtime.lock_path, wait_seconds=5):
+            state = runtime._state()
+            if (state.get("controller_managed") is not True or state.get("native_session_uncertain")
+                    or event.get("session_id") != state["session_id"]
+                    or str(Path(event.get("cwd", "")).resolve(strict=True)) != state["cwd"]):
+                return None
+            path = event.get("transcript_path")
+            if path is not None and state.get("source_path") not in {None, path}:
+                return None
+        return _start_controller(runtime, environment=os.environ, automatic=True)
+    except (OSError, TypeError, ValueError, KeyError, core.ContinuityError, ContextRuntimeError,
+            subprocess.SubprocessError):
+        # Hook dispatch remains non-blocking to native tools; persist only a
+        # fixed waiting reason, never the command, environment, or credential.
+        try:
+            runtime._wait_external("managed_hook_controller_repair_pending")
+        except (OSError, TypeError, ValueError, KeyError, core.ContinuityError, ContextRuntimeError):
+            pass
+        return None
 
 
 def _controller_diagnostic(runtime, status, error):
@@ -1275,8 +1633,10 @@ def _health(runtime, state):
         result["status"] = "controller_unavailable"
     elif not result["control_socket_ready"]:
         result["status"] = "control_channel_unavailable"
-    elif state["phase"] in {"paused", "closed"}:
-        result["status"] = "automation_paused"
+    elif state["phase"] == "closed":
+        result["status"] = "native_session_unavailable"
+    elif state.get("reconciliation") or state["phase"] == "paused":
+        result["status"] = "automation_waiting"
     else:
         result["status"] = "healthy"
     return result
@@ -1293,22 +1653,28 @@ def status(context_id):
 def serve(context_id):
     runtime = TuiRuntime(context_id)
     with core.lock(runtime.directory / "controller.lock", wait_seconds=5):
-        registered, waiting = False, False
+        registered, waiting, failures, recovered_error = False, False, 0, None
         while True:
+            delay = 0.25
             try:
                 if not registered:
                     with core.lock(runtime.lock_path, wait_seconds=5):
                         state = runtime._state()
+                        runtime._normalize_legacy_pause(state)
                         state["controller_pid"] = os.getpid()
+                        state["controller_starting"] = False
                         runtime._save(state)
                     registered = True
                 outcome = runtime.advance()
-                if waiting:
-                    _controller_diagnostic(runtime, "running", "state_lock_busy")
-                    waiting = False
+                if waiting or recovered_error is not None:
+                    _controller_diagnostic(runtime, "running", recovered_error or "state_lock_busy")
+                    waiting, recovered_error = False, None
+                failures = 0
                 if outcome["phase"] == "closed":
                     return outcome
-                if outcome["phase"] == "paused" and _pid_alive(outcome["owned_pid"]) is False:
+                # A definitive OS process absence, not a waiting diagnostic,
+                # is the sole ordinary observer termination condition.
+                if _pid_alive(outcome.get("owned_pid")) is False:
                     with core.lock(runtime.lock_path, wait_seconds=5):
                         state = runtime._state()
                         state["phase"] = "closed"
@@ -1319,14 +1685,20 @@ def serve(context_id):
                 if not waiting:
                     _controller_diagnostic(runtime, "waiting_for_state_lock", "state_lock_busy")
                     waiting = True
+                delay = min(2.0, 0.25 * (2 ** min(failures, 3)))
+                failures += 1
             except Exception:
                 _controller_diagnostic(runtime, "failed", "state_or_io_failure")
+                recovered_error = "state_or_io_failure"
                 try:
-                    return runtime._pause_external("控制器状态读取或写入失败；自动换窗已暂停，请用 tui-status 检查后恢复")
+                    runtime._wait_external("controller_state_or_io_pending")
                 except Exception:
-                    return {"phase": "paused", "controller_error": "state_or_io_failure",
-                            "state_persisted": False, "context_id": runtime.conversation_id}
-            time.sleep(0.25)
+                    # The diagnostic is still a durable non-success signal when
+                    # state persistence itself is unavailable.
+                    pass
+                delay = min(2.0, 0.25 * (2 ** min(failures, 3)))
+                failures += 1
+            time.sleep(delay)
 
 
 def run(cwd, *, prompt=None, detached=False, native_args=()):
@@ -1335,22 +1707,22 @@ def run(cwd, *, prompt=None, detached=False, native_args=()):
         raise ContextRuntimeError("原生 TUI 需从终端启动；隔离验证可显式使用 --detached")
     size = os.get_terminal_size() if sys.stdin.isatty() else os.terminal_size((120, 40))
     runtime, reused = _launch(cwd, prompt=prompt, width=size.columns, height=size.lines,
-                              native_args=native_args, reuse=True)
+                              native_args=native_args, reuse=True, controller_managed=True)
     if reused:
         result = {"health": status(runtime.conversation_id)["health"]} if detached else attach(runtime.conversation_id)
         return {"status": "reused", "context_id": runtime.conversation_id,
                 "interface": "native_claude_tui_in_private_tmux", "state_path": str(runtime.state_path),
                 "attach_command": shlex.join(core.module_argv(
                     "tui-attach", "--context-id", runtime.conversation_id)), **result}
-    controller_env = {**os.environ, native_control.AUTH_ENV: runtime._control_auth,
-                      "CLAUDE_CONTINUITY_ID": runtime.conversation_id}
-    process = subprocess.Popen(core.module_argv("tui-serve", "--context-id", runtime.conversation_id),
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               start_new_session=True, env=controller_env)
+    with core.lock(runtime.lock_path, wait_seconds=5):
+        initial_state = runtime._state()
+        control = initial_state["native_control"]
+    controller_env = native_control.environment(control, runtime._control_auth) | {
+        "CLAUDE_CONTINUITY_ID": runtime.conversation_id,
+    }
+    _start_controller(runtime, environment=controller_env, automatic=True)
     with core.lock(runtime.lock_path, wait_seconds=5):
         state = runtime._state()
-        state["controller_pid"] = process.pid
-        runtime._save(state)
     if not detached:
         subprocess.run(tmux_transport.attach_argv(state["tmux"]), check=False)
     return {"status": "started", "context_id": runtime.conversation_id,
@@ -1360,33 +1732,16 @@ def run(cwd, *, prompt=None, detached=False, native_args=()):
 
 
 def recover(context_id, session_id):
-    """为已退出的附加控制器恢复监测；原生终端和任务保持不动。"""
+    """Explicitly re-observe and start the same observer; never restart native."""
     from . import tmux_transport
     runtime = TuiRuntime.load(context_id)
-    with core.lock(runtime.directory / "controller-start.lock"), core.lock(runtime.directory / "controller.lock"):
-        with core.lock(runtime.lock_path, wait_seconds=5):
-            state = runtime._state()
-            control = state.get("native_control")
-            if (not control or os.environ.get("CLAUDE_CONTINUITY_ID") != context_id
-                    or os.environ.get(native_control.SOCKET_ENV) != control["socket_path"]):
-                raise ContextRuntimeError("恢复需要对应受管终端的原生通道环境；不从其他会话接管")
-            control_env = native_control.environment(control, os.environ.get(native_control.AUTH_ENV))
-            tmux_transport.inspect(state["tmux"])
-            if not native_control.ready(control):
-                raise ContextRuntimeError("原生控制通道不可用；保留现有终端，不启动控制器")
-        runtime.recover_observation(session_id)
-        with core.lock(runtime.lock_path, wait_seconds=5):
-            state = runtime._state()
-            if state["phase"] not in {"running", "awaiting_tui_prompt"}:
-                raise ContextRuntimeError("现有自动操作未结算；不启动第二个控制器")
-            tmux_transport.inspect(state["tmux"])
-            state["at_turn_boundary"] = False
-            process = subprocess.Popen(core.module_argv("tui-serve", "--context-id", context_id),
-                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       start_new_session=True, env={**os.environ, **control_env})
-            state["controller_pid"] = process.pid
-            runtime._save(state)
-    return runtime.receipt()
+    with core.lock(runtime.lock_path, wait_seconds=5):
+        state = runtime._state()
+        _controller_environment(runtime, state, os.environ, automatic=False)
+        tmux_transport.inspect(state["tmux"])
+    runtime.recover_observation(session_id)
+    outcome = _start_controller(runtime, environment=os.environ, automatic=False)
+    return runtime.receipt() if outcome is None else outcome
 
 
 def attach(context_id):
@@ -1399,6 +1754,7 @@ def attach(context_id):
         raise ContextRuntimeError("原生 tmux 会话不可用或身份不符；不能只靠 attach 恢复，请查看 tui-status")
     if health["status"] != "healthy":
         print("cclaude 自动换窗未就绪；attach 只连接原生终端，不重启控制器。"
-              "请在对应受管终端内检查 tui-status，再按准确 session_id 使用 tui-recover。", file=sys.stderr)
+              "对应受管终端的 /resume 或下一次原生 hook 会自动恢复监测；"
+              "可用 tui-status 查看具体等待原因。", file=sys.stderr)
     return {"returncode": subprocess.run(tmux_transport.attach_argv(state["tmux"]), check=False).returncode,
             "health": health}

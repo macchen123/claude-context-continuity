@@ -96,7 +96,7 @@ Work in your project directory exactly as you normally do with Claude Code.
 
 When the conversation gets close to full, the tool opens a fresh context window and continues the current work. Background tasks keep running, messages sent during the switch are handled in the new window, and unfinished drafts are not sent.
 
-If an automatic switch cannot proceed, the terminal tells you why. You can still carry on with your work and look up earlier history.
+Monitoring stays active across successive windows. If native history or a switch confirmation is still arriving, the tool waits and continues automatically when it can verify the next step. It may hold the next model request to protect the remaining context; that is not a task completion or a shutdown of monitoring.
 
 ### Proactive rotation with `/renew`
 
@@ -197,25 +197,17 @@ Yes. All prior sessions in the task chain are indexed locally in SQLite FTS5. Us
 ### 4. Does this alter Claude Code's models, prompts, or permissions?
 No. You are still using native Claude Code. Your models, system prompts, MCP servers, and permission policies remain identical.
 
-### 5. What does “automatic context switching paused” mean?
-The native conversation and History/Notes remain available; only automatic switching is paused. Use `claude-context tui-status --context-id <context-id>` to check the reason. A `context-request` receipt with `phase: paused` exits with code `2`. An accepted request is not proof that a new window has opened; check the reported phase and native confirmation.
+### 5. Why is automatic switching waiting?
+The host may be waiting for a complete native history record, a tool result, or confirmation that a clear or handoff was received. It keeps checking and continues when the missing fact becomes available. A delayed confirmation does not permanently disable automatic switching, and an uncertain command is not sent again blindly.
 
-If a resumed window has no genuine user instruction yet, the host tries to verify registered earlier instructions instead of treating its continuation message as new authorization. If no prior session is registered to reuse, it keeps observing the selected native session without switching automatically; a later genuine user record can restore automatic switching after validation.
+History/Notes remains available. With enough verified room, work can continue; near the context limit, the next model request is held while completed results and submitted inputs remain in native history. Use `claude-context tui-status --context-id <context-id>` to see the current stage and waiting reason. An accepted request is not proof that a new window has opened.
 
-`PostToolBatch hook stopped continuation` together with the context-switch notice means the old turn is yielding to a new window, not that the task is finished. If no continuation follows, check `tui-status`.
+`PostToolBatch hook stopped continuation` together with the context-switch notice means the old turn is yielding to a new window, not that the task is finished. Peer messages and background-task notices remain readable in History; neither they nor the handoff provide new human authorization.
 
-Native peer messages and background-task completion notices arriving during a switch remain readable through History in the new window. They remain non-authoritative notifications, not new human instructions or approvals.
+### 6. How do I continue after a terminal interruption?
+Use the normal native resume flow: start with `cclaude --resume <session-id>`, or use `/resume` inside a managed `cclaude` session. Monitoring rebinds to the selected native session and its actual usage. If the terminal is still alive but its monitoring process exited, a genuine native hook restarts that observer without a separate repair command.
 
-### 6. Does reconnecting a terminal restore automatic switching?
-Not necessarily. The `health` section of `tui-status` checks the controller process, exclusive lock, native tmux session, and control socket instead of relying only on the saved `phase`. `tui-attach` only reconnects the native terminal; it warns when the controller is unavailable and does not silently start a second controller.
-
-If the native terminal is still running but its controller has exited, run this within the corresponding managed terminal environment:
-
-```sh
-claude-context tui-recover --context-id <context-id> --session-id <session-id>
-```
-
-Use the exact IDs returned by `tui-status`. Recovery still verifies the native channel, session identity, and unsettled operations; it never forces ownership or replays an uncertain delivery when the required environment or confirmation is missing. If the native tmux session is also gone, neither attach nor controller recovery can bring that process back. Use native session resume instead, for example `cclaude --resume <session-id>`.
+`tui-attach` only reconnects an existing terminal. `tui-status` checks the actual controller, exclusive lock, tmux session, and control socket; attaching alone is not proof that monitoring is healthy. Unreadable history or unconfirmed delivery is reported explicitly, never repaired by replaying completed work or taking over another session.
 
 If a clear was confirmed but the handoff was never dispatched, recovery does not clear again. It continues that one pending handoff only while the new window has not started a conversation; otherwise it restores observation without inserting the old handoff. Deferred inputs remain preserved, and uncertain deliveries are never resent.
 

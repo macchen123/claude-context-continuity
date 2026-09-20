@@ -158,6 +158,20 @@ class TuiRuntimeTests(unittest.TestCase):
         self.usage(800)
         self.runtime.on_hook(self.hook("Stop"))
 
+    def wait_for_unknown_continuation(self, reason="native continuation delivery is unknown"):
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["phase"] = "awaiting_continuation"
+            state["continuation_hash"] = core.digest("unconfirmed fixture continuation")
+            self.runtime._wait(state, reason)
+            self.runtime._save(state)
+
+    def assert_waiting(self, receipt, phase):
+        self.assertEqual(receipt["phase"], phase)
+        self.assertIsInstance(receipt["reconciliation"], dict)
+        self.assertTrue(receipt["reconciliation"]["reason"])
+        self.assertIsNone(receipt["pause_reason"])
+
     def test_idle_boundary_parses_once_and_does_not_rewrite_identical_state(self):
         self.runtime.on_hook(self.hook("Stop"))
         before = self.runtime.state_path.stat()
@@ -200,7 +214,7 @@ class TuiRuntimeTests(unittest.TestCase):
         replacement.write_text(self.source.read_text().replace(self.sid, str(uuid4())))
         os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
         replacement.replace(self.source)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "running")
         self.clear_mock.assert_not_called()
 
     def test_idle_snapshot_detects_new_user_input_without_reusing_stop(self):
@@ -228,7 +242,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.threshold()
         with self.source.open("a") as handle:
             handle.write("not-json\n")
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "running")
         self.clear_mock.assert_not_called()
 
     def test_serve_survives_real_state_lock_contention_and_records_recovery(self):
@@ -266,25 +280,27 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_serve_reports_io_failure_without_replaying_or_logging_exception_text(self):
+    def test_serve_recovers_io_failure_without_replaying_or_logging_exception_text(self):
         with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
-                patch.object(self.runtime, "advance", side_effect=OSError("private-exception-value")) as advance:
+                patch.object(self.runtime, "advance", side_effect=[
+                    OSError("private-exception-value"), {"phase": "closed"},
+                ]) as advance:
             outcome = tui_runtime.serve(self.runtime.conversation_id)
-        self.assertEqual(outcome["phase"], "paused")
-        advance.assert_called_once()
+        self.assertEqual(outcome["phase"], "closed")
+        self.assertEqual(advance.call_count, 2)
         raw = (self.runtime.directory / "controller-diagnostic.json").read_text()
         self.assertNotIn("private-exception-value", raw)
         self.assertEqual(json.loads(raw)["last_error"], "state_or_io_failure")
-        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.assertIsInstance(self.runtime.receipt()["reconciliation"], dict)
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_serve_preserves_diagnostic_when_state_cannot_be_persisted(self):
+    def test_serve_keeps_retrying_when_state_cannot_be_persisted(self):
         with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
-                patch.object(self.runtime, "_save", side_effect=OSError("unwritable")):
-            outcome = tui_runtime.serve(self.runtime.conversation_id)
-        self.assertFalse(outcome["state_persisted"])
-        self.assertEqual(outcome["controller_error"], "state_or_io_failure")
+                patch.object(self.runtime, "_save", side_effect=OSError("unwritable")), \
+                patch.object(tui_runtime.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                tui_runtime.serve(self.runtime.conversation_id)
         self.assertTrue((self.runtime.directory / "controller-diagnostic.json").is_file())
         self.assertFalse(tui_runtime._controller_locked(self.runtime))
 
@@ -418,7 +434,8 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.on_hook(self.hook("SubagentStart", agent_id="current-child"))
         self.runtime.on_hook(self.hook("PostToolUse", **fields))
         self.assertEqual(self.runtime.receipt()["active_child_handles"], ["current-child"])
-        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.assertEqual(self.runtime.receipt()["phase"], "running")
+        self.assertIsNone(self.runtime.receipt()["reconciliation"])
         self.clear_mock.assert_not_called()
 
     def test_resume_with_pr_link_metadata_binds_target_session(self):
@@ -501,8 +518,9 @@ class TuiRuntimeTests(unittest.TestCase):
         blocked = runtime.on_hook({"hook_event_name": "UserPromptSubmit", "session_id": old_sid,
                                    "cwd": str(self.cwd), "prompt": "不要在检查前请求模型"})
         self.assertFalse(blocked["continue"])
-        self.assertEqual(runtime.advance()["phase"], "rotation_requested")
+        self.assertEqual(runtime.advance()["phase"], "running")
         self.assertNotIn("resume_safe_boundary", runtime._state())
+        self.assertEqual(len(runtime._state()["deferred_inputs"]), 1)
         self.clear_mock.assert_not_called()
         with old_source.open("a") as handle:
             handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": old_sid,
@@ -521,11 +539,14 @@ class TuiRuntimeTests(unittest.TestCase):
                                   "transcript_path": str(old_source)})
         self.assertNotIn("continue", result)
         rejected = runtime.receipt()
-        self.assertEqual(rejected["phase"], "paused")
+        self.assert_waiting(rejected, "running")
         self.assertEqual(rejected["session_id"], initial_sid)
         self.assertEqual(rejected["source_path"], str(initial_source))
+        runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
 
-    def test_resume_pauses_if_the_bound_source_changes_before_first_clear(self):
+    def test_resume_invalidates_a_boundary_changed_before_first_clear(self):
         runtime, _, _ = self.resume_runtime()
         old_sid, old_source = self.resume_source(1200)
         runtime.on_hook({"hook_event_name": "SessionStart", "session_id": old_sid,
@@ -534,11 +555,12 @@ class TuiRuntimeTests(unittest.TestCase):
             f.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": old_sid,
                 "message": {"role": "user", "content": "并发来源的新输入。"}}) + "\n")
         outcome = runtime.advance()
-        self.assertEqual(outcome["phase"], "paused")
+        self.assert_waiting(outcome, "running")
+        self.assertNotIn("resume_safe_boundary", runtime._state())
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_resume_rejects_an_unsettled_source_without_rebinding(self):
+    def test_resume_preserves_historical_unsettled_ids_without_replaying_them(self):
         runtime, initial_sid, initial_source = self.resume_runtime()
         old_sid, old_source = self.resume_source(800)
         with old_source.open("a") as f:
@@ -551,10 +573,16 @@ class TuiRuntimeTests(unittest.TestCase):
                                   "cwd": str(self.cwd), "source": "resume",
                                   "transcript_path": str(old_source)})
         self.assertNotIn("continue", result)
-        rejected = runtime.receipt()
-        self.assertEqual(rejected["phase"], "paused")
-        self.assertEqual(rejected["session_id"], initial_sid)
-        self.assertEqual(rejected["source_path"], str(initial_source))
+        resumed = runtime.receipt()
+        self.assertEqual(resumed["phase"], "running")
+        self.assertEqual(resumed["session_id"], old_sid)
+        self.assertEqual(resumed["source_path"], str(old_source))
+        self.assertNotEqual(resumed["session_id"], initial_sid)
+        self.assertEqual(resumed["resume_historical_pending_tool_ids"], ["resume-pending-tool"])
+        self.assertEqual(resumed["pending_tool_ids"], [])
+        self.assertEqual(runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
 
     def test_budget_stop_clear_native_ack_and_real_source_consumption(self):
         self.threshold()
@@ -689,23 +717,23 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.advance()["phase"], "waiting_safe_boundary")
         self.clear_mock.assert_not_called()
 
-    def test_missing_native_clear_ack_pauses_without_fallback(self):
+    def test_missing_native_clear_ack_keeps_waiting_without_fallback(self):
         self.threshold()
         self.runtime.advance()
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        with self.assertRaises(ValueError):
-            self.runtime.recover_observation(self.sid)
+        self.assert_waiting(self.runtime.advance(), "clear_sent")
+        self.assert_waiting(self.runtime.recover_observation(self.sid), "clear_sent")
+        self.runtime.advance()
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
     def test_clear_transport_failure_is_never_replayed(self):
         self.threshold()
         self.clear_mock.side_effect = RuntimeError("unknown transport result")
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "clear_sent")
         self.runtime.advance()
         self.clear_mock.assert_called_once()
 
@@ -725,8 +753,8 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.advance()
         deferred = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="scheduled follow-up"))
         self.assertFalse(deferred["continue"])
-        self.runtime._pause_external("原生投递确认暂时缺失")
-        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.runtime._wait_external("原生投递确认暂时缺失")
+        self.assert_waiting(self.runtime.receipt(), "clear_sent")
         sid, source = self.resume_source(125)
         result = self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear",
             "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)})
@@ -757,12 +785,167 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
+    def _observe_window_usage(self, value, window, *, reset_budget=False):
+        self.config = {"hash": f"budget-{window}", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": str(window)}}
+        if reset_budget:
+            with core.lock(self.runtime.lock_path):
+                state = self.runtime._state()
+                state["budget"] = {}
+                self.runtime._save(state)
+        self.usage(value)
+        self.runtime.on_hook(self.hook("Stop"))
+
+    def test_paused_budget_blocks_repeated_high_usage_input_and_preserves_stale_clear_receipts(self):
+        self._observe_window_usage(515_908, 600_000, reset_budget=True)
+        self._observe_window_usage(575_640, 600_000)
+        self.assertEqual(self.runtime._state()["usage"]["total_input_and_cache_tokens"], 575_640)
+        self.assertEqual(self.runtime._state()["budget"]["guard_tokens"], 141_268)
+        old_sid = str(uuid4())
+        old_source = self.root / f"{old_sid}.jsonl"
+        old_source.write_text("")
+        prior = {"session_id": old_sid, "source_path": str(old_source),
+                 "prompt_hash": core.digest("unresolved deferred peer"), "after_byte": 0,
+                 "turn_generation": 0}
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["window_generation"] = 7
+            state["rotation"] = {
+                "generation": 7,
+                "request": {"generation": 7, "session_id": old_sid, "source_path": str(old_source),
+                            "handoff": "existing handoff", "notes": ""},
+                "clear": {"generation": 7, "old_session_id": old_sid, "command_id": str(uuid4()),
+                          "reset_seen": True, "new_session_id": self.sid},
+            }
+            state["deferred_inputs"] = [prior]
+            self.runtime._save(state)
+        self.wait_for_unknown_continuation("previous rollover acknowledgement is unresolved")
+        stale_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
+        first_prompt = "first blocked paused input"
+        first_after_byte = self.source.stat().st_size
+        first = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=first_prompt))
+        self.assertFalse(first["continue"])
+        self.assertIn("正在等待原生确认", first["stopReason"])
+        self.assertIn("下一次模型请求", first["stopReason"])
+        self.assertIn("systemMessage", first)
+        first_state = self.runtime._state()
+        self.assert_waiting(first_state, "awaiting_continuation")
+        self.assertEqual(first_state["rotation"], stale_rotation)
+        self.assertEqual(first_state["budget"]["handoff_reported"], 1)
+        self.assertEqual(first_state["deferred_inputs"][:-1], [prior])
+        self.assertEqual(first_state["deferred_inputs"][-1], {
+            "session_id": self.sid, "source_path": str(self.source),
+            "prompt_hash": core.digest(first_prompt), "after_byte": first_after_byte,
+            "turn_generation": first_state["turn_generation"],
+        })
+        second_prompt = "second blocked paused input"
+        second = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=second_prompt))
+        self.assertFalse(second["continue"])
+        self.assertIn("正在等待原生确认", second["stopReason"])
+        self.assertNotIn("systemMessage", second)
+        state = self.runtime._state()
+        self.assertEqual(state["rotation"], stale_rotation)
+        self.assertEqual([item["prompt_hash"] for item in state["deferred_inputs"]], [
+            prior["prompt_hash"], core.digest(first_prompt), core.digest(second_prompt),
+        ])
+        clear_escape = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="/clear"))
+        self.assertNotIn("continue", clear_escape)
+        self.assertEqual(self.runtime._state()["rotation"], stale_rotation)
+        self.assertEqual(len(self.runtime._state()["deferred_inputs"]), 3)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_paused_input_counts_pending_output_and_utf8_bytes(self):
+        self._observe_window_usage(500, 1_000, reset_budget=True)
+        self.wait_for_unknown_continuation()
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            accounting = self.runtime._output_accounting(state)
+            accounting["items"]["pending-output"] = {"text_bytes": 240, "raw_bytes": 240, "defer": False}
+            accounting["total_text_bytes"] = 240
+            self.runtime._save(state)
+        prompt = "界界界界"
+        after_byte = self.source.stat().st_size
+        blocked = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=prompt))
+        self.assertFalse(blocked["continue"])
+        self.assertIn("正在等待原生确认", blocked["stopReason"])
+        state = self.runtime._state()
+        self.assert_waiting(state, "awaiting_continuation")
+        self.assertEqual(state["output_budget"]["total_text_bytes"], 240)
+        self.assertEqual(state["deferred_inputs"], [{
+            "session_id": self.sid, "source_path": str(self.source),
+            "prompt_hash": core.digest(prompt), "after_byte": after_byte,
+            "turn_generation": state["turn_generation"],
+        }])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_paused_batch_blocks_projected_pending_output_without_rotation(self):
+        self._observe_window_usage(500, 1_000, reset_budget=True)
+        self.wait_for_unknown_continuation()
+        before_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
+        response = {"stdout": "x" * 300}
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{
+            "tool_use_id": "pending-output", "tool_name": "Bash", "tool_input": {}, "tool_response": response,
+        }]))
+        self.assertFalse(batch["continue"])
+        self.assertIn("正在等待原生确认", batch["stopReason"])
+        self.assertIn("保留上下文", batch["stopReason"])
+        state = self.runtime._state()
+        self.assert_waiting(state, "awaiting_continuation")
+        self.assertEqual(state["rotation"], before_rotation)
+        item = state["output_budget"]["items"]["pending-output"]
+        self.assertGreater(item["text_bytes"], 250)
+        self.assertTrue(item["defer"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_paused_batch_stops_for_a_defer_marked_result_even_when_projection_fits(self):
+        self._observe_window_usage(500, 1_000, reset_budget=True)
+        self.wait_for_unknown_continuation()
+        before_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            accounting = self.runtime._output_accounting(state)
+            accounting["items"]["deferred-output"] = {"text_bytes": 0, "raw_bytes": 999, "defer": True}
+            self.runtime._save(state)
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
+        self.assertFalse(batch["continue"])
+        self.assertIn("正在等待原生确认", batch["stopReason"])
+        state = self.runtime._state()
+        self.assert_waiting(state, "awaiting_continuation")
+        self.assertEqual(state["rotation"], before_rotation)
+        self.assertTrue(state["output_budget"]["items"]["deferred-output"]["defer"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_paused_below_reserve_input_and_batch_remain_usable(self):
+        self._observe_window_usage(100, 1_000, reset_budget=True)
+        self.wait_for_unknown_continuation()
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
+        prompt = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="short paused input"))
+        self.assertNotIn("continue", batch)
+        self.assertNotIn("continue", prompt)
+        self.assert_waiting(self.runtime._state(), "awaiting_continuation")
+        self.assertEqual(self.runtime._state().get("deferred_inputs", []), [])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_running_batch_rotation_behavior_is_unchanged(self):
+        self.usage(800)
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
+        self.assertFalse(batch["continue"])
+        self.assertIn("正在自动切换上下文", batch["stopReason"])
+        self.assertEqual(self.runtime.receipt()["phase"], "rotation_requested")
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 1)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_paused_automation_still_observes_usage_and_warns_once(self):
-        self.runtime._pause_external("terminal input outcome is unknown")
+        self.wait_for_unknown_continuation()
         self.usage(450)
         first = self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="new-work"))
         state = self.runtime._state()
-        self.assertEqual(state["phase"], "paused")
+        self.assert_waiting(state, "awaiting_continuation")
         self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 450)
         self.assertIn("systemMessage", first)
         second = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="new-work"))
@@ -780,8 +963,9 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(state["session_id"], self.sid)
         self.assertEqual(state["source_path"], str(self.source))
         self.assertFalse(state["rotation"]["clear"]["reset_seen"])
-        with self.assertRaises(ValueError):
-            self.runtime.recover_observation(self.sid)
+        self.assert_waiting(self.runtime.recover_observation(self.sid), "clear_sent")
+        self.runtime.advance()
+        self.assertTrue(self.runtime.receipt()["native_session_uncertain"])
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
@@ -809,7 +993,9 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.runtime._state().get("stop_serial"))
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
         self.clear_mock.assert_called_once()
-        sid, source = self.resume_source(125)
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
         self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
                               "cwd": str(self.cwd), "transcript_path": str(source)})
         self.runtime.advance()
@@ -941,7 +1127,7 @@ class TuiRuntimeTests(unittest.TestCase):
         assistant, results = self.batch_records(["bound"])
         self.append_records(assistant, *results)
         self.source.write_text(self.source.read_text().replace('"input_tokens": 800', '"input_tokens": 801'))
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "rotation_requested")
         self.clear_mock.assert_not_called()
 
     def test_batch_accounts_multiple_outputs_and_bounds_native_response(self):
@@ -1160,7 +1346,7 @@ class TuiRuntimeTests(unittest.TestCase):
                 **({"agent_id": "child"} if name.startswith("Subagent") else {})))
             self.assertNotIn("continue", output)
             self.assertNotIn("decision", output)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "running")
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
         self.config = {"hash": "repaired", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000"}}
@@ -1174,9 +1360,10 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.advance()
         notice = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="继续正常任务"))
         self.assertIn("systemMessage", notice)
-        self.assertNotIn("continue", notice)
+        self.assertFalse(notice["continue"])
+        self.assertIn("正在等待原生确认", notice["stopReason"])
         self.runtime.on_hook(self.hook("Stop"))
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        self.assert_waiting(self.runtime.advance(), "clear_sent")
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
@@ -1211,15 +1398,17 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_recovery_refuses_active_work_and_wrong_terminal(self):
-        self.runtime._pause_external("observation_failed")
+    def test_recovery_observes_active_work_but_refuses_wrong_terminal(self):
+        self.runtime._wait_external("observation_failed")
         self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="active"))
-        with self.assertRaises(ValueError):
-            self.runtime.recover_observation(self.sid)
+        result = self.runtime.recover_observation(self.sid)
+        self.assertEqual(result["pending_tool_ids"], ["active"])
         with self.assertRaises(ValueError):
             self.runtime.recover_observation(str(uuid4()))
-        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.assertEqual(self.runtime.receipt()["phase"], "running")
+        self.runtime.advance()
         self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
 
     def test_recovery_after_acknowledged_clear_timeout_restarts_one_controller_then_dispatches_once(self):
         self.threshold()
@@ -1235,7 +1424,8 @@ class TuiRuntimeTests(unittest.TestCase):
             state = self.runtime._state()
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
+        with patch.object(native_control, "ready", return_value=False):
+            self.assert_waiting(self.runtime.advance(), "awaiting_tui_prompt")
         environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)
         environment["CLAUDE_CONTINUITY_ID"] = self.runtime.conversation_id
         with patch.dict(os.environ, environment), \
@@ -1271,13 +1461,8 @@ class TuiRuntimeTests(unittest.TestCase):
             state = self.runtime._state()
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        try:
-            recovered = self.runtime.recover_observation(sid)
-        except ValueError:
-            self.assertEqual(self.runtime.receipt()["phase"], "paused")
-        else:
-            self.assertEqual(recovered["phase"], "running")
+        self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.assertIsNone(self.runtime._state()["rotation"]["request"])
         self.assertNotEqual(self.runtime.receipt()["phase"], "awaiting_tui_prompt")
         self.assertEqual(self.runtime.receipt()["session_id"], sid)
         self.clear_mock.assert_called_once()
@@ -1308,11 +1493,8 @@ class TuiRuntimeTests(unittest.TestCase):
             self.assertEqual(len(state["deferred_inputs"]), 1)
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        recovered = self.runtime.recover_observation(sid)
-        self.assertEqual(recovered["phase"], "awaiting_tui_prompt")
-        self.send_mock.assert_not_called()
         self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        self.send_mock.assert_called_once()
         packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
         self.assertEqual(packet["deferred_inputs"], [current_locator])
         self.assertEqual(packet["latest_instruction_locator"], current_locator)
@@ -1346,8 +1528,7 @@ class TuiRuntimeTests(unittest.TestCase):
             deferred_before = json.loads(json.dumps(state["deferred_inputs"]))
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        recovered = self.runtime.recover_observation(sid)
+        recovered = self.runtime.advance()
         state = self.runtime._state()
         self.assertEqual(recovered["phase"], "running")
         self.assertIsNone(state["rotation"]["clear"])
@@ -1379,9 +1560,9 @@ class TuiRuntimeTests(unittest.TestCase):
             self.assertIn("continuation_hash", state)
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        with self.assertRaises(ValueError):
-            self.runtime.recover_observation(sid)
+        self.assert_waiting(self.runtime.advance(), "awaiting_continuation")
+        self.assert_waiting(self.runtime.recover_observation(sid), "awaiting_continuation")
+        self.runtime.advance()
         self.clear_mock.assert_called_once()
         self.send_mock.assert_called_once()
 
@@ -1399,9 +1580,10 @@ class TuiRuntimeTests(unittest.TestCase):
             state = self.runtime._state()
             state["rotation_deadline"] = 0
             self.runtime._save(state)
-        self.assertEqual(self.runtime.advance()["phase"], "paused")
-        with self.assertRaises(ValueError):
-            self.runtime.recover_observation(sid)
+        self.assert_waiting(self.runtime.advance(), "awaiting_tui_prompt")
+        self.assert_waiting(self.runtime.recover_observation(sid), "awaiting_tui_prompt")
+        self.runtime.advance()
+        self.assertEqual(len(self.runtime._state()["deferred_inputs"]), 1)
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
@@ -1438,9 +1620,9 @@ class TuiRuntimeTests(unittest.TestCase):
             self.assertFalse(self.runtime._state()["at_turn_boundary"])
             self.assertNotIn("--model", spawn.call_args.args[0])
             self.assertEqual(spawn.call_args.kwargs["env"][native_control.AUTH_ENV], self.runtime._control_auth)
-        with core.lock(self.runtime.directory / "controller.lock"), patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
-            with self.assertRaises(core.ContinuityError):
-                continuity.dispatch(args)
+        with core.lock(self.runtime.directory / "controller.lock"), patch.dict(os.environ, environment), \
+                patch("claude_context_continuity.tui_runtime.subprocess.Popen") as spawn:
+            self.assertEqual(continuity.dispatch(args)["controller_pid"], 123456)
             spawn.assert_not_called()
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
@@ -1456,7 +1638,7 @@ class TuiRuntimeTests(unittest.TestCase):
             code = continuity.main()
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue()), {})
-        self.assertEqual(self.runtime.receipt()["phase"], "paused")
+        self.assert_waiting(self.runtime.receipt(), "running")
 
     def test_cli_defaults_to_native_tui(self):
         from claude_context_continuity import continuity
@@ -1575,7 +1757,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertIn("systemMessage", tool)
         self.assertNotIn("permissionDecision", tool)
         self.assertNotIn("continue", tool)
-        self.assertEqual(runtime.receipt()["phase"], "paused")
+        self.assert_waiting(runtime.receipt(), "running")
 
     def _managed_host_only_window(self, usage=1200):
         """Create an authentic managed continuation window with no local user root."""
@@ -1659,7 +1841,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
-    def test_no_owner_host_signal_pauses_actual_session_until_a_real_user_hook_recovers(self):
+    def test_no_owner_host_signal_waits_until_a_real_user_record_recovers(self):
         runtime, startup_sid, startup_source = self.resume_runtime()
         host_sid = str(uuid4())
         host_source = self.root / f"{host_sid}.jsonl"
@@ -1674,13 +1856,13 @@ class TuiRuntimeTests(unittest.TestCase):
                          "cwd": str(self.cwd), "source": "resume",
                          "transcript_path": str(host_source)})
         paused = runtime._state()
-        self.assertEqual(paused["phase"], "paused")
+        self.assert_waiting(paused, "running")
         self.assertEqual(paused["session_id"], host_sid)
         self.assertNotEqual(paused["session_id"], startup_sid)
         self.assertEqual(paused["source_path"], str(host_source))
         self.assertNotEqual(paused["source_path"], str(startup_source))
         self.assertIsNone(paused["authorization"])
-        self.assertTrue(paused["observation_only_pause"])
+        self.assertEqual(paused["pending_session_start"]["session_id"], host_sid)
         self.assertEqual(paused["usage"]["total_input_and_cache_tokens"], 125)
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
@@ -1719,9 +1901,15 @@ class TuiRuntimeTests(unittest.TestCase):
                          "cwd": str(self.cwd), "source": "resume",
                          "transcript_path": str(host_source)})
         rejected = runtime._state()
-        self.assertEqual(rejected["phase"], "paused")
-        self.assertEqual(rejected["session_id"], startup_sid)
-        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.assert_waiting(rejected, "running")
+        self.assertEqual(rejected["session_id"], host_sid)
+        self.assertEqual(rejected["source_path"], str(host_source))
+        self.assertIsNone(rejected["authorization"])
+        self.assertIsNotNone(rejected["pending_session_start"])
+        self.assertEqual(rejected["usage"]["total_input_and_cache_tokens"], 1200)
+        self.assert_waiting(runtime.advance(), "running")
+        self.assertIsNone(runtime.receipt()["authorization"])
+        self.assertFalse(runtime.receipt()["rotation_pending"])
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
@@ -1741,9 +1929,15 @@ class TuiRuntimeTests(unittest.TestCase):
                          "cwd": str(self.cwd), "source": "resume",
                          "transcript_path": str(host_source)})
         rejected = runtime._state()
-        self.assertEqual(rejected["phase"], "paused")
-        self.assertEqual(rejected["session_id"], startup_sid)
-        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.assert_waiting(rejected, "running")
+        self.assertEqual(rejected["session_id"], host_sid)
+        self.assertEqual(rejected["source_path"], str(host_source))
+        self.assertIsNone(rejected["authorization"])
+        self.assertIsNotNone(rejected["pending_session_start"])
+        self.assertEqual(rejected["usage"]["total_input_and_cache_tokens"], 1200)
+        self.assert_waiting(runtime.advance(), "running")
+        self.assertIsNone(runtime.receipt()["authorization"])
+        self.assertFalse(runtime.receipt()["rotation_pending"])
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
@@ -1790,9 +1984,15 @@ class TuiRuntimeTests(unittest.TestCase):
                          "cwd": str(self.cwd), "source": "resume",
                          "transcript_path": str(host_source)})
         rejected = runtime.receipt()
-        self.assertEqual(rejected["phase"], "paused")
-        self.assertEqual(rejected["session_id"], startup_sid)
-        self.assertEqual(rejected["source_path"], str(startup_source))
+        self.assert_waiting(rejected, "running")
+        self.assertEqual(rejected["session_id"], host_sid)
+        self.assertEqual(rejected["source_path"], str(host_source))
+        self.assertIsNone(rejected["authorization"])
+        self.assertIsNotNone(rejected["pending_session_start"])
+        self.assertEqual(rejected["usage"]["total_input_and_cache_tokens"], 1200)
+        self.assert_waiting(runtime.advance(), "running")
+        self.assertIsNone(runtime.receipt()["authorization"])
+        self.assertFalse(runtime.receipt()["rotation_pending"])
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
