@@ -170,7 +170,7 @@ class PublicPackageTests(unittest.TestCase):
 
     def test_generated_plugin_module_command_binds_valid_session_start_in_isolated_state(self) -> None:
         with tempfile.TemporaryDirectory(prefix="package-hook-") as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             state_root, workspace, outside = root / "state", root / "workspace", root / "outside"
             workspace.mkdir()
             outside.mkdir()

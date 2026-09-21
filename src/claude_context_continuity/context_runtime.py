@@ -200,14 +200,6 @@ def _sid(event: dict[str, Any], required: bool = False) -> str | None:
     return _uuid(value, "event session_id")
 
 
-def _event_cwd(event: dict[str, Any], expected: str, required: bool = False) -> None:
-    value = event.get("cwd")
-    if value is None and not required:
-        return
-    if not isinstance(value, str) or str(_cwd(value)) != expected:
-        raise ContextRuntimeError("event cwd drifted")
-
-
 def _compact(event: dict[str, Any]) -> bool:
     return (event.get("subtype") in {"compact_boundary", "microcompact_boundary"}
             or event.get("status") == "compacting" or event.get("hook_event_name") == "PreCompact")
@@ -290,7 +282,7 @@ class ContextRuntime:
         runtime = cls(conversation_id or str(uuid4()), configuration_reader=configuration_reader)
         path, expected = _cwd(cwd), _identity(configuration)
         state = {
-            "schema": _SCHEMA, "conversation_id": runtime.conversation_id, "cwd": str(path),
+            "schema": _SCHEMA, "conversation_id": runtime.conversation_id, "cwd": str(path), "launch_cwd": str(path),
             "session_id": _uuid(session_id, "session_id"), "configuration": expected,
             "source_path": None, "authorization": None, "native_context_window": None, "usage": None,
             "budget": {}, "budget_stream": None, "budget_handoff_signal": None,
@@ -417,6 +409,9 @@ class ContextRuntime:
     @staticmethod
     def _observe_authorization_records(state: dict[str, Any], source: HistorySource, records: list[Any]) -> None:
         """Update authority only from exact complete native records already read."""
+        pending = state.get("pending_session_start")
+        if isinstance(pending, dict) and not pending.get("workspace_verified"):
+            return
         bounds = source._bounds_from_records(records)
         if state["authorization"] is None:
             # A SessionStart or tool hook can precede the first durable human
@@ -428,15 +423,24 @@ class ContextRuntime:
         elif bounds["last"] is not None:
             state["authorization"]["latest_instruction_locator"] = bounds["last"]
 
-    def _bind(self, state: dict[str, Any], event: dict[str, Any], *,
-              snapshot: _HookHistorySnapshot | None = None) -> HistorySource:
+    @staticmethod
+    def _observe_native_context(state: dict[str, Any], event: dict[str, Any]) -> None:
+        """Bind identity before adopting the native host's mutable working directory."""
         if _sid(event, True) != state["session_id"]:
             raise ContextRuntimeError("hook session drifted")
-        _event_cwd(event, state["cwd"], True)
-        source = _source(event.get("transcript_path"), state["session_id"])
-        if state["source_path"] not in {None, str(source.path)}:
-            raise ContextRuntimeError("native history source drifted")
-        state["source_path"] = str(source.path)
+        path = event.get("transcript_path")
+        native = Path(path) if isinstance(path, str) else None
+        if (native is None or not native.is_absolute() or native.name != f'{state["session_id"]}.jsonl'
+                or native.resolve(strict=False) != native or state["source_path"] not in {None, path}):
+            raise ContextRuntimeError("tool lifecycle native source identity is unavailable")
+        cwd = str(_cwd(event.get("cwd")))
+        state.setdefault("launch_cwd", state["cwd"])
+        state["cwd"], state["source_path"] = cwd, path
+
+    def _bind(self, state: dict[str, Any], event: dict[str, Any], *,
+              snapshot: _HookHistorySnapshot | None = None) -> HistorySource:
+        self._observe_native_context(state, event)
+        source = _source(state["source_path"], state["session_id"])
         self._catalogue_source(state)
         # Runtime observation may use the parser's existing complete-prefix
         # mode.  Public History APIs remain strict for ordinary stream reads.
@@ -456,6 +460,9 @@ class ContextRuntime:
 
     def _catalogue_source(self, state: dict[str, Any], *, require_existing: bool = False) -> dict[str, Any] | None:
         """历史登记不依赖交接、用户首条输入或自动换窗是否可用。"""
+        pending = state.get("pending_session_start")
+        if not require_existing and isinstance(pending, dict) and not pending.get("workspace_verified"):
+            return None  # An unverified resume must not become its own future identity proof.
         path = state.get("source_path")
         if path is None:
             return None
@@ -701,6 +708,18 @@ class ContextRuntime:
         return encoded
 
     @staticmethod
+    def _settle_observed_tools(state, activity, *, source_identity=None):
+        """A paired native result settles only a call from that exact source."""
+        identity = list(source_identity or (state["session_id"], state["source_path"]))
+        bindings = state.setdefault("pending_tool_sources", {})
+        completed = {key for key in activity["settled_tool_ids"] if bindings.get(key, identity) == identity}
+        state["pending_tool_ids"] = [key for key in state["pending_tool_ids"] if key not in completed]
+        state["background_tool_ids"] = [key for key in state.get("background_tool_ids", []) if key not in completed]
+        for key in completed:
+            bindings.pop(key, None)
+        return completed
+
+    @staticmethod
     def _settle_task_hook(state, event):
         """成功的原生任务终态回执可结算 child，不等待额外 SubagentStop。"""
         handle = terminal_task_result(event.get("tool_name"), event.get("tool_input"), event.get("tool_response"))
@@ -716,14 +735,7 @@ class ContextRuntime:
 
     def _observe_tool_hook(self, state, event):
         """Retain trusted live lifecycle facts even if JSONL reading is delayed."""
-        if _sid(event, True) != state["session_id"]:
-            raise ContextRuntimeError("hook session drifted")
-        _event_cwd(event, state["cwd"], True)
-        path = event.get("transcript_path")
-        native = Path(path) if isinstance(path, str) else None
-        if (native is None or not native.is_absolute() or native.name != f'{state["session_id"]}.jsonl'
-                or native.resolve(strict=False) != native or state["source_path"] not in {None, path}):
-            raise ContextRuntimeError("tool lifecycle native source identity is unavailable")
+        self._observe_native_context(state, event)
         name, tool = event.get("hook_event_name"), event.get("tool_use_id")
         if name == "PostToolBatch":
             calls = event.get("tool_calls")
@@ -731,20 +743,21 @@ class ContextRuntime:
                     or not isinstance(call.get("tool_use_id"), str) for call in calls):
                 raise ContextRuntimeError("native tool batch identity is unavailable")
             completed = {call["tool_use_id"] for call in calls}
-            state["pending_tool_ids"] = [key for key in state["pending_tool_ids"] if key not in completed]
+            self._settle_observed_tools(state, {"settled_tool_ids": completed})
         elif name != "Stop" and (name not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
                                  or not isinstance(tool, str) or not tool):
             raise ContextRuntimeError("tool hook lacks its native identity")
         if name == "PreToolUse":
             if tool not in state["pending_tool_ids"]:
                 state["pending_tool_ids"].append(tool)
+            state.setdefault("pending_tool_sources", {})[tool] = [state["session_id"], state["source_path"]]
             state["at_turn_boundary"] = False
             if state.get("resume_safe_boundary"):
                 self._invalidate_resume_boundary(state, "fresh_tool_activity_after_resume")
             if event.get("tool_input", {}).get("run_in_background") is True:
                 state.setdefault("background_tool_ids", []).append(tool)
         elif tool in state["pending_tool_ids"]:
-            state["pending_tool_ids"].remove(tool)
+            self._settle_observed_tools(state, {"settled_tool_ids": [tool]})
             if name == "PostToolUse":
                 self._settle_task_hook(state, event)
 
@@ -765,7 +778,7 @@ class ContextRuntime:
         try:
             if _sid(event, False) != prior.get("session_id"):
                 return False
-            _event_cwd(event, prior.get("cwd"), True)
+            _cwd(event.get("cwd"))
             expected, observed = prior.get("source_path"), event.get("transcript_path")
             if not isinstance(expected, str) or not isinstance(observed, str):
                 return True
