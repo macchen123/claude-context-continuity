@@ -253,7 +253,7 @@ def terminal_task_result(tool_name: Any, tool_input: Any, response: Any) -> str 
     return None
 
 
-def _task_notice(record: Mapping[str, Any]) -> tuple[str, str] | None:
+def _task_notice(record: Mapping[str, Any]) -> tuple[str, str, str | None] | None:
     """只认原生 task-notification 来源，不采信用户粘贴的同名标签。"""
     if record.get("isSidechain"):
         return None
@@ -273,7 +273,8 @@ def _task_notice(record: Mapping[str, Any]) -> tuple[str, str] | None:
     header = text.split("<summary>", 1)[0].split("<result>", 1)[0]
     task = re.search(r"<task-id>([^<>\r\n]{1,200})</task-id>", header)
     status = re.search(r"<status>(completed|failed|stopped|cancelled|killed)</status>", header)
-    return (task.group(1), status.group(1)) if task and status else None
+    tool = re.search(r"<tool-use-id>([^<>\r\n]{1,200})</tool-use-id>", header)
+    return (task.group(1), status.group(1), tool.group(1) if tool else None) if task and status else None
 
 
 def redact(text: str, secrets: Any = ()) -> str:
@@ -752,10 +753,24 @@ class HistorySource:
     @staticmethod
     def _activity_from_records(records: list[_Record]) -> dict[str, Any]:
         tools, results, backgrounds, controls = {}, set(), {}, {}
+        terminal_backgrounds, lifecycle = set(), {}
+
+        def evidence(handle):
+            return lifecycle.setdefault(handle, {"launch_tool_ids": set(), "terminal_tool_ids": set()})
+
         for info in records:
             notice = _task_notice(info.data)
             if notice is not None:
-                backgrounds.pop(notice[0], None)
+                handle, _, launch_id = notice
+                proof, launched = evidence(handle), backgrounds.get(handle)
+                if launch_id is not None:
+                    proof["terminal_tool_ids"].add(launch_id)
+                if launched is not None and (
+                        launch_id in launched["tool_use_ids"]
+                        or launch_id is None and len(proof["launch_tool_ids"]) == 1):
+                    proof["terminal_tool_ids"].update(launched["tool_use_ids"])
+                    backgrounds.pop(handle)
+                    terminal_backgrounds.add(handle)
             if info.kind == "assistant":
                 for block in _blocks(_content(info.data)):
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
@@ -778,9 +793,13 @@ class HistorySource:
                 handle = response.get(key)
                 if isinstance(handle, str) and handle:
                     backgrounds[handle] = {"tool_use_ids": sorted(new_ids), "source_record": info.message_id}
+                    terminal_backgrounds.discard(handle)
+                    evidence(handle)["launch_tool_ids"].update(new_ids & tools.keys())
             handle = response.get("agentId")
             if response.get("isAsync") is True and isinstance(handle, str) and handle:
                 backgrounds[handle] = {"tool_use_ids": sorted(new_ids), "source_record": info.message_id}
+                terminal_backgrounds.discard(handle)
+                evidence(handle)["launch_tool_ids"].update(new_ids & tools.keys())
             # 顶层 toolUseResult 必须能唯一配回一次真实任务工具调用。
             if len(ids) == 1 and new_ids and not any(block.get("is_error", False) for block in _results(info.data)):
                 control = controls.get(next(iter(ids)))
@@ -789,8 +808,14 @@ class HistorySource:
                     settled = terminal_task_result(name, {"task_id": target}, response)
                     if settled and launched is not None and backgrounds.get(settled) == launched:
                         backgrounds.pop(settled, None)
+                        terminal_backgrounds.add(settled)
+                        evidence(settled)["terminal_tool_ids"].update(launched["tool_use_ids"])
         return {"pending_tools": {key: value for key, value in tools.items() if key not in results},
-                "background_handles": backgrounds}
+                "background_handles": backgrounds,
+                "settled_tool_ids": sorted(tools.keys() & results),
+                "terminal_background_handles": sorted(terminal_backgrounds),
+                "background_lifecycle": {handle: {key: sorted(ids) for key, ids in proof.items()}
+                                         for handle, proof in lifecycle.items()}}
 
     def instruction_bounds(self) -> dict[str, Any]:
         """只返回真实用户指令的首尾定位；没有指令与来源损坏分开处理。"""

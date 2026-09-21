@@ -72,7 +72,8 @@ class HistorySourceTests(unittest.TestCase):
         self.assertEqual(source_kind(link), "meta")
         self.assertEqual(self.source().instruction_bounds(), before)
         self.assertEqual(self.source().latest_usage()["total_input_tokens"], 125)
-        self.assertEqual(self.source().activity(), {"pending_tools": {}, "background_handles": {}})
+        self.assertEqual(self.source().activity(), {"pending_tools": {}, "background_handles": {},
+            "settled_tool_ids": [], "terminal_background_handles": [], "background_lifecycle": {}})
         self.assertEqual([record.message_id for record in self.source()._records()], ["user-1", "assistant-1"])
         self.assertEqual(self.source().read(before["last"])["text"], "continue the authorized task")
 
@@ -134,7 +135,11 @@ class HistorySourceTests(unittest.TestCase):
 
     def test_activity_taskstop_settles_and_later_resume_reopens(self):
         self.write_records(*self.task_control_records())
-        self.assertEqual(self.source().activity(), {"pending_tools": {}, "background_handles": {}})
+        self.assertEqual(self.source().activity(), {"pending_tools": {}, "background_handles": {},
+            "settled_tool_ids": ["control-call", "launch-call"],
+            "terminal_background_handles": ["agent-fixture"],
+            "background_lifecycle": {"agent-fixture": {"launch_tool_ids": ["launch-call"],
+                                                       "terminal_tool_ids": ["launch-call"]}}})
         resume = self.record("resume", "assistant", [{"type": "tool_use", "id": "resume-call", "name": "Agent", "input": {}}])
         resumed = self.record("resumed", "user", [{"type": "tool_result", "tool_use_id": "resume-call", "content": "resumed"}],
                               toolUseResult={"resumedAgentId": "agent-fixture"})

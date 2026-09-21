@@ -1332,6 +1332,228 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
         self.clear_mock.assert_called_once()
 
+    def test_lifecycle_directory_change_settles_build_and_rotates(self):
+        frontend = self.cwd / "frontend"
+        frontend.mkdir()
+        observed_cwds = []
+        self.runtime.configuration_reader = lambda cwd: observed_cwds.append(cwd) or self.config
+        request, results = self.batch_records(["cd-build"], value=820)
+        self.append_records(request)
+        self.runtime.on_hook(self.hook("PreToolUse", tool_name="Bash", tool_use_id="cd-build"))
+        self.append_records(*results)
+        output = self.runtime.on_hook(self.hook("PostToolUse", cwd=str(frontend),
+            tool_name="Bash", tool_use_id="cd-build", tool_response={"stdout": "built", "stderr": ""}))
+        self.assertNotIn("systemMessage", output)
+        self.assertEqual(self.runtime.receipt()["cwd"], str(frontend))
+        self.assertEqual(observed_cwds[-1], frontend)
+        self.assertEqual(self.runtime.receipt()["pending_tool_ids"], [])
+        batch = self.runtime.on_hook(self.hook("PostToolBatch", cwd=str(frontend),
+            tool_calls=[{"tool_use_id": "cd-build"}]))
+        self.assertFalse(batch["continue"])
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_lifecycle_changed_directory_cannot_rebind_foreign_source(self):
+        frontend = self.cwd / "frontend"
+        frontend.mkdir()
+        foreign = frontend / self.source.name
+        foreign.write_bytes(self.source.read_bytes())
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="live"))
+        self.runtime.on_hook(self.hook("PostToolUse", cwd=str(frontend),
+            transcript_path=str(foreign), tool_use_id="live"))
+        state = self.runtime._state()
+        self.assertEqual(state["source_path"], str(self.source))
+        self.assertEqual(state["cwd"], str(self.cwd))
+        self.assertEqual(state["pending_tool_ids"], ["live"])
+        self.clear_mock.assert_not_called()
+
+    def test_lifecycle_history_settles_missed_terminal_hook_at_next_boundary(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                tool_id = f"missed-post-{failed}"
+                request, results = self.batch_records([tool_id], value=125)
+                self.append_records(request)
+                self.runtime.on_hook(self.hook("PreToolUse", tool_use_id=tool_id))
+                results[0]["message"]["content"][0]["is_error"] = failed
+                self.append_records(*results)
+        request, results = self.batch_records(["next-batch"], value=820)
+        self.append_records(request, *results)
+        output = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "next-batch"}]))
+        self.assertFalse(output["continue"])
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.assertEqual(self.runtime.receipt()["pending_tool_ids"], [])
+        self.clear_mock.assert_called_once()
+
+    def test_lifecycle_settlement_needs_real_paired_terminal_evidence(self):
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="not-in-history"))
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="still-running"))
+        request, results = self.batch_records(["still-running"], value=125)
+        self.append_records(request)
+        orphan = self.batch_records(["not-in-history"], value=125)[1][0]
+        sidechain = dict(results[0], isSidechain=True)
+        self.append_records(orphan, sidechain)
+        request, results = self.batch_records(["finished-batch"], value=820)
+        self.append_records(request, *results)
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{"tool_use_id": "finished-batch"}]))
+        self.assertEqual(self.runtime.advance()["phase"], "waiting_safe_boundary")
+        self.assertEqual(set(self.runtime.receipt()["pending_tool_ids"]), {"not-in-history", "still-running"})
+        self.clear_mock.assert_not_called()
+
+    def test_lifecycle_clear_starts_fresh_foreground_epoch_and_keeps_background(self):
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="old-foreground"))
+        self.runtime.on_hook(self.hook("SubagentStart", agent_id="live-background"))
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook(self.hook("SessionStart", source="clear", session_id=sid,
+                                      transcript_path=str(source)))
+        state = self.runtime._state()
+        self.assertEqual(state["pending_tool_ids"], [])
+        self.assertEqual(state["active_child_handles"], ["live-background"])
+        self.assertEqual(state["superseded_lifecycle"]["pending_tool_ids"], ["old-foreground"])
+        self.runtime.on_hook(self.hook("PreToolUse", session_id=sid,
+                                      transcript_path=str(source), tool_use_id="new-foreground"))
+        frontend = self.cwd / "frontend"
+        frontend.mkdir()
+        self.runtime.on_hook(self.hook("PostToolUse", cwd=str(frontend), tool_use_id="old-foreground"))
+        state = self.runtime._state()
+        self.assertEqual(state["pending_tool_ids"], ["new-foreground"])
+        self.assertEqual(state["superseded_lifecycle"]["pending_tool_ids"], [])
+        self.assertEqual(state["cwd"], str(self.cwd))
+        self.assertIsNone(state.get("reconciliation"))
+        self.clear_mock.assert_not_called()
+
+    def test_lifecycle_reconciles_completed_tool_carried_from_catalogued_window(self):
+        old_id = "completed-before-clear"
+        request, results = self.batch_records([old_id], value=125)
+        self.append_records(request, *results)
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook(self.hook("SessionStart", source="clear", session_id=sid,
+                                      transcript_path=str(source)))
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["pending_tool_ids"] = [old_id]
+            self.runtime._save(state)
+        self.sid, self.source = sid, source
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        self.assertEqual(self.runtime.receipt()["pending_tool_ids"], [])
+        self.clear_mock.assert_called_once()
+
+    def test_lifecycle_native_failure_notice_settles_child_without_stop_hook(self):
+        request, results = self.batch_records(["child-launch"], value=125)
+        results[0]["toolUseResult"] = {"agentId": "failed-child", "isAsync": True}
+        self.append_records(request, *results)
+        self.runtime.on_hook(self.hook("SubagentStart", agent_id="failed-child"))
+        text = "<task-notification><task-id>failed-child</task-id><status>failed</status></task-notification>"
+        self.append_records({"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+            "origin": {"kind": "task-notification"}, "promptSource": "system",
+            "message": {"role": "user", "content": text}})
+        self.usage(125)
+        self.runtime.on_hook(self.hook("Stop"))
+        self.runtime.advance()
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
+        self.clear_mock.assert_not_called()
+
+    def test_lifecycle_resume_after_directory_change_uses_current_native_cwd(self):
+        frontend = self.cwd / "frontend"
+        frontend.mkdir()
+        self.runtime.on_hook(self.hook("SessionStart", source="resume", cwd=str(frontend)))
+        state = self.runtime._state()
+        self.assertEqual(state["cwd"], str(frontend))
+        self.assertNotIn("pending_session_start", state)
+        self.assertIsNone(state.get("reconciliation"))
+        self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 125)
+        self.clear_mock.assert_not_called()
+
+    def test_lifecycle_delayed_foreign_resume_retains_workspace_check(self):
+        foreign_cwd = self.root / "foreign-workspace"
+        foreign_cwd.mkdir()
+        for hook_before_reconcile in (False, True):
+            with self.subTest(hook_before_reconcile=hook_before_reconcile):
+                runtime, _, _ = self.resume_runtime()
+                sid, source = self.resume_source(125, cwd=foreign_cwd)
+                complete = source.read_bytes()
+                source.write_bytes(b"")
+                event = self.hook("SessionStart", source="resume", session_id=sid,
+                                  transcript_path=str(source))
+                runtime.on_hook(event)
+                self.assertIsNotNone(runtime._state().get("pending_session_start"))
+                source.write_bytes(complete)
+                if hook_before_reconcile:
+                    runtime.on_hook(self.hook("Stop", session_id=sid, transcript_path=str(source)))
+                state = runtime._state()
+                self.assertIsNone(state["authorization"])
+                self.assertFalse(runtime._reconcile_pending_session_start(state))
+                self.assertIsNone(state["authorization"])
+                self.assertIsNotNone(state.get("pending_session_start"))
+                # Repeating SessionStart must not turn its provisional catalogue
+                # entry into an already-verified workspace binding.
+                runtime.on_hook(event)
+                self.assertIsNone(runtime._state()["authorization"])
+                self.clear_mock.assert_not_called()
+                self.send_mock.assert_not_called()
+
+    def test_lifecycle_provisional_resume_catalogue_is_not_workspace_proof(self):
+        runtime, _, _ = self.resume_runtime()
+        foreign_cwd = self.root / "foreign-workspace"
+        foreign_cwd.mkdir()
+        sid, source = self.resume_source(125, cwd=foreign_cwd)
+        complete = source.read_bytes()
+        source.write_bytes(b"")
+        event = self.hook("SessionStart", source="resume", session_id=sid, transcript_path=str(source))
+        runtime.on_hook(event)
+        source.write_bytes(complete)
+        runtime.on_hook(self.hook("SessionStart", source="resume"))
+        self.assertEqual(runtime._state()["session_id"], self.sid)
+        runtime.on_hook(event)
+        self.assertNotEqual(runtime._state()["authorization"]["root_instruction_locator"]["session_id"], sid)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_lifecycle_cold_resume_after_cd_accepts_verified_launch_workspace(self):
+        frontend = self.cwd / "frontend"
+        frontend.mkdir()
+        self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="completed-cd", cwd=str(frontend)))
+        self.usage(125, cwd=frontend)
+        self.assertTrue(tui_runtime._owner_workspace_matches(self.runtime._state(), self.cwd))
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                runtime, _, _ = self.resume_runtime()
+                complete = self.source.read_bytes()
+                if delayed:
+                    self.source.write_bytes(b"")
+                runtime.on_hook(self.hook("SessionStart", source="resume"))
+                if delayed:
+                    self.source.write_bytes(complete)
+                    with core.lock(runtime.lock_path):
+                        state = runtime._state()
+                        self.assertTrue(runtime._reconcile_pending_session_start(state))
+                        runtime._save(state)
+                state = runtime._state()
+                self.assertEqual(state["session_id"], self.sid)
+                self.assertEqual(state["cwd"], str(self.cwd))
+                self.assertNotIn("pending_session_start", state)
+                self.assertFalse(state.get("native_session_uncertain"))
+                self.assertEqual(state["authorization"]["root_instruction_locator"]["session_id"], self.sid)
+                self.clear_mock.assert_not_called()
+                self.send_mock.assert_not_called()
+
+    def test_lifecycle_old_result_cannot_settle_reused_live_tool_id(self):
+        tool_id = "call-reused-across-sessions"
+        request, results = self.batch_records([tool_id], value=125)
+        self.append_records(request, *results)
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook(self.hook("SessionStart", source="clear", session_id=sid,
+                                      transcript_path=str(source)))
+        self.runtime.on_hook(self.hook("PreToolUse", session_id=sid, transcript_path=str(source),
+                                      tool_use_id=tool_id, tool_name="Bash", tool_input={}))
+        state = self.runtime._state()
+        activity = HistorySource(source, sid).activity()
+        self.assertNotIn(tool_id, activity["pending_tools"])
+        self.runtime._reconcile_lifecycle(state, activity)
+        self.assertEqual(state["pending_tool_ids"], [tool_id])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_duplicate_tool_pre_and_failed_post_do_not_block(self):
         for name in ("PreToolUse", "PreToolUse", "PostToolUseFailure", "PostToolUseFailure"):
             output = self.runtime.on_hook(self.hook(name, tool_use_id="retry-tool"))
@@ -1919,7 +2141,7 @@ class TuiRuntimeTests(unittest.TestCase):
         other_cwd.mkdir()
         with core.lock(self.runtime.lock_path):
             owner = self.runtime._state()
-            owner["cwd"] = str(other_cwd)
+            owner["cwd"] = owner["launch_cwd"] = str(other_cwd)
             self.runtime._save(owner)
         runtime, startup_sid, startup_source = self.resume_runtime()
         self.clear_mock.reset_mock()

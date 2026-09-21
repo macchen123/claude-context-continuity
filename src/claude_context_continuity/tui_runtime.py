@@ -28,6 +28,10 @@ def _durable_cron_compat_enabled():
     return value == "on"
 
 
+def _owner_workspace_matches(state, cwd):
+    return str(cwd) in {state.get("cwd"), state.get("launch_cwd", state.get("cwd"))}
+
+
 _PLUGIN_EVENTS = (
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop",
     "SubagentStart", "SubagentStop", "PreCompact",
@@ -213,6 +217,7 @@ class TuiRuntime(ContextRuntime):
         # that those inputs were consumed.  Preserve them without replaying text.
         candidate["deferred_inputs"] = deepcopy(state.get("deferred_inputs", []))
         candidate["pending_tool_ids"], candidate["active_child_handles"], candidate["background_tool_ids"] = [], [], []
+        candidate["pending_tool_sources"] = {}
         candidate["at_turn_boundary"] = False
         for key in ("output_budget", "tool_batch_boundary", "rotation_model", "rotation_permission",
                     "rotation_deadline", "continuation_hash", "continuation_observed", "continuation_input_receipts",
@@ -264,7 +269,7 @@ class TuiRuntime(ContextRuntime):
                 return
             if owner_state.get("session_id") != sid or owner_state.get("source_path") != source_path:
                 return
-            if owner_state.get("cwd") != cwd:
+            if owner.conversation_id != self.conversation_id and not _owner_workspace_matches(owner_state, cwd):
                 raise ContextRuntimeError("恢复来源与已登记 owner 的工作目录不符")
             rotation = owner_state.get("rotation")
             if not isinstance(rotation, dict) or type(owner_state.get("window_generation")) is not int:
@@ -273,10 +278,10 @@ class TuiRuntime(ContextRuntime):
             # direct tool receipt, or continuation marker decides only whether an
             # old command may run; it must not prevent binding the real resumed
             # native epoch.
-            owner._catalogue_source(owner_state, require_existing=True)
             authorization = owner_state.get("authorization")
             if authorization is None:
                 return
+            owner._catalogue_source(owner_state, require_existing=True)
             owner._verify_authorization(owner_state)
             owners.append((owner.conversation_id, {
                 "root_instruction_locator": deepcopy(authorization["root_instruction_locator"]),
@@ -368,14 +373,25 @@ class TuiRuntime(ContextRuntime):
         return {"hook_event_name": "SessionStart", "source": "resume", "session_id": sid,
                 "cwd": cwd, "transcript_path": path}
 
+    def _verify_resume_workspace(self, binding, source, latest):
+        """Keep an unverified source pending even when its prefix arrives later."""
+        if binding.get("workspace_verified"):
+            return
+        if latest["cwd"] != binding["cwd"]:
+            # A registered owner may have legitimately changed cwd after launch.
+            # Do not treat this manager's provisional binding as its own proof.
+            owner = self._resolve_resume_authorization({}, source, binding["session_id"], binding["cwd"])
+            if owner is None:
+                raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
+        binding["workspace_verified"] = True
+
     def _complete_resume_binding(self, candidate, binding, *, incoming_state=None):
         """Complete a previously accepted resume only from a readable exact prefix."""
         sid = binding["session_id"]
         source = _source(binding["transcript_path"], sid)
         records = source._records(defer_incomplete_tail=True)
         latest = source._usage_from_records(records)
-        if latest["cwd"] != candidate["cwd"]:
-            raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
+        self._verify_resume_workspace(binding, source, latest)
         candidate["source_path"] = str(source.path)
         self._catalogue_source(candidate)
         self._observe_authorization_records(candidate, source, records)
@@ -418,15 +434,21 @@ class TuiRuntime(ContextRuntime):
         """Accept a validated native epoch before waiting for its history prefix."""
         incoming_state = state if incoming_state is None else incoming_state
         binding = self._resume_binding(event, sid, state["cwd"])
-        if Path(binding["transcript_path"]).is_file():
+        known = any((entry["session_id"], entry["source_path"]) == (sid, binding["transcript_path"])
+                    for entry in self._catalogue_entries(self))
+        pending = incoming_state.get("pending_session_start")
+        if (isinstance(pending, dict) and pending.get("session_id") == sid
+                and pending.get("transcript_path") == binding["transcript_path"]):
+            known = bool(pending.get("workspace_verified"))
+        binding["workspace_verified"] = known
+        if not known and Path(binding["transcript_path"]).is_file():
             try:
                 source = _source(binding["transcript_path"], sid)
                 latest = source._usage_from_records(source._records(defer_incomplete_tail=True))
             except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError):
-                pass  # The validated native path may still be awaiting its prefix.
+                pass  # The pending binding retains its workspace verification obligation.
             else:
-                if latest["cwd"] != state["cwd"]:
-                    raise ContextRuntimeError("恢复来源的实际模型用量工作目录不符")
+                self._verify_resume_workspace(binding, source, latest)
         candidate = self._resume_candidate(state, incoming_state, sid, binding["transcript_path"])
         candidate["pending_session_start"] = binding
         self._catalogue_source(candidate)
@@ -449,7 +471,8 @@ class TuiRuntime(ContextRuntime):
         binding = state.get("pending_session_start")
         if not isinstance(binding, dict) or binding.get("source") != "resume":
             return False
-        if binding.get("session_id") != state.get("session_id") or binding.get("cwd") != state.get("cwd"):
+        if (binding.get("session_id") != state.get("session_id")
+                or binding.get("transcript_path") != state.get("source_path")):
             self._wait(state, "resume_binding_identity_drift")
             return False
         try:
@@ -727,8 +750,8 @@ class TuiRuntime(ContextRuntime):
                 self._save(state)
                 return result
             try:
-                self._verify_config(state)
                 self._bind(state, event)
+                self._verify_config(state)
                 self._window(state, event)
                 observed = self._usage(state, False)
                 if (observed is not None and self._waiting(state)
@@ -860,7 +883,6 @@ class TuiRuntime(ContextRuntime):
             self._normalize_legacy_pause(previous)
             state = deepcopy(previous)
             try:
-                self._verify_config(state)
                 sid = _uuid(event["session_id"], "native session_id")
                 cwd = Path(event["cwd"]).resolve(strict=True)
                 if not cwd.is_dir():
@@ -879,6 +901,7 @@ class TuiRuntime(ContextRuntime):
                 if duplicate and path is not None and state.get("source_path") not in {None, path}:
                     raise ContextRuntimeError("重复 SessionStart 的原生历史路径不符")
                 state["cwd"] = str(cwd)
+                self._verify_config(state)
                 if state["phase"] == "created" and source in {"startup", "resume"}:
                     state["durable_cron_compat"] = {
                         "enabled": _durable_cron_compat_enabled(), "scheduler_session_id": sid}
@@ -891,6 +914,11 @@ class TuiRuntime(ContextRuntime):
                 elif source == "resume":
                     self._bind_resume(state, event, sid, incoming_state=previous)
                 elif source == "clear" and sid != old_sid:
+                    # SessionStart confirms a new foreground epoch, not completion
+                    # of old work. Keep its receipt for late events, never replay it.
+                    state["superseded_lifecycle"] = self._superseded_lifecycle(previous)
+                    state["pending_tool_ids"], state["background_tool_ids"] = [], []
+                    state["pending_tool_sources"] = {}
                     clear = state["rotation"]["clear"]
                     expected = (clear is not None and clear["old_session_id"] == old_sid
                                 and not clear["reset_seen"])
@@ -1118,6 +1146,53 @@ class TuiRuntime(ContextRuntime):
         return source, (str(source.path), source.session_id, stat.st_dev, stat.st_ino,
                         stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
+    def _reconcile_lifecycle(self, state, activity):
+        """Settle exact native receipts, never infer completion from absent activity."""
+        self._settle_observed_tools(state, activity)
+        pending = set(state["pending_tool_ids"]) - set(activity["pending_tools"])
+        children = set(state["active_child_handles"]) - set(activity["background_handles"])
+        lifecycle, complete = {}, True
+
+        def merge(observed):
+            for handle in children & observed["background_lifecycle"].keys():
+                proof = lifecycle.setdefault(handle, {"launch_tool_ids": set(), "terminal_tool_ids": set()})
+                for key, ids in observed["background_lifecycle"][handle].items():
+                    proof[key].update(ids)
+
+        merge(activity)
+        # Catalogue generations can be reassigned when adopting a lineage. Match
+        # launch/terminal tool IDs across sources, not their catalogue ordering.
+        if pending or children:
+            try:
+                entries = self._catalogue_entries(self)
+            except (OSError, TypeError, ValueError, HistoryError):
+                entries, complete = [], False
+            seen = {(state["session_id"], state["source_path"])}
+            for entry in reversed(entries):
+                identity = (entry["session_id"], entry["source_path"])
+                if identity in seen or entry["generation"] > state["window_generation"]:
+                    continue
+                seen.add(identity)
+                try:
+                    source = _source(entry["source_path"], entry["session_id"])
+                    records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
+                    prior = source._activity_from_records(records)
+                except (OSError, TypeError, ValueError, HistoryError):
+                    complete = False
+                    continue  # An unrelated unreadable window cannot hide a paired tool result.
+                complete = complete and not incomplete
+                completed = pending & set(prior["settled_tool_ids"])
+                settled = self._settle_observed_tools(state, {"settled_tool_ids": completed},
+                                                     source_identity=identity)
+                pending.difference_update(settled)
+                merge(prior)
+                if not pending and not children:
+                    break
+        if complete and not state["pending_tool_ids"] and not self._current_epoch_pending(state, activity):
+            terminal = {handle for handle, proof in lifecycle.items() if proof["launch_tool_ids"]
+                        and proof["launch_tool_ids"] <= proof["terminal_tool_ids"]}
+            state["active_child_handles"] = [key for key in state["active_child_handles"] if key not in terminal]
+
     @staticmethod
     def _current_epoch_pending(state, activity):
         historical = set(state.get("resume_historical_pending_tool_ids", []))
@@ -1240,10 +1315,11 @@ class TuiRuntime(ContextRuntime):
                         if not stable:
                             self._save(state)
                             return self._receipt(state)
+                        activity = source._activity_from_records(records)
+                        self._reconcile_lifecycle(state, activity)
                         self._usage(state, True, sample=source._usage_from_records(records))
                         self._automatic_rotation(state)
                         if state["rotation"]["request"]:
-                            activity = source._activity_from_records(records)
                             if self._current_epoch_pending(state, activity) or state["pending_tool_ids"]:
                                 state["phase"] = "waiting_safe_boundary"
                             elif native_control.ready(control):
