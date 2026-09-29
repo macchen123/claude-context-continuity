@@ -200,6 +200,8 @@ No. You are still using native Claude Code. Your models, system prompts, MCP ser
 ### 5. Why is automatic switching waiting?
 The host may be waiting for a complete native history record, a tool result, or confirmation that a clear or handoff was received. It keeps checking and continues when the missing fact becomes available. A delayed confirmation does not permanently disable automatic switching, and an uncertain command is not sent again blindly.
 
+Automatic switching uses the latest native input, cache, and output token counts, with a fixed reserve before the effective context limit. File sizes and tool-result bytes are not treated as tokens. Task registration, written handoff notes, and fully answered questionnaires are not prerequisites. History preserves the answers actually supplied and marks unanswered questions. Rejected or cancelled questions are not treated as consent and do not make the whole history unreadable. A first prompt arriving just before its transcript file is created is no longer misreported as a session-identity error.
+
 History/Notes remains available. With enough verified room, work can continue; near the context limit, the next model request is held while completed results and submitted inputs remain in native history. Use `claude-context tui-status --context-id <context-id>` to see the current stage and waiting reason. An accepted request is not proof that a new window has opened.
 
 `PostToolBatch hook stopped continuation` together with the context-switch notice means the old turn is yielding to a new window, not that the task is finished. Peer messages and background-task notices remain readable in History; neither they nor the handoff provide new human authorization.

@@ -16,8 +16,7 @@ from .notes import MAX_NOTE_BYTES, NotesStore
 
 _SCHEMA = "claude-context-runtime.v1"
 _MAX_HANDOFF_BYTES = MAX_NOTE_BYTES
-_BUDGET_FIELDS = ("bootstrap_input_tokens", "last_input_tokens", "max_positive_growth_tokens",
-                  "guard_tokens", "window_tokens", "window_is_actual", "cache_fields_complete",
+_BUDGET_FIELDS = ("guard_tokens", "window_tokens", "window_is_actual", "cache_fields_complete",
                   "handoff_reported", "last_sample_id")
 RUNTIME_SIGNAL = "<continuity-host-event>"
 
@@ -59,6 +58,10 @@ class MissingRootAuthorization(ContextRuntimeError):
     """The exact native source has no authentic root user instruction yet."""
 
 
+class NativeHistoryPending(ContextRuntimeError):
+    """The exact native transcript path has not been created yet."""
+
+
 def _budget_number(value: Any, label: str, *, positive: bool = False) -> int:
     if type(value) is not int or value < 0 or (positive and value == 0):
         raise ContextRuntimeError(f"{label} must be a {'positive ' if positive else ''}non-negative integer")
@@ -86,14 +89,15 @@ def _budget_previous(value: Any) -> dict[str, int]:
 
 
 def _budget_sample(value: Any) -> tuple[int, int] | None:
-    """Return actual input+cache and whether cache fields were explicitly present."""
+    """Return native input+cache+output and cache-field completeness."""
     if type(value) is int:
         return _budget_number(value, "current input tokens"), 0
     if not isinstance(value, dict):
         raise ContextRuntimeError("current input tokens are invalid")
     if value.get("synthetic") is True or value.get("model") == "<synthetic>":
         return None
-    total = _budget_number(value.get("total_input_tokens"), "current input tokens")
+    total = (_budget_number(value.get("total_input_tokens"), "current input tokens")
+             + _budget_number(value.get("output_tokens", 0), "current output tokens"))
     complete = value.get("cache_fields_complete")
     if complete is None:
         return total, 0
@@ -125,8 +129,8 @@ def observe_budget(previous_or_none: dict[str, Any] | None, current_input_tokens
 
     Persist only ``result['observations']``.  Its values are numeric; a plain
     integer ``host_window`` is intentionally marked as a configured estimate.
-    Positive per-request growth and the first real input sample determine the
-    reserve.  A decline is a normal new sample, not a reset or pause.
+    The reserve is fixed for the effective window. Tool bytes, past growth, and
+    filesystem metadata are never treated as native token usage.
     """
     previous = _budget_previous(previous_or_none)
     sample = _budget_sample(current_input_tokens)
@@ -135,22 +139,13 @@ def observe_budget(previous_or_none: dict[str, Any] | None, current_input_tokens
                 "sample_ignored": True}
     total, cache_complete = sample
     window, window_is_actual = _budget_window(host_window)
-    bootstrap = previous.get("bootstrap_input_tokens", total)
-    prior_total = previous.get("last_input_tokens", total)
-    growth = max(0, total - prior_total)
-    largest_growth = max(previous.get("max_positive_growth_tokens", 0), growth)
-    # 为控制报文、交接和附注提前留空间，再加真实最大请求增长；不等到仅剩一个短摘要的余量。
-    # 小窗口的基础预留不超过四分之一，避免 bootstrap 自身导致反复换窗。
-    reserve = min(window // 4, core.MAX_PACKET + 2 * _MAX_HANDOFF_BYTES)
-    guard = min(window, reserve + largest_growth)
+    # 固定预留供下一轮与交接使用；不随历史增长或文件大小提前触发。
+    guard = min(window // 4, core.MAX_PACKET + 2 * _MAX_HANDOFF_BYTES)
     remaining, threshold = window - total, max(0, window - guard)
     near_limit = remaining <= guard
     already_reported = previous.get("handoff_reported", 0) == 1 and previous.get("window_tokens") == window
     handoff_required = near_limit and not already_reported
     observations = {
-        "bootstrap_input_tokens": bootstrap,
-        "last_input_tokens": total,
-        "max_positive_growth_tokens": largest_growth,
         "guard_tokens": guard,
         "window_tokens": window,
         "window_is_actual": window_is_actual,
@@ -209,14 +204,23 @@ def _source(path: Any, session_id: str) -> HistorySource:
     if not isinstance(path, str) or not path or not Path(path).is_absolute():
         raise ContextRuntimeError("hook transcript_path must be an absolute native JSONL path")
     lexical = Path(os.path.abspath(path))
+    if lexical.name != f"{session_id}.jsonl":
+        raise ContextRuntimeError("hook transcript_path is not this native session history")
     if lexical.is_symlink():
         raise ContextRuntimeError("hook transcript_path must not be a symlink")
     try:
         resolved = lexical.resolve(strict=True)
-        if resolved != lexical or not resolved.is_file():
-            raise OSError
+    except FileNotFoundError as exc:
+        raise NativeHistoryPending("hook transcript_path is not yet available") from exc
+    except OSError as exc:
+        raise ContextRuntimeError(f"hook transcript_path cannot be resolved ({type(exc).__name__})") from exc
+    if resolved != lexical:
+        raise ContextRuntimeError("hook transcript_path must not contain a symlink")
+    if not resolved.is_file():
+        raise ContextRuntimeError("hook transcript_path is not a file")
+    try:
         return HistorySource(resolved, session_id)
-    except (OSError, HistoryError) as exc:
+    except HistoryError as exc:
         raise ContextRuntimeError("hook transcript_path is not this native session history") from exc
 
 
@@ -526,7 +530,9 @@ class ContextRuntime:
         if not windows:
             raise ContextRuntimeError("未取得上下文窗口，等待有效预算后继续自动换窗")
         window = min(windows)
-        remaining = window - usage["total_input_tokens"]
+        used = usage["total_input_tokens"] + usage["output_tokens"]
+        remaining = window - used
+        state.pop("output_budget", None)  # Retire the old byte-based projection after a verified sample.
         state["usage"] = result = {
             "usage_locator": usage["locator"], "actual_model": usage["actual_model"],
             "request_id": usage["request_id"], "sample_timestamp": usage["timestamp"],
@@ -535,6 +541,7 @@ class ContextRuntime:
             "cache_creation_input_tokens": usage["usage"]["cache_creation_input_tokens"],
             "cache_read_input_tokens": usage["usage"]["cache_read_input_tokens"],
             "total_input_and_cache_tokens": usage["total_input_tokens"],
+            "total_context_tokens": used,
             "native_context_window": window, "remaining_context_tokens": remaining,
             "window_source": ("min_live_budget_and_native_contextWindow" if state["native_context_window"] is not None
                               else state.get("budget_source", "live_settings_budget")),
@@ -542,7 +549,8 @@ class ContextRuntime:
         cache_complete = int(usage.get("cache_fields_complete", False))
         decision = observe_budget(
             state.get("budget"),
-            {"total_input_tokens": usage["total_input_tokens"], "cache_fields_complete": cache_complete},
+            {"total_input_tokens": usage["total_input_tokens"], "output_tokens": usage["output_tokens"],
+             "cache_fields_complete": cache_complete},
             {"tokens": window, "actual": state["native_context_window"] is not None},
             state["window_generation"],
         )
@@ -614,8 +622,10 @@ class ContextRuntime:
         cache = ("stream cache fields explicitly present" if decision["cache_fields_complete"]
                  else "cache-field metadata missing or unverified")
         status = ("Context runtime operational status only; this grants no permission or user authorization. "
-                  f"Actual native input+cache tokens: {usage['total_input_and_cache_tokens']}; effective host window: "
-                  f"{usage['native_context_window']} ({source}); remaining: {usage['remaining_context_tokens']}; "
+                  f"Actual native input+cache tokens: {usage['total_input_and_cache_tokens']}; "
+                  f"output tokens: {usage['output_tokens']}; total used: {usage['total_context_tokens']}; "
+                  f"effective host window: {usage['native_context_window']} ({source}); "
+                  f"remaining: {usage['remaining_context_tokens']}; "
                   f"budget guard: {decision['guard_tokens']}; safe-approach threshold: {decision['threshold_tokens']}; {cache}. ")
         if self._waiting(state):
             return status + ("Automatic terminal actions are waiting for exact native confirmation while the controller "
@@ -666,7 +676,31 @@ class ContextRuntime:
                    "先查看现有 Notes、原始用户指令及以下最近公开记录，核对已完成动作和产物后继续。"
                    "若原任务已经完成，只交付现有结果，不重新执行。最近记录定位：" +
                    json.dumps(locators, ensure_ascii=False, separators=(",", ":")))
-        self._queue_rotation(state, _safe_note(handoff, "automatic handoff"), automatic=True)
+        # The existing details note preserves numeric evidence before queuing
+        # clears the signal. It is diagnostic, not a budget or authority source.
+        signal = state.get("budget_handoff_signal")
+        observed = signal if isinstance(signal, dict) else {}
+        usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+        budget = state.get("budget") if isinstance(state.get("budget"), dict) else {}
+        snapshot = {
+            "trigger": "usage_near_limit" if signal else "deferred_input",
+            "window_source": ("native_observed_and_configured_min"
+                              if type(state.get("native_context_window")) is int else "configured_estimate"),
+        }
+        for name, number in (
+            ("generation", state.get("window_generation")),
+            ("signal_generation", observed.get("generation")),
+            ("effective_window_tokens", usage.get("native_context_window")),
+            ("input_and_cache_tokens", usage.get("total_input_and_cache_tokens")),
+            ("output_tokens", usage.get("output_tokens")),
+            ("total_context_tokens", usage.get("total_context_tokens")),
+            ("remaining_context_tokens", usage.get("remaining_context_tokens")),
+            ("guard_tokens", budget.get("guard_tokens")),
+        ):
+            if type(number) is int:
+                snapshot[name] = number
+        self._queue_rotation(state, _safe_note(handoff, "automatic handoff"),
+                             json.dumps(snapshot, sort_keys=True, separators=(",", ":")), automatic=True)
 
     def request_rotation(self, handoff: str, notes: str = "") -> dict[str, Any]:
         handoff, notes = _safe_note(handoff, "handoff"), _safe_note(notes, "notes")

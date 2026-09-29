@@ -47,6 +47,7 @@ class _Record:
 class _Pair:
     ask: _Record
     selections: tuple[tuple[str, str], ...]
+    unanswered: tuple[str, ...] = ()
 
 
 def _decode(raw: bytes, start: int) -> dict[str, Any]:
@@ -334,10 +335,9 @@ def _selections(questions: list[Any], answers: Any) -> tuple[tuple[str, str], ..
     if not labels or any(not isinstance(label, str) or not label for label in labels) or len(set(labels)) != len(labels):
         raise HistoryError("AskUserQuestion questions are empty or ambiguous")
     if isinstance(answers, dict):
-        try:
-            values = [answers[label] for label in labels]
-        except KeyError as exc:
-            raise HistoryError("AskUserQuestion answers do not cover every question") from exc
+        if not answers.keys() <= set(labels):
+            raise HistoryError("AskUserQuestion answer is paired with another question")
+        values = [answers.get(label) for label in labels]
     elif isinstance(answers, list) and len(answers) == len(labels):
         values = []
         for label, value in zip(labels, answers):
@@ -352,7 +352,14 @@ def _selections(questions: list[Any], answers: Any) -> tuple[tuple[str, str], ..
         values = [answers]
     else:
         raise HistoryError("AskUserQuestion answers do not match questions")
-    return tuple((label, _answer(value)) for label, value in zip(labels, values))
+    selections = []
+    for label, value in zip(labels, values):
+        if value is None:
+            continue
+        answer = _answer(value)
+        if answer.strip():
+            selections.append((label, answer))
+    return tuple(selections)
 
 
 def _structured(record: Mapping[str, Any], blocks: list[dict[str, Any]]) -> Any | None:
@@ -444,17 +451,26 @@ class HistorySource:
 
     def _pairs(self, records: list[_Record]) -> dict[str, _Pair]:
         asks: dict[str, tuple[int, _Record, list[Any]]] = {}
+        ambiguous: set[str] = set()
+        result_counts: dict[str, int] = {}
         for index, info in enumerate(records):
+            if info.kind == "tool_result":
+                for block in _results(info.data):
+                    tool_id = block["tool_use_id"]
+                    result_counts[tool_id] = result_counts.get(tool_id, 0) + 1
             if info.kind != "assistant":
                 continue
             for block in _blocks(_content(info.data)):
                 if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "AskUserQuestion":
                     continue
                 tool_id, tool_input = block.get("id"), block.get("input")
-                if not isinstance(tool_id, str) or not tool_id or not isinstance(tool_input, dict) or not isinstance(tool_input.get("questions"), list):
-                    raise HistoryError("AskUserQuestion tool_use has invalid id or questions")
+                if not isinstance(tool_id, str) or not tool_id:
+                    continue
                 if tool_id in asks:
-                    raise HistoryError("duplicate AskUserQuestion tool_use_id")
+                    ambiguous.add(tool_id)
+                if not isinstance(tool_input, dict) or not isinstance(tool_input.get("questions"), list):
+                    ambiguous.add(tool_id)
+                    continue
                 asks[tool_id] = (index, info, tool_input["questions"])
         pairs: dict[str, _Pair] = {}
         for index, info in enumerate(records):
@@ -462,21 +478,32 @@ class HistorySource:
                 continue
             blocks = _results(info.data)
             ids = [b["tool_use_id"] for b in blocks if b["tool_use_id"] in asks and asks[b["tool_use_id"]][0] < index]
-            structured = _structured(info.data, blocks) if ids else None
-            if not ids or structured is None:
+            if (not ids or any(tool_id in ambiguous or result_counts[tool_id] != 1 for tool_id in ids)
+                    or info.data.get("is_error") or any(b.get("is_error") for b in blocks)):
                 continue
-            if not isinstance(structured, dict) or not {"questions", "answers", "annotations"} <= structured.keys() or not isinstance(structured["questions"], list):
-                raise HistoryError("AskUserQuestion result has no complete toolUseResult object")
-            declared = structured.get("tool_use_id", structured.get("toolUseId"))
-            if declared is not None:
-                if not isinstance(declared, str) or declared not in ids:
-                    raise HistoryError("toolUseResult does not match its tool_result id")
-                ids = [declared]
-            if len(set(ids)) != 1:
-                raise HistoryError("toolUseResult does not identify exactly one AskUserQuestion")
-            _, ask, questions = asks[ids[0]]
-            if _json(questions) == _json(structured["questions"]):
-                pairs[info.message_id] = _Pair(ask, _selections(structured["questions"], structured["answers"]))
+            # 问答配对只提升可核验的回答，不决定整份原生历史是否可读。
+            # 拒绝、缺字段或歧义保留为 tool_result，不能补造回答或授权。
+            try:
+                structured = _structured(info.data, blocks)
+                if not isinstance(structured, dict) or not {"questions", "answers", "annotations"} <= structured.keys() or not isinstance(structured["questions"], list):
+                    continue
+                declared = structured.get("tool_use_id", structured.get("toolUseId"))
+                if declared is not None:
+                    if not isinstance(declared, str) or declared not in ids:
+                        continue
+                    ids = [declared]
+                if len(set(ids)) != 1:
+                    continue
+                _, ask, questions = asks[ids[0]]
+                if _json(questions) != _json(structured["questions"]):
+                    continue
+                selections = _selections(questions, structured["answers"])
+            except HistoryError:
+                continue
+            if selections:
+                answered = {label for label, _ in selections}
+                unanswered = tuple(q["question"] for q in questions if q["question"] not in answered)
+                pairs[info.message_id] = _Pair(ask, selections, unanswered)
         return pairs
 
     @staticmethod
@@ -531,7 +558,10 @@ class HistorySource:
 
     def _text(self, info: _Record, kind: str, pairs: Mapping[str, _Pair], secrets: Any) -> str:
         if kind == "verified_user_answer":
-            text = "\n\n".join(f"Question: {question}\nAnswer: {answer}" for question, answer in pairs[info.message_id].selections)
+            pair = pairs[info.message_id]
+            text = "\n\n".join(f"Question: {question}\nAnswer: {answer}" for question, answer in pair.selections)
+            if pair.unanswered:
+                text += "\n\nUnanswered questions (no answer or authorization recorded):\n" + "\n".join(pair.unanswered)
         elif kind == "original_user" and info.data.get("type") == "attachment":
             text = _queued_user_text(info.data)
         elif kind == "meta" and (_peer_message_envelope(info.data) is not None or _task_notice(info.data) is not None):
@@ -843,7 +873,7 @@ class HistorySource:
         if canonical["source_kind"] != "verified_user_answer":
             raise HistoryError("locator is not a verified AskUserQuestion answer")
         pair = pairs[info.message_id]
-        text = redact("\n\n".join(f"Question: {question}\nAnswer: {answer}" for question, answer in pair.selections), secrets)
+        text = self._text(info, canonical["source_kind"], pairs, secrets)
         return {"locator": canonical, "text": text, "pairing_locator": self._locator(pair.ask, "assistant")}
 
     def tool_result(self, tool_use_id: str) -> dict[str, Any]:

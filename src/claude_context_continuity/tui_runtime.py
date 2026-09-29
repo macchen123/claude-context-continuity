@@ -13,7 +13,7 @@ import time
 from uuid import uuid4
 
 from . import core, native_control, __version__
-from .context_runtime import (ContextRuntime, ContextRuntimeError, _safe_note, _source, _uuid,
+from .context_runtime import (ContextRuntime, ContextRuntimeError, NativeHistoryPending, _safe_note, _source, _uuid,
                               context_prompt, _runtime_message, _event_context_window)
 from .history import HistoryError, HistorySource, redact
 
@@ -577,7 +577,7 @@ class TuiRuntime(ContextRuntime):
                 state = self._state()
                 if event.get("session_id") == state["session_id"]:
                     if name == "PostToolUse":
-                        result = self._observe_output(state, event, result)
+                        result = self._bound_output(event, result)
                     elif name == "PostToolBatch":
                         result = self._finish_batch(state, event, result)
                 if name == "Stop" and event.get("session_id") == state["session_id"] and state.get("source_path"):
@@ -603,58 +603,23 @@ class TuiRuntime(ContextRuntime):
             return result
         return self._session_start(event)
 
-    @staticmethod
-    def _output_accounting(state):
-        usage = state.get("usage")
-        if not usage:
-            return None
-        sample = core.digest([state["session_id"], usage["request_id"]])
-        accounting = state.get("output_budget")
-        if not accounting or accounting["sample"] != sample:
-            accounting = {"sample": sample, "items": {}, "total_text_bytes": 0,
-                          "basis": "native_input_and_output_tokens_plus_pending_utf8_json_bytes"}
-            state["output_budget"] = accounting
-        return accounting
-
-    def _observe_output(self, state, event, result, *, can_replace=True):
+    def _bound_output(self, event, result):
+        """Bound supported text for delivery, independently of native token accounting."""
         from .result_budget import bound_result
-        accounting = self._output_accounting(state)
-        tool_id = event.get("tool_use_id")
-        if accounting is None or not isinstance(tool_id, str) or tool_id in accounting["items"]:
+        name, response = event.get("tool_name"), event.get("tool_response")
+        if name not in {"Bash", "Read", "Agent"} or response is None:
             return result
-        response, name = event.get("tool_response"), event.get("tool_name")
-        blocks = response if isinstance(response, list) else response.get("content", []) if isinstance(response, dict) else []
-        rich = (isinstance(response, dict) and (
-            name == "Read" and response.get("type") != "text" or response.get("isImage") is True))
-        rich = rich or isinstance(blocks, list) and any(isinstance(block, dict)
-            and block.get("type") in {"image", "image_url", "audio", "resource"} for block in blocks)
-        if rich or response is None:
-            # 多模态 payload 交由原生计量，不把 base64 字节冒充文本 token。
-            accounting["items"][tool_id] = {"text_bytes": 0, "native_rich_or_unmeasured": True, "defer": False}
+        bounded = bound_result(name, response, directory=self.directory, byte_limit=16_000)
+        if not bounded["replaced"]:
             return result
-        raw_bytes = len(json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
-        usage = state["usage"]
-        room = (usage["remaining_context_tokens"] - usage.get("output_tokens", 0)
-                - accounting["total_text_bytes"] - state["budget"]["guard_tokens"])
-        limit = min(16_000, max(1, room))
-        model_bytes, defer = raw_bytes, raw_bytes > max(0, room)
-        if can_replace and raw_bytes > limit:
-            bounded = bound_result(name, response, directory=self.directory, byte_limit=limit)
-            model_bytes = bounded["model_bytes"] if bounded["model_bytes"] is not None else raw_bytes
-            defer = bounded["defer_required"] and raw_bytes > max(0, room)
-            if bounded["replaced"]:
-                result = dict(result)
-                specific = dict(result.get("hookSpecificOutput", {}))
-                specific.update(hookEventName="PostToolUse", updatedToolOutput=bounded["response"])
-                reference = bounded["reference"]
-                notice = (f"本次工具输出已限长，完整脱敏结果：{reference['path']}，SHA256={reference['sha256']}。"
-                          "需要细节时有界读取，不为恢复输出重跑已完成工具。")
-                specific["additionalContext"] = "\n".join(filter(None, (specific.get("additionalContext"), notice)))
-                result["hookSpecificOutput"] = specific
-        context = result.get("hookSpecificOutput", {}).get("additionalContext", "")
-        model_bytes += len(context.encode("utf-8"))
-        accounting["items"][tool_id] = {"text_bytes": model_bytes, "raw_bytes": raw_bytes, "defer": defer}
-        accounting["total_text_bytes"] += model_bytes
+        result = dict(result)
+        specific = dict(result.get("hookSpecificOutput", {}))
+        specific.update(hookEventName="PostToolUse", updatedToolOutput=bounded["response"])
+        reference = bounded["reference"]
+        notice = (f"本次工具输出已限长，完整脱敏结果：{reference['path']}，SHA256={reference['sha256']}。"
+                  "需要细节时有界读取，不为恢复输出重跑已完成工具。")
+        specific["additionalContext"] = "\n".join(filter(None, (specific.get("additionalContext"), notice)))
+        result["hookSpecificOutput"] = specific
         return result
 
     @staticmethod
@@ -678,27 +643,10 @@ class TuiRuntime(ContextRuntime):
     def _finish_batch(self, state, event, result):
         context = result.get("hookSpecificOutput", {}).get("additionalContext", "")
         usage = state.get("usage")
-        if not isinstance(usage, dict):
-            return result
-        if self._waiting(state) and not context:
-            return result  # 当前来源未给出新的可信观察，不能用旧状态编造预算事实。
-        budget = state.get("budget", {})
-        if (type(usage.get("total_input_and_cache_tokens")) is not int
-                or type(usage.get("native_context_window")) is not int
-                or type(budget.get("guard_tokens")) is not int):
-            return result
-        for call in event["tool_calls"]:
-            self._observe_output(state, call, {}, can_replace=False)
-        accounting = self._output_accounting(state)
-        projected = (usage["total_input_and_cache_tokens"] + usage.get("output_tokens", 0)
-                     + accounting["total_text_bytes"] + len(context.encode("utf-8")))
-        over_budget = (projected >= usage["native_context_window"] - budget["guard_tokens"]
-                       or any(item["defer"] for item in accounting["items"].values()))
-        if over_budget:
-            state["budget_handoff_signal"] = {"generation": state["window_generation"],
-                "reason": "pending_tool_output_budget", "projected_text_budget": projected}
+        if not isinstance(usage, dict) or not context:
+            return result  # 当前 hook 没有可信用量，不使用旧估算触发换窗。
         if self._waiting(state):
-            return self._waiting_budget_stop(result) if over_budget else result
+            return self._waiting_budget_stop(result) if state.get("budget_handoff_signal") else result
         self._automatic_rotation(state)
         if state["rotation"]["request"]:
             state["tool_batch_boundary"] = {"session_id": state["session_id"],
@@ -711,26 +659,12 @@ class TuiRuntime(ContextRuntime):
         return result
 
     def _hold_input_while_waiting(self, state, event, prompt, result):
-        """Keep the existing receipt-only budget hold active during reconciliation."""
+        """Hold only when the latest verified native usage is near capacity."""
         try:
             observed = self._usage(state, False)
         except (OSError, TypeError, ValueError, KeyError, ContextRuntimeError):
             observed = None
-        if observed is None:
-            return result
-        usage, _ = observed
-        accounting = self._output_accounting(state)
-        budget = state.get("budget", {})
-        if not (isinstance(accounting, dict)
-                and type(usage.get("total_input_and_cache_tokens")) is int
-                and type(usage.get("native_context_window")) is int
-                and type(budget.get("guard_tokens")) is int):
-            return result
-        projected = (usage["total_input_and_cache_tokens"] + usage.get("output_tokens", 0)
-                     + accounting["total_text_bytes"] + len(prompt.encode("utf-8")))
-        over_budget = (projected >= usage["native_context_window"] - budget["guard_tokens"]
-                       or any(item["defer"] for item in accounting["items"].values()))
-        if over_budget:
+        if observed is not None and observed[1]["near_limit"]:
             self._defer_submitted_input(state, event, prompt)
             return self._waiting_budget_stop(result)
         return result
@@ -749,6 +683,7 @@ class TuiRuntime(ContextRuntime):
                 result = self._hook_output(state, name)
                 self._save(state)
                 return result
+            initial_history_pending = False
             try:
                 self._bind(state, event)
                 self._verify_config(state)
@@ -759,6 +694,12 @@ class TuiRuntime(ContextRuntime):
                         and not state.get("pending_session_start") and not state.get("native_session_uncertain")
                         and state.get("authorization")):
                     self._clear_wait(state)
+            except NativeHistoryPending as exc:
+                self._wait(state, "prompt_history_prefix_pending")
+                state["diagnostic"] = str(exc)
+                # 首条输入 hook 可能先于原生日志建文件；无既有用量时不是身份错误。
+                initial_history_pending = (state.get("usage") is None and state["window_generation"] == 0
+                                           and not state.get("pending_session_start"))
             except (OSError, TypeError, ValueError, HistoryError, core.ContinuityError, ContextRuntimeError) as exc:
                 self._wait(state, "prompt_history_prefix_pending")
                 state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
@@ -776,7 +717,7 @@ class TuiRuntime(ContextRuntime):
             state.pop("tool_batch_boundary", None)
             state["at_turn_boundary"] = False
             state["turn_generation"] = state.get("turn_generation", 0) + 1
-            result = self._hook_output(state, name)
+            result = {} if initial_history_pending else self._hook_output(state, name)
             if not own_input and isinstance(prompt, str) and prompt.strip() != "/clear":
                 switching = bool(state["rotation"]["request"] or state["rotation"]["clear"]) or state["phase"] in {
                     "clear_sent", "awaiting_tui_prompt", "continuation_dispatching"}
