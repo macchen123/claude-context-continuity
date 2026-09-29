@@ -166,6 +166,32 @@ class HistoryIndexTests(unittest.TestCase):
             with self.assertRaises(HistoryIndexStaleError):
                 index.search(sources, "needle", limit=1, cursor=page["next_cursor"])
 
+    def test_resumed_native_source_is_searched_once_with_latest_selected_generation(self) -> None:
+        first, path, sid = self.source(1, self.record("", "before", "user", "before resume"))
+        resumed = {**first, "generation": 43}
+        self.append(path, self.record(sid, "after", "user", "after resume"))
+        sources = [resumed, first]
+        with HistoryIndex(self.work / "resumed.sqlite") as index:
+            all_windows = index.search(sources, "resume", source_kinds=("original_user",))
+            self.assertEqual(self.ids(all_windows), ["before", "after"])
+            self.assertEqual([entry["generation"] for entry in all_windows["entries"]], [43, 43])
+            self.assertEqual(all_windows["refresh"]["parsed_sources"], 1)
+            self.assertEqual(self.ids(index.search(sources, "resume", windows=(1,))), ["before", "after"])
+            self.assertEqual(self.ids(index.search(sources, "resume", windows=(43,))), ["before", "after"])
+            both = index.search(sources, "resume", windows=(1, 43), limit=1)
+            self.assertEqual(self.ids(both), ["before"])
+            self.assertEqual(self.ids(index.search(sources, "resume", windows=(1, 43), limit=1,
+                                                   cursor=both["next_cursor"])), ["after"])
+            with self.assertRaises(HistoryIndexError):
+                index.search([first, first], None)
+            with self.assertRaises(HistoryIndexError):
+                index.search([first, resumed, first], None)
+            alias = self.work / "alias"
+            alias.mkdir()
+            (alias / path.name).symlink_to(path)
+            with self.assertRaises(HistoryIndexError):
+                index.search([first, {**resumed, "source_path": str(alias / path.name)}], None)
+
     def test_literal_search_matches_canonical_projection_for_unicode_and_punctuation(self) -> None:
         first, first_path, first_id = self.source(
             0,
@@ -385,6 +411,31 @@ class HistoryIndexTests(unittest.TestCase):
         self.assertEqual(self.ids(refreshed), ["peer"])
         self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
         self.assertEqual(refreshed["refresh"]["unchanged_sources"], 0)
+
+    def test_question_policy_rebuilds_cached_answer_authority(self) -> None:
+        self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 3)
+        questions = [{"question": "Publish?"}]
+        ask = self.record("", "ask", "assistant", [{"type": "tool_use", "name": "AskUserQuestion",
+            "id": "ask-1", "input": {"questions": questions}}])
+        result = self.record("", "answer", "user", [{"type": "tool_result", "tool_use_id": "ask-1",
+            "is_error": True, "content": "Rejected; do not publish."}], toolUseResult={
+            "questions": questions, "answers": {"Publish?": "Yes"}, "annotations": {}})
+        spec, path, sid = self.source(0, ask, result)
+        previous = HistorySource(path, sid).index_projection()
+        previous["entries"][0]["source_kind"] = "verified_user_answer"
+        previous["entries"][0]["locator"]["source_kind"] = "verified_user_answer"
+        previous["entries"][0]["text"] = "Question: Publish?\nAnswer: Yes"
+        previous["entries"][0]["total_chars"] = len(previous["entries"][0]["text"])
+        cache = self.work / "question-policy.sqlite"
+        with patch.object(history_index, "_REDACTION_POLICY_VERSION", 2), \
+                patch.object(HistorySource, "index_projection", return_value=previous):
+            with HistoryIndex(cache) as index:
+                self.assertEqual(self.ids(index.search([spec], None, source_kinds=("verified_user_answer",))), ["answer"])
+        with HistoryIndex(cache) as index:
+            refreshed = index.search([spec], None, source_kinds=("verified_user_answer",))
+            self.assertEqual(self.ids(refreshed), [])
+            self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
+            self.assertEqual(self.ids(index.search([spec], "Rejected", source_kinds=("tool_result",))), ["answer"])
 
     def test_parser_and_cache_failures_do_not_become_empty_results(self) -> None:
         spec, path, _ = self.source(0, self.record("", "valid", "user", "valid marker"))

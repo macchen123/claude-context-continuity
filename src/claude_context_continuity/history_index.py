@@ -51,7 +51,7 @@ MAX_CURSOR_BYTES = 4 * 1024
 
 # A private namespace marker for a reconstructible cache, not task-state data.
 _APPLICATION_ID = 0x43434958
-_REDACTION_POLICY_VERSION = 2  # Rebuild public projections that omitted native notifications.
+_REDACTION_POLICY_VERSION = 3  # Rebuild question-answer authority and partial-answer text.
 _CURSOR_VERSION = 1
 _MAX_SQLITE_INT = (1 << 63) - 1
 _SOURCE_KINDS = frozenset({
@@ -440,19 +440,27 @@ class HistoryIndex:
 
     @classmethod
     def _bound_sources(cls, specs: tuple[_SourceSpec, ...]) -> tuple[_BoundSource, ...]:
-        bound: list[_BoundSource] = []
-        seen: set[tuple[str, str]] = set()
+        bound: dict[tuple[str, str], _BoundSource] = {}
+        seen_generations: dict[tuple[str, str], set[int]] = {}
         for spec in specs:
             try:
                 source = HistorySource(Path(spec.source_path), spec.session_id)
             except (HistoryError, OSError, TypeError, ValueError) as exc:
                 raise HistoryIndexParserError("an explicit history source is unavailable or invalid") from exc
             item = _BoundSource(spec, source)
-            if item.key in seen:
-                raise HistoryIndexError("two source bindings resolve to the same session history")
-            seen.add(item.key)
-            bound.append(item)
-        return tuple(sorted(bound, key=lambda item: (item.generation, item.key[0], item.key[1])))
+            previous = bound.get(item.key)
+            if previous is not None:
+                # A native /resume can return to an earlier session in a later
+                # generation. Its single append-only history is indexed once,
+                # under the newest selected generation. Never merge path aliases
+                # or duplicate generation claims into that verified binding.
+                if (spec.source_path != item.key[0] or previous.spec.source_path != spec.source_path
+                        or spec.generation in seen_generations[item.key]):
+                    raise HistoryIndexError("two source bindings resolve to the same session history")
+            seen_generations.setdefault(item.key, set()).add(spec.generation)
+            if previous is None or spec.generation > previous.generation:
+                bound[item.key] = item
+        return tuple(sorted(bound.values(), key=lambda item: (item.generation, item.key[0], item.key[1])))
 
     @staticmethod
     def _signature(path: Path) -> _Signature:

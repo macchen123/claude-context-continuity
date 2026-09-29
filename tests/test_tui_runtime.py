@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from claude_context_continuity import continuity, core, native_control, tmux_transport, tui_runtime
 from claude_context_continuity.history import HistorySource
+from claude_context_continuity.notes import NotesStore
 from claude_context_continuity.tui_runtime import TuiRuntime
 
 
@@ -118,10 +119,11 @@ class TuiRuntimeTests(unittest.TestCase):
             for record in records:
                 handle.write(json.dumps(record) + "\n")
 
-    def resume_runtime(self):
+    def resume_runtime(self, *, history_present=True):
         sid = str(uuid4())
         source = self.root / f"{sid}.jsonl"
-        source.write_text("")
+        if history_present:
+            source.write_text("")
         runtime = TuiRuntime.create(cwd=self.cwd, session_id=sid, configuration=self.config,
                                     configuration_reader=lambda _: self.config)
         runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid,
@@ -613,6 +615,77 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(outcome["native_clear_confirmations"], 1)
         self.assertEqual(outcome["authorization"]["root_instruction_locator"]["session_id"], self.sid)
 
+    def test_automatic_rotation_details_capture_observed_budget_before_clear(self):
+        self.usage(800)
+        self.runtime.on_hook(self.hook("Stop", contextWindow=900))
+        before = self.runtime._state()
+        self.assertEqual(before["usage"]["native_context_window"], 900)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        queued = self.runtime._state()
+        generation = queued["rotation"]["generation"]
+        details = NotesStore(self.runtime.directory).read(f"details-{generation}")["text"]
+        snapshot = json.loads(details)
+        self.assertEqual(queued["rotation"]["request"]["notes"], details)
+        self.assertIsNone(queued["budget_handoff_signal"])
+        self.assertEqual(snapshot, {
+            "generation": before["window_generation"], "signal_generation": before["window_generation"],
+            "trigger": "usage_near_limit", "effective_window_tokens": 900,
+            "window_source": "native_observed_and_configured_min",
+            "input_and_cache_tokens": before["usage"]["total_input_and_cache_tokens"],
+            "output_tokens": before["usage"]["output_tokens"],
+            "total_context_tokens": before["usage"]["total_context_tokens"],
+            "remaining_context_tokens": before["usage"]["remaining_context_tokens"],
+            "guard_tokens": before["budget"]["guard_tokens"],
+        })
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": str(uuid4()),
+                              "cwd": str(self.cwd), "source": "clear"})
+        self.assertIsNone(self.runtime._state()["usage"])
+        self.assertEqual(NotesStore(self.runtime.directory).read(f"details-{generation}")["text"], details)
+
+    def test_batch_rotation_uses_native_output_tokens_not_result_bytes(self):
+        response = {"stdout": "x" * 900}
+        calls = [{"tool_use_id": "large-output", "tool_name": "Bash", "tool_response": response}]
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=calls))
+        self.assertNotIn("continue", result)
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 0)
+        request, results = self.batch_records(["large-output"], value=700)
+        request["message"]["usage"]["output_tokens"] = 60
+        self.append_records(request, *results)
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=calls))
+        self.assertFalse(result["continue"])
+        queued = self.runtime._state()
+        self.assertEqual(queued["usage"]["remaining_context_tokens"], 240)
+        details = NotesStore(self.runtime.directory).read("details-1")["text"]
+        snapshot = json.loads(details)
+        self.assertEqual(queued["rotation"]["request"]["notes"], details)
+        self.assertEqual(snapshot["trigger"], "usage_near_limit")
+        self.assertEqual(snapshot["total_context_tokens"], 760)
+        self.assertEqual(snapshot["remaining_context_tokens"], 240)
+        self.assertNotIn("pending_text_bytes", snapshot)
+        self.assertNotIn("projected_text_budget", snapshot)
+        self.assertNotIn("x" * 900, details)
+
+    def test_automatic_rotation_details_distinguish_deferred_input_without_budget(self):
+        # A submitted input can require another window without a budget signal.
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state.setdefault("turn_generation", 0)  # Mimic the native input phase before deferral.
+            self.runtime._defer_submitted_input(state, self.hook("UserPromptSubmit"), "later input")
+            self.assertIsNone(state["budget_handoff_signal"])
+            self.runtime._automatic_rotation(state)
+            self.runtime._save(state)
+        deferred = self.runtime._state()
+        details = NotesStore(self.runtime.directory).read("details-1")["text"]
+        snapshot = json.loads(details)
+        self.assertEqual(deferred["rotation"]["request"]["notes"], details)
+        self.assertEqual(snapshot["trigger"], "deferred_input")
+        self.assertEqual(snapshot["window_source"], "configured_estimate")
+        self.assertEqual(set(snapshot), {"generation", "trigger", "effective_window_tokens",
+            "window_source", "input_and_cache_tokens", "output_tokens", "guard_tokens",
+            "total_context_tokens", "remaining_context_tokens"})
+        self.assertNotIn("projected_text_budget", snapshot)
+        self.assertNotIn("later input", details)
+
     def test_manual_request_uses_same_rotation_below_budget_and_is_idempotent(self):
         from claude_context_continuity.continuity import dispatch, parser
         args = parser().parse_args(["context-request", "--context-id", self.runtime.conversation_id,
@@ -799,7 +872,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self._observe_window_usage(515_908, 600_000, reset_budget=True)
         self._observe_window_usage(575_640, 600_000)
         self.assertEqual(self.runtime._state()["usage"]["total_input_and_cache_tokens"], 575_640)
-        self.assertEqual(self.runtime._state()["budget"]["guard_tokens"], 141_268)
+        self.assertEqual(self.runtime._state()["budget"]["guard_tokens"], 81_536)
         old_sid = str(uuid4())
         old_source = self.root / f"{old_sid}.jsonl"
         old_source.write_text("")
@@ -854,67 +927,66 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_paused_input_counts_pending_output_and_utf8_bytes(self):
+    def test_paused_input_does_not_treat_pending_bytes_as_tokens(self):
         self._observe_window_usage(500, 1_000, reset_budget=True)
         self.wait_for_unknown_continuation()
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
-            accounting = self.runtime._output_accounting(state)
-            accounting["items"]["pending-output"] = {"text_bytes": 240, "raw_bytes": 240, "defer": False}
-            accounting["total_text_bytes"] = 240
+            state["output_budget"] = {"items": {"pending": {"text_bytes": 999999, "defer": True}},
+                                      "total_text_bytes": 999999}
             self.runtime._save(state)
-        prompt = "界界界界"
-        after_byte = self.source.stat().st_size
-        blocked = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=prompt))
-        self.assertFalse(blocked["continue"])
-        self.assertIn("正在等待原生确认", blocked["stopReason"])
+        result = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="界界界界"))
+        self.assertNotIn("continue", result)
         state = self.runtime._state()
+        self.assertNotIn("output_budget", state)
+        self.assertEqual(state.get("deferred_inputs", []), [])
         self.assert_waiting(state, "awaiting_continuation")
-        self.assertEqual(state["output_budget"]["total_text_bytes"], 240)
-        self.assertEqual(state["deferred_inputs"], [{
-            "session_id": self.sid, "source_path": str(self.source),
-            "prompt_hash": core.digest(prompt), "after_byte": after_byte,
-            "turn_generation": state["turn_generation"],
-        }])
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_paused_batch_blocks_projected_pending_output_without_rotation(self):
-        self._observe_window_usage(500, 1_000, reset_budget=True)
+    def test_paused_input_does_not_recount_consumed_results(self):
+        self.config = {"hash": "multi-request", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "10000"}}
+        request, results = self.batch_records(["consumed"], value=500)
+        results[0]["message"]["content"][0]["content"] = "x" * 5000
+        self.append_records(request, *results)
+        self.usage(2000)
+        self.runtime.on_hook(self.hook("Stop"))
+        self.wait_for_unknown_continuation()
+        result = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="continue this task"))
+        self.assertNotIn("continue", result)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 8000)
+        self.assertEqual(self.runtime._state().get("deferred_inputs", []), [])
+        self.assert_waiting(self.runtime._state(), "awaiting_continuation")
+        self.clear_mock.assert_not_called()
+
+    def test_paused_batch_blocks_native_near_limit_without_new_rotation(self):
+        self._observe_window_usage(800, 1_000, reset_budget=True)
         self.wait_for_unknown_continuation()
         before_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
-        response = {"stdout": "x" * 300}
         batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{
-            "tool_use_id": "pending-output", "tool_name": "Bash", "tool_input": {}, "tool_response": response,
+            "tool_use_id": "pending-output", "tool_name": "Bash", "tool_response": {"stdout": "ok"},
         }]))
         self.assertFalse(batch["continue"])
         self.assertIn("正在等待原生确认", batch["stopReason"])
-        self.assertIn("保留上下文", batch["stopReason"])
-        state = self.runtime._state()
-        self.assert_waiting(state, "awaiting_continuation")
-        self.assertEqual(state["rotation"], before_rotation)
-        item = state["output_budget"]["items"]["pending-output"]
-        self.assertGreater(item["text_bytes"], 250)
-        self.assertTrue(item["defer"])
+        self.assert_waiting(self.runtime._state(), "awaiting_continuation")
+        self.assertEqual(self.runtime._state()["rotation"], before_rotation)
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_paused_batch_stops_for_a_defer_marked_result_even_when_projection_fits(self):
+    def test_paused_batch_ignores_old_byte_based_defer_flags(self):
         self._observe_window_usage(500, 1_000, reset_budget=True)
         self.wait_for_unknown_continuation()
         before_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
-            accounting = self.runtime._output_accounting(state)
-            accounting["items"]["deferred-output"] = {"text_bytes": 0, "raw_bytes": 999, "defer": True}
+            state["output_budget"] = {"items": {"deferred-output": {"defer": True}}, "total_text_bytes": 999999}
             self.runtime._save(state)
         batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
-        self.assertFalse(batch["continue"])
-        self.assertIn("正在等待原生确认", batch["stopReason"])
+        self.assertNotIn("continue", batch)
         state = self.runtime._state()
         self.assert_waiting(state, "awaiting_continuation")
         self.assertEqual(state["rotation"], before_rotation)
-        self.assertTrue(state["output_budget"]["items"]["deferred-output"]["defer"])
+        self.assertNotIn("output_budget", state)
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
@@ -1001,6 +1073,31 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.advance()
         packet = json.loads(self.send_mock.call_args.args[2].split("\n", 1)[1].split("\n", 1)[1])
         self.assertEqual(packet["active_background_agents"], ["still-running"])
+
+    def test_question_outcomes_do_not_gate_budget_triggered_rotation(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected):
+                self.clear_mock.reset_mock()
+                runtime, sid, source = self.resume_runtime()
+                questions = [{"question": "Which mode?"}, {"question": "Publish?"}]
+                request, results = self.batch_records(["ask-budget"], value=820)
+                call = request["message"]["content"][0]
+                call.update(name="AskUserQuestion", input={"questions": questions})
+                request["sessionId"] = results[0]["sessionId"] = sid
+                results[0]["message"]["content"][0]["is_error"] = rejected
+                results[0]["toolUseResult"] = "User requested clarification." if rejected else {
+                    "questions": questions, "answers": {"Which mode?": "Safe"}, "annotations": {}}
+                root = {"type": "user", "uuid": "root-budget", "sessionId": sid,
+                        "message": {"role": "user", "content": "Continue locally; do not publish."}}
+                source.write_text("".join(json.dumps(row) + "\n" for row in (root, request, *results)))
+                response = runtime.on_hook(self.hook("PostToolBatch", session_id=sid, transcript_path=str(source),
+                    tool_calls=[{"tool_use_id": "ask-budget", "tool_name": "AskUserQuestion"}]))
+                self.assertFalse(response["continue"])
+                self.assertIsNone(runtime._state().get("reconciliation"))
+                locator = runtime._state()["authorization"]["latest_instruction_locator"]
+                self.assertEqual(locator["source_kind"], "original_user" if rejected else "verified_user_answer")
+                self.assertEqual(runtime.advance()["phase"], "clear_sent")
+                self.clear_mock.assert_called_once()
 
     def test_batch_rotates_after_late_transcript_flush_without_another_prompt(self):
         self.usage(800)
@@ -1130,35 +1227,128 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assert_waiting(self.runtime.advance(), "rotation_requested")
         self.clear_mock.assert_not_called()
 
-    def test_batch_accounts_multiple_outputs_and_bounds_native_response(self):
+    def test_text_output_bounds_do_not_drive_rotation(self):
         self.config = {"hash": "output-budget", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "100000"}}
-        with core.lock(self.runtime.lock_path):
-            state = self.runtime._state()
-            state["budget"] = {}
-            self.runtime._save(state)
         self.usage(60000)
         response = {"stdout": "x" * 8000, "stderr": "", "interrupted": False}
         first = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="out-one", tool_name="Bash",
                                                tool_response=response))
         self.assertNotIn("updatedToolOutput", first.get("hookSpecificOutput", {}))
+        large_response = {**response, "stdout": "x" * 50000}
         second = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="out-two", tool_name="Bash",
-                                                tool_response=response))
+                                                tool_response=large_response))
         replacement = second["hookSpecificOutput"]["updatedToolOutput"]
         self.assertFalse(replacement["interrupted"])
-        self.assertLess(len(replacement["stdout"]), len(response["stdout"]))
+        self.assertLess(len(replacement["stdout"]), 16000)
         self.assertTrue(list((self.runtime.directory / "outputs").glob("*.json")))
-        before = self.runtime._state()["output_budget"]["total_text_bytes"]
-        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
-            {"tool_use_id": "out-one", "tool_name": "Bash", "tool_input": {}, "tool_response": response},
-            {"tool_use_id": "out-two", "tool_name": "Bash", "tool_input": {}, "tool_response": replacement},
-        ]))
-        self.assertFalse(result["continue"])
-        self.assertEqual(self.runtime._state()["output_budget"]["total_text_bytes"], before)
-        assistant, results = self.batch_records(["out-one", "out-two"], value=60000)
+        calls = [
+            {"tool_use_id": "out-one", "tool_name": "Bash", "tool_response": response},
+            {"tool_use_id": "out-two", "tool_name": "Bash", "tool_response": replacement},
+        ]
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=calls))
+        self.assertNotIn("continue", result)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 40000)
+        self.assertNotIn("output_budget", self.runtime._state())
+        assistant, results = self.batch_records(["out-one", "out-two"], value=80000)
         for block in assistant["message"]["content"]:
             block["name"] = "Bash"
         self.append_records(assistant, *results)
+        self.assertFalse(self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=calls))["continue"])
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+
+    def test_batch_does_not_recount_tool_results_already_in_native_input(self):
+        self.config = {"hash": "multi-request", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "10000"}}
+        old_response = {"stdout": "x" * 4500, "stderr": ""}
+        old_request, old_results = self.batch_records(["already-consumed"], value=500)
+        old_results[0]["toolUseResult"] = old_response
+        old_results[0]["message"]["content"][0]["content"] = old_response["stdout"]
+        self.append_records(old_request)
+        self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="already-consumed", tool_name="Bash",
+                                       tool_response=old_response))
+        self.append_records(*old_results)
+
+        fresh_request, fresh_results = self.batch_records(["fresh"], value=2000)
+        fresh_response = {"stdout": "ok", "stderr": ""}
+        fresh_results[0]["toolUseResult"] = fresh_response
+        self.append_records(fresh_request)
+        self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="fresh", tool_name="Bash",
+                                       tool_response=fresh_response))
+        self.append_records(*fresh_results)
+
+        result = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
+            {"tool_use_id": "already-consumed", "tool_name": "Bash", "tool_response": old_response},
+            {"tool_use_id": "fresh", "tool_name": "Bash", "tool_response": fresh_response},
+        ]))
+        self.assertNotIn("continue", result)
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 0)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 8000)
+        self.clear_mock.assert_not_called()
+
+        # A later native usage observation, not a replayed byte count, triggers rotation.
+        newest_request, newest_results = self.batch_records(["new-large"], value=8000)
+        newest_response = {"stdout": "y" * 3900, "stderr": ""}
+        newest_results[0]["toolUseResult"] = newest_response
+        newest_results[0]["message"]["content"][0]["content"] = newest_response["stdout"]
+        self.append_records(newest_request, *newest_results)
+        stopped = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
+            {"tool_use_id": "already-consumed", "tool_name": "Bash", "tool_response": old_response},
+            {"tool_use_id": "fresh", "tool_name": "Bash", "tool_response": fresh_response},
+            {"tool_use_id": "new-large", "tool_name": "Bash", "tool_response": newest_response},
+        ]))
+        self.assertFalse(stopped["continue"])
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 1)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 2000)
+        self.assertNotIn("output_budget", self.runtime._state())
+
+    def _large_file_mutation_batch(self, name, visible="File updated successfully.", *, value=96933):
+        self.config = {"hash": "mutation-budget", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "600000"}}
+        with core.lock(self.runtime.lock_path):
+            state = self.runtime._state()
+            state["budget"] = {}
+            self.runtime._save(state)
+        request, results = self.batch_records(["mutation"], value=value)
+        request["message"]["content"][0]["name"] = name
+        request["message"]["usage"]["output_tokens"] = 574
+        response = {"filePath": str(self.cwd / "large.txt"), "originalFile": "old line\n" * 70000,
+                    "structuredPatch": [], "userModified": False}
+        if name == "Edit":
+            response.update(oldString="old line", newString="new line", replaceAll=False)
+        else:
+            response.update(type="update", content="new line\n" * 70000)
+        self.append_records(request)
+        post = self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="mutation", tool_name=name,
+                                              tool_response=response))
+        self.assertNotIn("updatedToolOutput", post.get("hookSpecificOutput", {}))
+        results[0]["message"]["content"][0]["content"] = visible
+        self.append_records(*results)
+        return self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[{
+            "tool_use_id": "mutation", "tool_name": name, "tool_response": response}]))
+
+    def test_large_edit_metadata_is_not_model_input(self):
+        batch = self._large_file_mutation_batch("Edit")
+        self.assertNotIn("continue", batch)
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 0)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 502493)
+        self.clear_mock.assert_not_called()
+
+    def test_large_write_metadata_is_not_model_input(self):
+        batch = self._large_file_mutation_batch("Write")
+        self.assertNotIn("continue", batch)
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 0)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 502493)
+        self.clear_mock.assert_not_called()
+
+    def test_near_limit_native_usage_still_rotates_after_mutation(self):
+        batch = self._large_file_mutation_batch("Edit", value=550000)
+        self.assertFalse(batch["continue"])
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 1)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 49426)
+
+    def test_large_rendered_text_bytes_are_not_native_tokens(self):
+        batch = self._large_file_mutation_batch("Edit", "visible changed content\n" * 30000)
+        self.assertNotIn("continue", batch)
+        self.assertEqual(self.runtime.receipt()["automatic_rotations"], 0)
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 502493)
 
     def test_native_image_bytes_do_not_force_repeated_fresh_window_resets(self):
         response = {"type": "image", "file": {"base64": "A" * 200000, "type": "image/png"}}
@@ -1168,7 +1358,8 @@ class TuiRuntimeTests(unittest.TestCase):
         batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[
             {"tool_use_id": "figure", "tool_name": "Read", "tool_input": {}, "tool_response": response}]))
         self.assertNotIn("continue", batch)
-        self.assertTrue(self.runtime._state()["output_budget"]["items"]["figure"]["native_rich_or_unmeasured"])
+        self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 875)
+        self.assertNotIn("output_budget", self.runtime._state())
 
     def test_wrapped_peer_deferred_input_crosses_clear_with_partial_trailing_append(self):
         self.threshold()
@@ -1463,6 +1654,63 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertIsNone(state.get("reconciliation"))
         self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 125)
         self.clear_mock.assert_not_called()
+
+    def test_first_prompt_before_transcript_exists_recovers_without_identity_warning(self):
+        runtime, sid, source = self.resume_runtime(history_present=False)
+        self.assertFalse(source.exists())
+        event = self.hook("UserPromptSubmit", session_id=sid, transcript_path=str(source),
+                          prompt="Continue the authorized task.")
+        result = runtime.on_hook(event)
+        self.assertNotIn("systemMessage", result)
+        self.assertIsNot(result.get("continue"), False)
+        self.assertIsNone(runtime._state()["authorization"])
+        self.clear_mock.assert_not_called()
+        source.write_text(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+            "message": {"role": "user", "content": event["prompt"]}}) + "\n")
+        self.usage(125, source, sid)
+        runtime.on_hook(self.hook("PreToolUse", session_id=sid, transcript_path=str(source), tool_use_id="first"))
+        runtime.on_hook(self.hook("PostToolUse", session_id=sid, transcript_path=str(source), tool_use_id="first"))
+        state = runtime._state()
+        self.assertIsNone(state.get("reconciliation"))
+        self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 125)
+        self.assertEqual(state["authorization"]["root_instruction_locator"]["session_id"], sid)
+
+    def test_missing_resume_transcript_retains_identity_checks_and_recovers(self):
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                runtime, _, _ = self.resume_runtime()
+                sid = str(uuid4())
+                source = self.root / f"{sid}.jsonl"
+                event = self.hook("SessionStart", source="resume", session_id=sid, transcript_path=str(source))
+                runtime.on_hook(event)
+                state = runtime._state()
+                self.assertIn("not yet available", state["diagnostic"])
+                self.assertIsNotNone(state.get("pending_session_start"))
+                self.assertIsNone(state["authorization"])
+                cwd = self.cwd
+                if foreign:
+                    cwd = self.root / "foreign-late-transcript"
+                    cwd.mkdir()
+                source.write_text(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                    "message": {"role": "user", "content": "Keep the existing scope."}}) + "\n")
+                self.usage(125, source, sid, cwd)
+                state = runtime._state()
+                self.assertEqual(runtime._reconcile_pending_session_start(state), not foreign)
+                self.assertEqual(state.get("pending_session_start") is None, not foreign)
+                self.assertEqual(state.get("authorization") is None, foreign)
+                self.clear_mock.assert_not_called()
+                self.send_mock.assert_not_called()
+
+    def test_missing_transcript_is_distinct_from_mismatched_identity(self):
+        missing = self.root / f"{uuid4()}.jsonl"
+        with self.assertRaisesRegex(tui_runtime.ContextRuntimeError, "not this native session history"):
+            tui_runtime._source(str(missing), self.sid)
+        with self.assertRaisesRegex(tui_runtime.ContextRuntimeError, "not yet available"):
+            tui_runtime._source(str(missing), missing.stem)
+        alias = self.root / "history-alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(tui_runtime.ContextRuntimeError, "symlink"):
+            tui_runtime._source(str(alias / self.source.name), self.sid)
 
     def test_lifecycle_delayed_foreign_resume_retains_workspace_check(self):
         foreign_cwd = self.root / "foreign-workspace"

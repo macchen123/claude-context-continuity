@@ -12,37 +12,40 @@ from claude_context_continuity.context_runtime import ContextRuntimeError, obser
 
 
 class ObserveBudgetTests(unittest.TestCase):
-    def test_tracks_actual_input_cache_and_largest_positive_growth(self) -> None:
-        bootstrap = observe_budget(
-            None,
-            {"total_input_tokens": 125, "cache_fields_complete": True},
-            {"tokens": 1000, "actual": True},
-            1,
-        )
-        self.assertEqual(bootstrap["observations"]["bootstrap_input_tokens"], 125)
-        self.assertEqual(bootstrap["observations"]["max_positive_growth_tokens"], 0)
-        self.assertEqual(bootstrap["observations"]["window_is_actual"], 1)
-        self.assertEqual(bootstrap["observations"]["cache_fields_complete"], 1)
-        self.assertFalse(bootstrap["handoff_required"])
+    def test_fixed_reserve_does_not_predict_from_prior_growth(self) -> None:
+        previous = None
+        for value in (125, 325, 250, 600, 749):
+            observed = observe_budget(
+                previous, {"total_input_tokens": value, "cache_fields_complete": True},
+                {"tokens": 1000, "actual": True}, 1,
+            )
+            self.assertEqual(observed["guard_tokens"], 250)
+            self.assertEqual(observed["remaining_tokens"], 1000 - value)
+            self.assertFalse(observed["near_limit"])
+            self.assertEqual(observed["observations"]["window_is_actual"], 1)
+            self.assertEqual(observed["observations"]["cache_fields_complete"], 1)
+            previous = observed
+        self.assertTrue(observe_budget(previous, 750, 1000, 1)["near_limit"])
 
-        grown = observe_budget(
-            bootstrap,
-            {"total_input_tokens": 325, "cache_fields_complete": True},
-            {"tokens": 1000, "actual": True},
-            2,
-        )
-        self.assertEqual(grown["observations"]["max_positive_growth_tokens"], 200)
-        self.assertEqual(grown["guard_tokens"], 450)
+    def test_native_output_tokens_are_counted_once(self) -> None:
+        observed = observe_budget(
+            None, {"total_input_tokens": 700, "output_tokens": 50, "cache_fields_complete": True}, 1000, 1)
+        self.assertTrue(observed["near_limit"])
+        self.assertEqual(observed["remaining_tokens"], 250)
+        repeated = observe_budget(
+            observed, {"total_input_tokens": 700, "output_tokens": 50}, 1000, 1)
+        self.assertEqual(repeated["remaining_tokens"], 250)
+        self.assertFalse(repeated["handoff_required"])
+        consumed = observe_budget(repeated, {"total_input_tokens": 760, "output_tokens": 10}, 1000, 2)
+        self.assertEqual(consumed["remaining_tokens"], 230)
 
-        declined = observe_budget(
-            grown["observations"],
-            {"total_input_tokens": 250, "cache_fields_complete": True},
-            {"tokens": 1000, "actual": True},
-            3,
-        )
-        self.assertEqual(declined["observations"]["last_input_tokens"], 250)
-        self.assertEqual(declined["observations"]["max_positive_growth_tokens"], 200)
-        self.assertFalse(declined["handoff_required"])
+    def test_old_growth_observations_cannot_inflate_reserve(self) -> None:
+        old = {"last_input_tokens": 96933, "max_positive_growth_tokens": 500000,
+               "bootstrap_input_tokens": 125, "guard_tokens": 580000, "window_tokens": 600000}
+        observed = observe_budget(old, 198068, 600000, 1)
+        self.assertFalse(observed["near_limit"])
+        self.assertEqual(observed["guard_tokens"], 81536)
+        self.assertNotIn("max_positive_growth_tokens", observed["observations"])
 
     def test_handoff_notice_is_once_per_observed_window(self) -> None:
         first = observe_budget(None, 900, 1000, 1)

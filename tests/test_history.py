@@ -537,6 +537,89 @@ class HistorySourceTests(unittest.TestCase):
         self.assertEqual(projection["pairing_locator"]["message_id"], "ask-message")
         self.assertNotIn("TOOL PROSE", source.read(answer_locator)["text"])
 
+    def question_records(self, answers=None, *, error=False, response=None):
+        questions = [{"question": "Which mode?"}, {"question": "Publish the result?"}]
+        ask = self.record("ask", "assistant", [{
+            "type": "tool_use", "id": "ask-1", "name": "AskUserQuestion",
+            "input": {"questions": questions},
+        }])
+        result = self.record("answer", "user", [{
+            "type": "tool_result", "tool_use_id": "ask-1", "is_error": error,
+            "content": "Native question outcome; consult the original response.",
+        }], toolUseResult=response if response is not None else {
+            "questions": questions, "answers": answers, "annotations": {},
+        })
+        return ask, result
+
+    def test_partial_question_answer_preserves_only_verified_selections(self) -> None:
+        for answers in ({"Which mode?": "Safe"}, {"Which mode?": "Safe", "Publish the result?": ""}):
+            with self.subTest(answers=answers):
+                ask, result = self.question_records(answers)
+                self.write_records(self.record("root", "user", "Keep publication disabled."), ask, result)
+                source = self.source()
+                locator = source.locator("answer")
+                self.assertEqual(locator["source_kind"], "verified_user_answer")
+                projection = source.read_answer(locator)
+                self.assertIn("Question: Which mode?\nAnswer: Safe", projection["text"])
+                self.assertIn("Unanswered questions (no answer or authorization recorded):\nPublish the result?", projection["text"])
+                self.assertNotIn("Question: Publish the result?\nAnswer:", projection["text"])
+                self.assertEqual(projection["text"], source.read(locator)["text"])
+                self.assertEqual(source.instruction_bounds()["last"], locator)
+                self.assertEqual(source.activity()["pending_tools"], {})
+                self.assertEqual(source.index_projection()["entries"][-1]["source_kind"], "verified_user_answer")
+
+    def test_unverified_question_outcomes_do_not_block_history(self) -> None:
+        cases = [
+            {"error": True, "response": "User rejected the question and requested clarification."},
+            {"answers": {"Which mode?": "Safe", "Publish the result?": "Yes"}, "error": True},
+            {"answers": {}},
+            {"answers": {"Which mode?": None}},
+            {"answers": {"Different question": "Yes"}},
+            {"response": {"questions": [], "answers": {}, "annotations": {}}},
+            {"response": {"answers": {"Which mode?": "Safe"}}},
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                ask, result = self.question_records(**case)
+                self.write_records(self.record("root", "user", "Keep publication disabled."), ask, result)
+                source = self.source()
+                locator = source.locator("answer")
+                self.assertEqual(locator["source_kind"], "tool_result")
+                self.assertEqual(source.latest_instruction()["message_id"], "root")
+                self.assertIn("Native question outcome", source.read(locator)["text"])
+                self.assertEqual(source.index_projection()["entries"][-1]["source_kind"], "tool_result")
+                self.assertEqual(source.activity()["pending_tools"], {})
+                with self.assertRaises(HistoryError):
+                    source.read_answer(locator)
+
+    def test_ambiguous_question_pairings_remain_tool_results(self) -> None:
+        for ambiguity in ("call", "result", "declared_id", "envelope"):
+            with self.subTest(ambiguity=ambiguity):
+                ask, result = self.question_records({"Which mode?": "Safe", "Publish the result?": "No"})
+                rows = [self.record("root", "user", "Keep publication disabled."), ask, result]
+                if ambiguity == "call":
+                    rows.insert(2, {**ask, "uuid": "duplicate-ask"})
+                elif ambiguity == "result":
+                    rows.append({**result, "uuid": "duplicate-answer"})
+                elif ambiguity == "declared_id":
+                    result["toolUseResult"]["tool_use_id"] = "another-call"
+                else:
+                    result["message"]["content"][0]["toolUseResult"] = result["toolUseResult"]
+                self.write_records(*rows)
+                source = self.source()
+                self.assertEqual(source.locator("answer")["source_kind"], "tool_result")
+                self.assertEqual(source.latest_instruction()["message_id"], "root")
+                source.index_projection()
+
+    def test_invalid_question_arguments_do_not_block_unrelated_history(self) -> None:
+        ask, result = self.question_records({"Which mode?": "Safe"})
+        ask["message"]["content"][0]["input"]["questions"] = "invalid tool input"
+        self.write_records(self.record("root", "user", "Keep publication disabled."), ask, result)
+        source = self.source()
+        self.assertEqual(source.latest_instruction()["message_id"], "root")
+        self.assertEqual(source.locator("answer")["source_kind"], "tool_result")
+        source.index_projection()
+
     def test_projections_omit_thinking_tool_inputs_and_data_and_redact_credentials(self) -> None:
         assistant = self.record(
             "assistant-1",
