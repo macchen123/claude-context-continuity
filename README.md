@@ -61,7 +61,7 @@ You keep your existing native Claude Code setup. This tool does not rebuild codi
 
 ### 1. Requirements & Installation
 
-Prerequisites: Python 3.10+, Git, `tmux`, and native Claude Code **2.1.266 or newer**. Run `claude --version` to check your installed version.
+Prerequisites: Python 3.10+, Git, `tmux`, and native Claude Code **2.1.304 or newer**. Run `claude --version` to check your installed version. This version follows the current native contract; it does not migrate obsolete runtime states. If an old state is rejected, start a new `cclaude` session. Existing histories and notes remain on disk.
 
 ```sh
 python3 -m pip install "git+https://github.com/macchen123/claude-context-continuity.git"
@@ -135,6 +135,23 @@ Since rotating context involves session boundaries, this package includes a ligh
 
 ---
 
+<a id="agent-compat"></a>
+## Subagent Identity Across Context Windows
+
+Native Claude Code reads a subagent's `.meta.json` from the current session when resuming it. If a background agent continues across `/clear` while its identity sidecar remains in the old session, a later `SendMessage` can silently fall back to `general-purpose` and lose the original model slot.
+
+cclaude inherits native agent metadata from its catalogued sessions at `SessionStart` and revalidates it before `SendMessage`, the current native resume entry:
+
+- Native role, explicit model, permission/isolation fields, and opaque extension fields are preserved. Agent definitions, global settings, and official binaries are untouched.
+- Both running and completed agents survive multiple context rotations without being restarted or stopped by this repair.
+- Missing, conflicting, unreadable, or unsafe identity metadata blocks that resume instead of silently choosing a generic agent. Messages to `main` and identifiable non-local peers are unaffected.
+- A narrowly recognized native default-fallback record can be restored from a verified original sidecar only after the agent stops. Source hashes and the previous value are kept in the context's private `agent_metadata/` directory; other identity conflicts are not overwritten.
+- Native `stoppedByUser` markers remain effective. Native fork, model, tool, and current-permission checks still apply; preservation does not grant new authority.
+
+Inspect `agent_metadata_compat` with `claude-context tui-status --context-id "$CLAUDE_CONTINUITY_ID"`. Investigate a blocked restore rather than changing the role or repeatedly resending to bypass it.
+
+---
+
 <a id="advanced"></a>
 ## Advanced Features: History Search & Working Notes
 
@@ -200,7 +217,9 @@ No. You are still using native Claude Code. Your models, system prompts, MCP ser
 ### 5. Why is automatic switching waiting?
 The host may be waiting for a complete native history record, a tool result, or confirmation that a clear or handoff was received. It keeps checking and continues when the missing fact becomes available. A delayed confirmation does not permanently disable automatic switching, and an uncertain command is not sent again blindly.
 
-Automatic switching uses the latest native input, cache, and output token counts, with a fixed reserve before the effective context limit. File sizes and tool-result bytes are not treated as tokens. Task registration, written handoff notes, and fully answered questionnaires are not prerequisites. History preserves the answers actually supplied and marks unanswered questions. Rejected or cancelled questions are not treated as consent and do not make the whole history unreadable. A first prompt arriving just before its transcript file is created is no longer misreported as a session-identity error.
+Automatic switching uses the latest native input, cache, and output token counts. When the ceiling is only a configured estimate, it reserves 25% of that window for input added after the last sample, such as skill expansions and tool batches; a 600,000-token estimate therefore yields at 450,000 tokens. This does not verify the provider's actual capacity. File sizes and tool-result bytes are not treated as tokens. Task registration, written handoff notes, and fully answered questionnaires are not prerequisites. History preserves the answers actually supplied and marks unanswered questions. Rejected or cancelled questions are not treated as consent and do not make the whole history unreadable. A first prompt arriving just before its transcript file is created is no longer misreported as a session-identity error.
+
+A native `StopFailure` reporting `Prompt is too long` can also trigger the same safe rotation, even below the estimated threshold. The controller first verifies the exact main-session error record and settles foreground tools; background agents are not stopped or restarted. Missing or late error records remain a wait, unrelated failures never trigger a clear, and unknown control deliveries are never resent. A rejected first request without any successful native usage is reported as `context_rejection_without_native_usage` rather than resetting in a loop.
 
 History/Notes remains available. With enough verified room, work can continue; near the context limit, the next model request is held while completed results and submitted inputs remain in native history. Use `claude-context tui-status --context-id <context-id>` to see the current stage and waiting reason. An accepted request is not proof that a new window has opened.
 

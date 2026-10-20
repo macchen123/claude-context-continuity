@@ -531,7 +531,7 @@ def main(argv=None):
             switch_sent = switch_confirmed = False
             restart_target = old_controller = None
             initial_session_id = None
-            observed_pauses = set()
+            observed_waits = set()
             clear_pending_snapshots, observed_clear_sessions = [], set()
             changed_cwd_observations, observed_changed_cwd_states = [], set()
             premature_rotation = False
@@ -589,8 +589,8 @@ def main(argv=None):
                     initial_session_id = initial_session_id or state["session_id"]
                 _observe_cwd_epochs(state)
                 _observe_edit_usage(state)
-                if state["phase"] == "paused":
-                    observed_pauses.add(state.get("diagnostic") or state.get("pause_reason") or "unknown")
+                if runtime._waiting(state):
+                    observed_waits.add(state["reconciliation"]["reason"])
                 if model.failed or premature_rotation or (args.file_edit_budget and not args.near_limit
                                                             and state["rotation"]["request"]):
                     break
@@ -778,7 +778,8 @@ def main(argv=None):
                     and clear_history_confirmed and source_identity_bound and native_pending_empty
                     and len(session_ids) == args.cycles + 1
                     and len(model.read_response_ids) == args.cycles)
-            success = (model.done and model.failed is None and state["phase"] != "paused"
+            success = (model.done and model.failed is None and state["phase"] == "running"
+                       and not runtime._waiting(state)
                        and len(model.continuations) == args.cycles
                        and len(evidence["session_ids"]) >= args.cycles + 1
                        and len(evidence["batch_stop_sessions"]) >= args.cycles
@@ -787,9 +788,9 @@ def main(argv=None):
                        and tools_settled_once and resumed and controller_restored and cwd_change_verified
                        and model_switch_verified)
             report.update(status="passed" if success else "failed", native_version=state.get("native_cli_version"),
-                phase=state["phase"], waiting_reason=state.get("waiting_reason"), pause_reason=state.get("pause_reason"),
+                phase=state["phase"], reconciliation=state.get("reconciliation"),
                 diagnostic=state.get("diagnostic"), cycles_observed=len(model.continuations),
-                observed_pause_reasons=sorted(observed_pauses),
+                observed_wait_reasons=sorted(observed_waits),
                 main_request_count=len(model.requests), completed_read_requests=len(model.read_response_ids),
                 completed_tool_requests=len(model.batch_only_tool_calls),
                 native_resume_confirmations=state.get("native_resume_confirmations", 0),

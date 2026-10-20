@@ -76,15 +76,10 @@ def _context_socket_path(value: str | os.PathLike[str]) -> Path:
     except ValueError:
         _fail("tmux socket 不属于 continuity runtime")
 
-    # 标准上下文目录保留给较短 HOME 路径；macOS 下可改用 runtime/tmux/<uuid>.sock。
     parts = relative.parts
-    conversation_id: str | None = None
-    if len(parts) == 4 and parts[0] == "contexts" and parts[2] == "tui" and parts[3]:
-        conversation_id = parts[1]
-    elif len(parts) == 2 and parts[0] == "tmux" and parts[1].endswith(".sock"):
-        conversation_id = parts[1][:-len(".sock")]
-    if conversation_id is None:
-        _fail("tmux socket 必须是准确的 conversation 专用 runtime 路径")
+    if len(parts) != 2 or parts[0] != "tmux" or not parts[1].endswith(".sock"):
+        _fail("tmux socket 必须是准确的 conversation 专用 runtime/tmux/<uuid>.sock 路径")
+    conversation_id = parts[1][:-len(".sock")]
     try:
         core.uuid(conversation_id)
     except (TypeError, ValueError, core.ContinuityError):

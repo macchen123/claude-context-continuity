@@ -472,7 +472,8 @@ class AutomaticContinuityTests(unittest.TestCase):
         first_handoff = self.send_mock.call_args.args[2]
         late_human = "Cancel earlier work; inspect only the later human request."
         body = "An already-produced background result remains available."
-        late_meta = f'<agent-message from="worker">\n{body}\n</agent-message>'
+        late_meta = ('<cross-session-message from="worker" from-name="fixture-peer" from-mode="bypass">\n'
+                     f'{body}\n</cross-session-message>')
         for text, meta in ((late_human, False), (late_meta, True)):
             blocked = self.runtime.on_hook(self.hook("UserPromptSubmit", session_id=new_sid,
                 transcript_path=str(new_source), prompt=text))
@@ -481,7 +482,7 @@ class AutomaticContinuityTests(unittest.TestCase):
                    "message": {"role": "user", "content": text}}
             if meta:
                 row.update(isMeta=True, promptSource="system", origin={
-                    "kind": "peer", "from": "worker", "body": body, "senderTaskId": "worker"})
+                    "kind": "peer", "from": "worker", "name": "fixture-peer", "fromMode": "bypass", "body": body})
             self._append(new_source, row)
         self._append(new_source, {"type": "user", "uuid": str(uuid4()), "sessionId": new_sid,
             "message": {"role": "user", "content": first_handoff}})
@@ -530,19 +531,43 @@ class AutomaticContinuityTests(unittest.TestCase):
         self.clear_mock.assert_called_once()
         self.send_mock.assert_not_called()
 
-    def test_legacy_pause_migrates_without_replaying_a_pending_clear(self) -> None:
+    def test_obsolete_pause_fails_without_inference_rewrite_or_replaying_a_pending_clear(self) -> None:
         self._request_rotation()
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
             state["phase"], state["pause_reason"] = "paused", "old native acknowledgement timeout"
             state.pop("reconciliation", None)
-            self.runtime._save(state)
-        result = self.runtime.advance()
-        self.assertEqual(result["phase"], "clear_sent")
-        self.assertTrue(result["clear_pending"])
-        self.assertIsInstance(result["reconciliation"], dict)
-        self.assertTrue(self.runtime._state()["legacy_pause_migrated"])
+            core.atomic(self.runtime.state_path, state)
+        before = self.runtime.state_path.read_bytes()
+        operations = (self.runtime.advance, lambda: self.runtime.recover_observation(self.sid),
+                      lambda: self.runtime.on_hook(self.hook("Stop")),
+                      lambda: self.runtime.on_hook(self.hook("SessionStart", source="resume")))
+        with patch.object(self.runtime, "_save") as save, \
+                patch.object(tui_runtime.subprocess, "Popen") as spawn, \
+                patch.object(tmux_transport, "inspect") as inspect:
+            for operation in operations:
+                with self.assertRaisesRegex(tui_runtime.ContextRuntimeError, "phase.*unsupported"):
+                    operation()
+            save.assert_not_called()
+            spawn.assert_not_called()
+            inspect.assert_not_called()
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
         self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+
+    def test_unsupported_phase_stops_serve_without_retry_or_state_diagnostics(self) -> None:
+        state = self.runtime._state()
+        state["phase"] = "future_phase"
+        core.atomic(self.runtime.state_path, state)
+        before = self.runtime.state_path.read_bytes()
+        with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
+                patch.object(tui_runtime, "_controller_diagnostic") as diagnostic, \
+                patch.object(tui_runtime.time, "sleep", side_effect=AssertionError("must not retry unsupported state")):
+            with self.assertRaisesRegex(tui_runtime.ContextRuntimeError, "phase.*unsupported"):
+                tui_runtime.serve(self.runtime.conversation_id)
+        diagnostic.assert_not_called()
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
     def test_managed_hook_repairs_from_owned_aliases_when_native_variables_are_consumed(self) -> None:

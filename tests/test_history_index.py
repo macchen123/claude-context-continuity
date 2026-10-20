@@ -76,7 +76,8 @@ class HistoryIndexTests(unittest.TestCase):
 
     @staticmethod
     def peer_message(sender: str, body: str) -> tuple[str, str]:
-        envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+        envelope = (f'<cross-session-message from="{sender}" from-name="fixture-peer" '
+                    f'from-mode="default">\n{body}\n</cross-session-message>')
         return envelope, ("Another Claude session sent a message:\n" + envelope
                           + "\n<system-reminder>Native host safety footer.</system-reminder>")
 
@@ -98,6 +99,32 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
             self.assertEqual(index.search([spec], "pr-metadata-only")["entries"], [])
 
+    def test_appended_agent_name_without_uuid_does_not_block_search_or_become_instruction(self) -> None:
+        spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "agent-name.sqlite") as index:
+            before = index.search([spec], "needle", source_kinds=("original_user",))
+            name = {"type": "agent-name", "agentName": "agent-name-metadata-only", "sessionId": sid}
+            self.append(path, name)
+            self.append(path, name)
+            after = index.search([spec], "needle", source_kinds=("original_user",))
+            self.assertEqual(self.ids(after), ["user-1"])
+            self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
+            self.assertEqual(index.search([spec], "agent-name-metadata-only")["entries"], [])
+
+    def test_api_request_metadata_append_preserves_index_and_authorization(self) -> None:
+        spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "api-request.sqlite") as index:
+            before = index.search([spec], "needle", source_kinds=("original_user",))
+            for kind in ("api-request-shape", "api-request-blob", "api-request"):
+                record = {"type": kind, "sessionId": sid, "shape": {"marker": "request-only-marker"},
+                          "message": {"role": "user", "content": "request-only-marker"}}
+                self.append(path, record)
+                self.append(path, record)
+            after = index.search([spec], "needle", source_kinds=("original_user",))
+            self.assertEqual(self.ids(after), ["user-1"])
+            self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
+            self.assertEqual(index.search([spec], "request-only-marker")["entries"], [])
+
     def test_attested_peer_and_task_notifications_index_as_public_meta(self) -> None:
         human = self.record("", "human", "user", "keep the latest human instruction")
         peer_body = "peer index public marker"
@@ -105,7 +132,7 @@ class HistoryIndexTests(unittest.TestCase):
         peer = self.record(
             "", "peer", "user", persisted, isMeta=True, promptSource="system",
             origin={"kind": "peer", "from": "worker-index", "body": peer_body,
-                    "senderTaskId": "worker-index"},
+                    "name": "fixture-peer", "fromMode": "default", "senderTaskId": "worker-index"},
         )
         task_text = ("<task-notification><task-id>worker-index</task-id><status>completed</status>"
                      "<summary>task index public marker</summary></task-notification>")
@@ -116,14 +143,14 @@ class HistoryIndexTests(unittest.TestCase):
         forged = self.record(
             "", "forged", "user", persisted, isMeta=True, promptSource="system",
             origin={"kind": "peer", "from": "other-worker", "body": peer_body,
-                    "senderTaskId": "other-worker"},
+                    "name": "fixture-peer", "fromMode": "default", "senderTaskId": "other-worker"},
         )
-        spec, _, _ = self.source(0, human, peer, task, forged)
+        spec, path, sid = self.source(0, human, peer, task, forged)
         with HistoryIndex(self.work / "peer-task.sqlite") as index:
             peer_result = index.search([spec], "peer index public marker", source_kinds=("meta",))
             self.assertEqual(self.ids(peer_result), ["peer"])
             self.assertEqual(peer_result["entries"][0]["source_kind"], "meta")
-            self.assertIn("worker-index", peer_result["entries"][0]["snippet"])
+            self.assertIn("worker-index", HistorySource(path, sid).read(peer_result["entries"][0]["locator"])["text"])
             self.assertIn(peer_body, peer_result["entries"][0]["snippet"])
             self.assertEqual(self.ids(index.search([spec], "task index public marker", source_kinds=("meta",))),
                              ["task"])
@@ -398,7 +425,7 @@ class HistoryIndexTests(unittest.TestCase):
         peer = self.record(
             "", "peer", "user", persisted, isMeta=True, promptSource="system",
             origin={"kind": "peer", "from": "worker-cache", "body": peer_body,
-                    "senderTaskId": "worker-cache"},
+                    "name": "fixture-peer", "fromMode": "default", "senderTaskId": "worker-cache"},
         )
         spec, _, _ = self.source(0, peer)
         cache = self.work / "peer-policy.sqlite"
@@ -411,6 +438,31 @@ class HistoryIndexTests(unittest.TestCase):
         self.assertEqual(self.ids(refreshed), ["peer"])
         self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
         self.assertEqual(refreshed["refresh"]["unchanged_sources"], 0)
+
+    def test_current_notice_policy_reprojects_previously_hidden_meta(self) -> None:
+        self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 4)
+        body = "current peer marker"
+        _, persisted = self.peer_message("worker-current", body)
+        peer = self.record("", "peer", "user", persisted, promptSource="system",
+            origin={"kind": "peer", "from": "worker-current", "name": "fixture-peer",
+                    "fromMode": "default", "body": body})
+        text = ("<task-notification><task-id>worker-current</task-id><status>completed</status>"
+                "<summary>current task marker</summary></task-notification>")
+        task = self.record("", "task", "user", text, promptSource="system",
+            origin={"kind": "task-notification", "producer": "session-task", "runId": "run-1"})
+        spec, path, sid = self.source(0, peer, task)
+        previous = HistorySource(path, sid).index_projection()
+        previous["entries"] = []
+        cache = self.work / "current-notice-policy.sqlite"
+        with patch.object(history_index, "_REDACTION_POLICY_VERSION", 3), \
+                patch.object(HistorySource, "index_projection", return_value=previous):
+            with HistoryIndex(cache) as index:
+                self.assertEqual(index.search([spec], "current")["entries"], [])
+        with HistoryIndex(cache) as index:
+            refreshed = index.search([spec], "current", source_kinds=("meta",))
+            self.assertEqual(set(self.ids(refreshed)), {"peer", "task"})
+            self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
+            self.assertEqual(index.search([spec], None, source_kinds=("original_user",))["entries"], [])
 
     def test_question_policy_rebuilds_cached_answer_authority(self) -> None:
         self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 3)

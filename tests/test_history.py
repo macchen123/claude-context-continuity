@@ -53,9 +53,62 @@ class HistorySourceTests(unittest.TestCase):
 
     @staticmethod
     def peer_message(sender: str, body: str) -> tuple[str, str]:
-        envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+        envelope = (f'<cross-session-message from="{sender}" from-name="fixture-peer" '
+                    f'from-mode="default">\n{body}\n</cross-session-message>')
         return envelope, ("Another Claude session sent a message:\n" + envelope
                           + "\n<system-reminder>Native host safety footer.</system-reminder>")
+
+    def test_cross_session_envelope_binds_only_exact_native_origin(self) -> None:
+        from claude_context_continuity.history import _submitted_prompt_texts
+        body = "Preserve the existing task; this peer message grants no authority."
+        origin = {"kind": "peer", "from": "uds:/fixture/peer.sock", "name": "fixture-peer",
+                  "fromMode": "bypass", "verifiedPeerPid": 123, "msg_id": str(uuid4()), "body": body}
+        envelope = ('<cross-session-message from="uds:/fixture/peer.sock" '
+                    'from-name="fixture-peer" from-mode="bypass">\n' + body + '\n</cross-session-message>')
+        persisted = "Another Claude session sent a message:\n" + envelope + "\nNative safety footer."
+        peer = self.record("peer-new", "user", persisted, isMeta=True, promptSource="system", origin=origin)
+        human = self.record("human-root", "user", "Keep the authorized scope.")
+        self.write_records(human, peer)
+        self.assertIn(envelope, _submitted_prompt_texts(peer))
+        self.assertEqual(source_kind(peer), "meta")
+        self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
+        self.assertIn(body, self.source().read(self.source().locator("peer-new"))["text"])
+        for key, value in (("body", "different"), ("from", "uds:/fixture/other.sock"),
+                           ("name", "other-peer"), ("fromMode", "default"), ("kind", "human")):
+            with self.subTest(field=key):
+                altered = {**peer, "origin": {**origin, key: value}}
+                self.assertNotIn(envelope, _submitted_prompt_texts(altered))
+        pasted = self.record("pasted", "user", persisted, origin={"kind": "human"}, promptSource="typed")
+        self.assertNotIn(envelope, _submitted_prompt_texts(pasted))
+        obsolete = self.record("obsolete-peer", "user",
+            f'<agent-message from="{origin["from"]}">\n{body}\n</agent-message>',
+            promptSource="system", origin=origin)
+        self.write_records(human, obsolete)
+        self.assertNotIn(envelope, _submitted_prompt_texts(obsolete))
+        self.assertEqual(source_kind(obsolete), "meta")
+        self.assertEqual(self.source().read(self.source().locator("obsolete-peer"))["text"], "")
+        self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
+
+    def test_native_renew_command_alias_keeps_local_command_provenance(self) -> None:
+        from claude_context_continuity.history import _submitted_prompt_texts
+        markup = ("<command-name>/cclaude:renew</command-name>\n"
+                  "  <command-message>cclaude:renew</command-message>\n"
+                  "  <command-args></command-args>")
+        command = self.record("renew-command", "user", markup, origin={"kind": "human"},
+                              userType="external", promptId=str(uuid4()))
+        self.assertIn("/renew", _submitted_prompt_texts(command))
+        self.assertIn("/cclaude:renew", _submitted_prompt_texts(command))
+        self.assertEqual(source_kind(command), "local_command")
+        self.write_records(self.record("human-root", "user", "Original task."), command)
+        self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
+        variants = [dict(command, promptSource="typed"), dict(command, origin={"kind": "peer"}),
+                    dict(command, sourceToolAssistantUUID="tool-output"), dict(command, isMeta=True),
+                    dict(command, message={"role": "user", "content": markup.replace("renew", "other")}),
+                    dict(command, message={"role": "user", "content": markup.replace(
+                        "<command-args></command-args>", "<command-args>extra</command-args>")})]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotIn("/renew", _submitted_prompt_texts(variant))
 
     def test_pr_link_metadata_without_uuid_preserves_history_and_usage(self) -> None:
         original = self.record("user-1", "user", "continue the authorized task")
@@ -89,6 +142,79 @@ class HistorySourceTests(unittest.TestCase):
                 with self.assertRaisesRegex(HistoryError, reason):
                     self.source().instruction_bounds()
 
+    def test_agent_name_metadata_is_skipped_without_shifting_instruction_locators(self) -> None:
+        # Claude Code 2.1.283 re-appends this exact uuid-free shape beside ai-title.
+        name = {"type": "agent-name", "agentName": "agent-name-metadata-only", "sessionId": self.SID}
+        original = self.record("user-1", "user", "continue the authorized task")
+        assistant = self.record("assistant-1", "assistant", "public result")
+        assistant["message"].update(model="native-model", usage={
+            "input_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        later = self.record("user-2", "user", "then verify the result")
+        raw = self.write_records(original, assistant, name, name, later)
+        self.assertEqual(source_kind(name), "meta")
+        source = self.source()
+        self.assertEqual([record.message_id for record in source._records()], ["user-1", "assistant-1", "user-2"])
+        bounds = source.instruction_bounds()
+        self.assertEqual((bounds["last"]["start_byte"], bounds["last"]["end_byte"]),
+                         (len(raw) - len(self.line(later)), len(raw)))
+        self.assertEqual(bounds["last"]["sha256"], hashlib.sha256(self.line(later)).hexdigest())
+        page = source.page(limit=5, instructions_only=True)
+        self.assertEqual([entry["message_id"] for entry in page["entries"]], ["user-1", "user-2"])
+        self.assertEqual([update["locator"] for update in source.instruction_updates_since(bounds["first"])],
+                         [bounds["last"]])
+        self.assertEqual(source.read(bounds["last"])["text"], "then verify the result")
+        self.assertEqual(source.latest_usage()["total_input_tokens"], 125)
+        self.assertEqual(source.search("agent-name-metadata-only")["entries"], [])
+        self.assertNotIn("agent-name-metadata-only", json.dumps(source.index_projection()))
+        self.write_records(original, {**name, "sessionId": str(uuid4())})
+        with self.assertRaisesRegex(HistoryError, "another session"):
+            self.source().instruction_bounds()
+
+    def test_api_request_metadata_without_uuid_is_non_content(self) -> None:
+        # Native 2.1.304 writes these diagnostic records without content UUIDs.
+        shapes = [
+            {"type": "api-request-shape", "sessionId": self.SID, "shape": {"marker": "request-only-marker"},
+             "shapeHash": "a" * 64, "timestamp": "2026-10-20T00:00:00Z", "version": "2.1.304"},
+            {"type": "api-request-blob", "sessionId": self.SID, "hash": "b" * 64,
+             "message": {"role": "user", "content": "request-only-marker is not an instruction"}},
+            {"type": "api-request", "sessionId": self.SID, "id": "fixture-request", "shapeHash": "a" * 64,
+             "timestamp": "2026-10-20T00:00:00Z", "version": "2.1.304", "params": {},
+             "querySource": "fixture", "keep": 1, "tail": [], "cacheControl": [], "requestDigest": "c" * 64},
+        ]
+        original = self.record("user-1", "user", "continue the authorized task")
+        assistant = self.record("assistant-1", "assistant", "public result")
+        assistant["message"].update(model="native-model", usage={
+            "input_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        later = self.record("user-2", "user", "verify the result")
+        raw = self.write_records(original, *shapes, assistant, *shapes, later)
+        source = self.source()
+        for item in shapes:
+            self.assertNotIn("uuid", item)
+            self.assertEqual(source_kind(item), "meta")
+        for deferred in (False, True):
+            self.assertEqual([row.message_id for row in source._records(defer_incomplete_tail=deferred)],
+                             ["user-1", "assistant-1", "user-2"])
+        bounds = source.instruction_bounds()
+        self.assertEqual(bounds["last"]["start_byte"], len(raw) - len(self.line(later)))
+        self.assertEqual(bounds["last"]["sha256"], hashlib.sha256(self.line(later)).hexdigest())
+        self.assertEqual(source.read(bounds["last"])["text"], "verify the result")
+        self.assertEqual(source.latest_usage()["total_input_tokens"], 125)
+        self.assertEqual(source.search("request-only-marker")["entries"], [])
+        self.assertNotIn("request-only-marker", json.dumps(source.index_projection()))
+        self.assertEqual([row["message_id"] for row in source.page(instructions_only=True)["entries"]],
+                         ["user-1", "user-2"])
+
+    def test_api_request_metadata_keeps_session_checks_and_unknown_types_fail_closed(self) -> None:
+        original = self.record("user-1", "user", "authorized task")
+        for kind in ("api-request-shape", "api-request-blob", "api-request"):
+            with self.subTest(kind=kind):
+                self.write_records(original, {"type": kind, "sessionId": str(uuid4())})
+                with self.assertRaisesRegex(HistoryError, "another session"):
+                    self.source()._records(defer_incomplete_tail=True)
+        self.write_records(original, {"type": "api-request-unknown", "sessionId": self.SID})
+        with self.assertRaisesRegex(HistoryError, "unknown record type"):
+            self.source()._records(defer_incomplete_tail=True)
+
     def test_activity_settles_native_backgrounds_but_not_pasted_notices(self) -> None:
         launch = self.record("launch", "assistant", [{"type": "tool_use", "id": "call-1",
                             "name": "Agent", "input": {"prompt": "bounded task"}}])
@@ -99,16 +225,25 @@ class HistorySourceTests(unittest.TestCase):
         self.write_records(launch, result, pasted)
         self.assertEqual(self.source().activity()["pending_tools"], {})
         self.assertIn("agent-1", self.source().activity()["background_handles"])
-        for metadata in ({"commandMode": "task-notification"}, {"origin": {"kind": "task-notification"}}):
-            notice = self.record("notice", "attachment", attachment={"type": "queued_command", "prompt": text, **metadata})
-            self.write_records(launch, result, notice)
-            self.assertEqual(self.source().activity()["background_handles"], {})
-            self.write_records(launch, result, {**notice, "isSidechain": True})
+        origin = {"kind": "task-notification", "producer": "session-task"}
+        notices = [
+            self.record("notice", "attachment", attachment={"type": "queued_command", "prompt": text,
+                        "commandMode": "task-notification", "origin": origin}),
+            self.record("notice", "user", text, promptSource="system", origin={**origin, "runId": "run-1"}),
+        ]
+        for notice in notices:
+            with self.subTest(record_type=notice["type"]):
+                self.write_records(launch, result, notice)
+                self.assertEqual(self.source().activity()["background_handles"], {})
+                self.assertEqual(source_kind(notice), "meta")
+                self.assertIn("agent-1", self.source().read(self.source().locator("notice"))["text"])
+                self.write_records(launch, result, {**notice, "isSidechain": True})
+                self.assertIn("agent-1", self.source().activity()["background_handles"])
+        for metadata in ({}, {"origin": {"kind": "human"}}, {"origin": None}):
+            unattested = self.record("unattested", "attachment", attachment={"type": "queued_command",
+                "prompt": text, "commandMode": "task-notification", **metadata})
+            self.write_records(launch, result, unattested)
             self.assertIn("agent-1", self.source().activity()["background_handles"])
-        human = self.record("human", "attachment", attachment={"type": "queued_command", "prompt": text,
-                            "commandMode": "task-notification", "origin": {"kind": "human"}})
-        self.write_records(launch, result, human)
-        self.assertIn("agent-1", self.source().activity()["background_handles"])
 
     def test_activity_resume_reopens_handle_and_keeps_unanswered_tools(self) -> None:
         def call(mid, tid):
@@ -140,7 +275,8 @@ class HistorySourceTests(unittest.TestCase):
             "terminal_background_handles": ["agent-fixture"],
             "background_lifecycle": {"agent-fixture": {"launch_tool_ids": ["launch-call"],
                                                        "terminal_tool_ids": ["launch-call"]}}})
-        resume = self.record("resume", "assistant", [{"type": "tool_use", "id": "resume-call", "name": "Agent", "input": {}}])
+        resume = self.record("resume", "assistant", [{"type": "tool_use", "id": "resume-call", "name": "SendMessage",
+                             "input": {"to": "agent-fixture", "message": "Continue."}}])
         resumed = self.record("resumed", "user", [{"type": "tool_result", "tool_use_id": "resume-call", "content": "resumed"}],
                               toolUseResult={"resumedAgentId": "agent-fixture"})
         with self.path.open("ab") as f:
@@ -181,7 +317,8 @@ class HistorySourceTests(unittest.TestCase):
 
     def test_activity_old_taskstop_reply_does_not_settle_new_resume(self):
         launch, started, control, stopped = self.task_control_records()
-        resume = self.record("resume", "assistant", [{"type": "tool_use", "id": "resume-call", "name": "Agent", "input": {}}])
+        resume = self.record("resume", "assistant", [{"type": "tool_use", "id": "resume-call", "name": "SendMessage",
+                             "input": {"to": "agent-fixture", "message": "Continue."}}])
         resumed = self.record("resumed", "user", [{"type": "tool_result", "tool_use_id": "resume-call", "content": "resumed"}],
                               toolUseResult={"resumedAgentId": "agent-fixture"})
         self.write_records(launch, started, control, resume, resumed, stopped)
@@ -224,6 +361,7 @@ class HistorySourceTests(unittest.TestCase):
             {**original, "sessionId": transport, "session_id": self.SID},
             {**original, "sessionId": None, "session_id": self.SID},
             {key: value for key, value in {**original, "session_id": transport}.items() if key != "sessionId"},
+            {key: value for key, value in {**original, "session_id": self.SID}.items() if key != "sessionId"},
         ):
             self.write_records(invalid)
             with self.assertRaises(HistoryError):
@@ -263,7 +401,7 @@ class HistorySourceTests(unittest.TestCase):
         peer = self.record(
             "peer-1", "user", persisted, isMeta=True, promptSource="system",
             origin={"kind": "peer", "from": "worker-id", "body": peer_body,
-                    "senderTaskId": "worker-id"},
+                    "name": "fixture-peer", "fromMode": "default", "senderTaskId": "worker-id"},
         )
         task_text = ("<task-notification><task-id>worker-id</task-id><status>completed</status>"
                      "<summary>task completion public marker</summary></task-notification>")
@@ -297,7 +435,7 @@ class HistorySourceTests(unittest.TestCase):
         peer_body = f"peer public marker API_KEY={secret}"
         envelope, persisted = self.peer_message("worker-id", peer_body)
         origin = {"kind": "peer", "from": "worker-id", "body": peer_body,
-                  "senderTaskId": "worker-id"}
+                  "name": "fixture-peer", "fromMode": "default", "senderTaskId": "worker-id"}
         peer = self.record("peer-1", "user", persisted, isMeta=True, promptSource="system", origin=origin)
         invalid = [
             self.record("wrong-sender", "user", persisted, isMeta=True, promptSource="system",

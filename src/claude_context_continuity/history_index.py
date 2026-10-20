@@ -51,7 +51,7 @@ MAX_CURSOR_BYTES = 4 * 1024
 
 # A private namespace marker for a reconstructible cache, not task-state data.
 _APPLICATION_ID = 0x43434958
-_REDACTION_POLICY_VERSION = 3  # Rebuild question-answer authority and partial-answer text.
+_REDACTION_POLICY_VERSION = 4  # Reproject current native peer and task-notification records.
 _CURSOR_VERSION = 1
 _MAX_SQLITE_INT = (1 << 63) - 1
 _SOURCE_KINDS = frozenset({

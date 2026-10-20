@@ -293,7 +293,7 @@ def _event_task_id(event: Any, runtime: dict[str, Any]) -> tuple[str | None, str
         return None, "not_post_tool_use"
     if event.get("tool_name") != "CronCreate":
         return None, "not_cron_create"
-    if event.get("agent_id") or event.get("agentId"):
+    if event.get("agent_id"):
         return None, "agent_event"
     if event.get("session_id") != runtime["session_id"]:
         return None, "session_mismatch"

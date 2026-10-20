@@ -15,6 +15,8 @@ from .history import HistoryError, HistorySource, redact, terminal_task_result
 from .notes import MAX_NOTE_BYTES, NotesStore
 
 _SCHEMA = "claude-context-runtime.v1"
+_PHASES = frozenset({"created", "running", "rotation_requested", "waiting_safe_boundary", "clear_sent",
+                     "awaiting_tui_prompt", "continuation_dispatching", "awaiting_continuation", "closed"})
 _MAX_HANDOFF_BYTES = MAX_NOTE_BYTES
 _BUDGET_FIELDS = ("guard_tokens", "window_tokens", "window_is_actual", "cache_fields_complete",
                   "handoff_reported", "last_sample_id")
@@ -44,7 +46,7 @@ def _event_context_window(event):
     usage = event.get("modelUsage")
     if isinstance(usage, dict):
         windows = [item.get("contextWindow") for item in usage.values() if isinstance(item, dict)
-                   and isinstance(item.get("contextWindow"), int) and item["contextWindow"] > 0]
+                   and type(item.get("contextWindow")) is int and item["contextWindow"] > 0]
         if windows:
             return min(windows)
     return None
@@ -52,6 +54,26 @@ def _event_context_window(event):
 
 class ContextRuntimeError(ValueError):
     pass
+
+
+class UnsupportedRuntimePhase(ContextRuntimeError):
+    """Reject an unreadable protocol stage without adopting or rewriting it.
+
+    Identity hints may only screen launch conflicts; they are not a usable
+    runtime state, an authorization source, or evidence that an owner is dead.
+    """
+
+    def __init__(self, state: dict[str, Any]) -> None:
+        super().__init__("runtime state phase is unsupported; no stage migration is performed")
+        self.discovery_identity = {key: state.get(key) for key in (
+            "session_id", "cwd", "native_session_uncertain")}
+        self.discovery_identity["launch_session_ids"] = state.get("launch_session_ids", [])
+
+
+def _validate_phase(state: dict[str, Any]) -> None:
+    phase = state.get("phase")
+    if not isinstance(phase, str) or phase not in _PHASES:
+        raise UnsupportedRuntimePhase(state)
 
 
 class MissingRootAuthorization(ContextRuntimeError):
@@ -139,8 +161,10 @@ def observe_budget(previous_or_none: dict[str, Any] | None, current_input_tokens
                 "sample_ignored": True}
     total, cache_complete = sample
     window, window_is_actual = _budget_window(host_window)
-    # 固定预留供下一轮与交接使用；不随历史增长或文件大小提前触发。
-    guard = min(window // 4, core.MAX_PACKET + 2 * _MAX_HANDOFF_BYTES)
+    # An unverified ceiling needs headroom for native input added after the last
+    # usage sample (skills, tool batches, and queued notifications).
+    guard = (min(window // 4, core.MAX_PACKET + 2 * _MAX_HANDOFF_BYTES)
+             if window_is_actual else window // 4)
     remaining, threshold = window - total, max(0, window - guard)
     near_limit = remaining <= guard
     already_reported = previous.get("handoff_reported", 0) == 1 and previous.get("window_tokens") == window
@@ -290,11 +314,11 @@ class ContextRuntime:
             "session_id": _uuid(session_id, "session_id"), "configuration": expected,
             "source_path": None, "authorization": None, "native_context_window": None, "usage": None,
             "budget": {}, "budget_stream": None, "budget_handoff_signal": None,
-            "pending_tool_ids": [], "active_child_handles": [], "background_tool_ids": [],
+            "pending_tool_ids": [], "active_child_handles": [], "background_tool_ids": [], "child_handle_sources": {},
             "at_turn_boundary": False, "window_generation": 0,
             "rotation": {"generation": 0, "request": None, "clear": None},
             "owned_pid": None,
-            "phase": "created", "pause_reason": None, "reconciliation": None,
+            "phase": "created", "reconciliation": None,
         }
         try:
             with core.lock(runtime.lock_path, wait_seconds=5):
@@ -321,9 +345,11 @@ class ContextRuntime:
             raise ContextRuntimeError("runtime state cannot be read") from exc
         if not isinstance(state, dict) or state.get("schema") != _SCHEMA or state.get("conversation_id") != self.conversation_id:
             raise ContextRuntimeError("runtime state identity drifted")
+        _validate_phase(state)
         return state
 
     def _save(self, state: dict[str, Any], exclusive: bool = False) -> None:
+        _validate_phase(state)
         try:
             core.no_secrets(state)
             core.atomic(self.state_path, state, exclusive=exclusive, skip_unchanged=not exclusive)
@@ -340,17 +366,12 @@ class ContextRuntime:
         settle the handoff.  Reconciliation therefore has no absorbing terminal
         state to accidentally strand the controller in.
         """
-        if state.get("phase") == "closed":
+        _validate_phase(state)
+        if state["phase"] == "closed":
             return
-        stage = state.get("phase")
-        if not isinstance(stage, str) or not stage:
-            stage = "unknown"
         if not isinstance(reason, str) or not reason:
             reason = "native_observation_pending"
-        state["reconciliation"] = {"stage": stage, "reason": reason}
-        # Retain the old field only as an inert on-disk migration boundary; new
-        # code never uses it to make automation absorbing.
-        state["pause_reason"] = None
+        state["reconciliation"] = {"stage": state["phase"], "reason": reason}
 
     @staticmethod
     def _waiting(state: dict[str, Any]) -> bool:
@@ -363,38 +384,12 @@ class ContextRuntime:
         if isinstance(previous, dict):
             state["last_reconciliation"] = previous
             state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
-        state["pause_reason"] = None
         state.pop("diagnostic", None)
-        state.pop("observation_only_pause", None)
-        state.pop("pause_notice_key", None)
-
-    @classmethod
-    def _normalize_legacy_pause(cls, state: dict[str, Any]) -> None:
-        """Migrate an old persisted pause at its real outstanding stage.
-
-        Existing v0.2.7 state did not preserve a stage separately.  Infer only
-        from its durable control receipts and resume observation; never resend a
-        command while doing so.
-        """
-        if state.get("phase") != "paused":
-            return
-        rotation = state.get("rotation", {})
-        clear = rotation.get("clear") if isinstance(rotation, dict) else None
-        if state.get("continuation_hash"):
-            state["phase"] = "awaiting_continuation"
-        elif isinstance(clear, dict):
-            state["phase"] = "awaiting_tui_prompt" if clear.get("reset_seen") else "clear_sent"
-        elif isinstance(rotation, dict) and rotation.get("request"):
-            state["phase"] = "rotation_requested"
-        else:
-            state["phase"] = "running"
-        cls._wait(state, state.get("pause_reason") or "legacy_observation_requires_reconciliation")
-        state["legacy_pause_migrated"] = True
 
     @staticmethod
     def _receipt(state: dict[str, Any]) -> dict[str, Any]:
         rotation = state["rotation"]
-        return {key: state.get(key) for key in ("conversation_id", "phase", "pause_reason", "reconciliation", "cwd", "session_id",
+        return {key: state.get(key) for key in ("conversation_id", "phase", "reconciliation", "cwd", "session_id",
                 "source_path", "configuration", "usage", "authorization", "owned_pid", "diagnostic", "capabilities")} | {
                     "pending_tool_ids": list(state["pending_tool_ids"]),
                     "active_child_handles": list(state["active_child_handles"]),
@@ -404,6 +399,8 @@ class ContextRuntime:
                     "budget": dict(state.get("budget", {})),
                     "budget_handoff_required": isinstance(state.get("budget_handoff_signal"), dict),
                     "budget_handoff_signal": state.get("budget_handoff_signal"),
+                    "context_rejections": state.get("context_rejections", 0),
+                    "last_context_rejection": state.get("last_context_rejection"),
                 }
 
     def receipt(self) -> dict[str, Any]:
@@ -493,7 +490,7 @@ class ContextRuntime:
 
     @staticmethod
     def _hook_output(state: dict[str, Any], name: str, context: str | None = None) -> dict[str, Any]:
-        result = {} if context is None or name == "Stop" else {
+        result = {} if context is None or name in {"Stop", "StopFailure"} else {
             "hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
         reconciliation = state.get("reconciliation")
         if isinstance(reconciliation, dict):
@@ -532,7 +529,6 @@ class ContextRuntime:
         window = min(windows)
         used = usage["total_input_tokens"] + usage["output_tokens"]
         remaining = window - used
-        state.pop("output_budget", None)  # Retire the old byte-based projection after a verified sample.
         state["usage"] = result = {
             "usage_locator": usage["locator"], "actual_model": usage["actual_model"],
             "request_id": usage["request_id"], "sample_timestamp": usage["timestamp"],
@@ -658,7 +654,8 @@ class ContextRuntime:
         state["phase"] = "rotation_requested"
 
     def _automatic_rotation(self, state: dict[str, Any]) -> None:
-        if (not state.get("budget_handoff_signal") and not state.get("deferred_inputs")) or state["rotation"]["request"]:
+        failure = state.get("context_failure")
+        if (not failure and not state.get("budget_handoff_signal") and not state.get("deferred_inputs")) or state["rotation"]["request"]:
             return
         if not state.get("authorization"):
             self._wait(state, "native_root_authorization_pending")
@@ -670,8 +667,9 @@ class ContextRuntime:
         recent = [info for info in source._records(defer_incomplete_tail=True)
                   if info.kind in {"assistant", "tool_result"}][-4:]
         locators = [source.locator(info.message_id) for info in recent]
-        reason = ("宿主因真实预算进入预留区自动换窗；" if state.get("budget_handoff_signal")
-                  else "宿主为处理上一条交接未包含的已提交输入而换窗；")
+        reason = ("原生宿主已拒绝过长上下文，按核验过的失败记录安全换窗；" if failure else
+                  "宿主因真实预算进入预留区自动换窗；" if state.get("budget_handoff_signal") else
+                  "宿主为处理上一条交接未包含的已提交输入而换窗；")
         handoff = (reason + "这不是用户新指令。"
                    "先查看现有 Notes、原始用户指令及以下最近公开记录，核对已完成动作和产物后继续。"
                    "若原任务已经完成，只交付现有结果，不重新执行。最近记录定位：" +
@@ -683,7 +681,7 @@ class ContextRuntime:
         usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
         budget = state.get("budget") if isinstance(state.get("budget"), dict) else {}
         snapshot = {
-            "trigger": "usage_near_limit" if signal else "deferred_input",
+            "trigger": "native_context_rejection" if failure else "usage_near_limit" if signal else "deferred_input",
             "window_source": ("native_observed_and_configured_min"
                               if type(state.get("native_context_window")) is int else "configured_estimate"),
         }
@@ -699,6 +697,8 @@ class ContextRuntime:
         ):
             if type(number) is int:
                 snapshot[name] = number
+        if failure:
+            snapshot["rejection_locator"] = failure["locator"]
         self._queue_rotation(state, _safe_note(handoff, "automatic handoff"),
                              json.dumps(snapshot, sort_keys=True, separators=(",", ":")), automatic=True)
 
@@ -706,7 +706,6 @@ class ContextRuntime:
         handoff, notes = _safe_note(handoff, "handoff"), _safe_note(notes, "notes")
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
-            self._normalize_legacy_pause(state)
             if state["rotation"]["request"] or state["rotation"]["clear"]:
                 self._save(state)
                 return self._receipt(state)
@@ -778,10 +777,12 @@ class ContextRuntime:
                 raise ContextRuntimeError("native tool batch identity is unavailable")
             completed = {call["tool_use_id"] for call in calls}
             self._settle_observed_tools(state, {"settled_tool_ids": completed})
-        elif name != "Stop" and (name not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+        elif name not in {"Stop", "StopFailure"} and (name not in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
                                  or not isinstance(tool, str) or not tool):
             raise ContextRuntimeError("tool hook lacks its native identity")
         if name == "PreToolUse":
+            state.pop("failure_boundary", None)
+            state.pop("context_failure", None)
             if tool not in state["pending_tool_ids"]:
                 state["pending_tool_ids"].append(tool)
             state.setdefault("pending_tool_sources", {})[tool] = [state["session_id"], state["source_path"]]
@@ -796,10 +797,35 @@ class ContextRuntime:
                 self._settle_task_hook(state, event)
 
     @staticmethod
+    def _trim_child_sources(state):
+        sources = state.setdefault("child_handle_sources", {})
+        inactive = [agent for agent in sources if agent not in state["active_child_handles"]]
+        for agent in inactive[:-32]:
+            sources.pop(agent)
+
+    @staticmethod
     def _settle_superseded_hook(state: dict[str, Any], event: dict[str, Any]) -> bool:
         """Keep an old epoch's late lifecycle receipt out of the current one."""
-        if event.get("hook_event_name") == "SessionStart":
+        name = event.get("hook_event_name")
+        if name == "SessionStart":
             return False  # A genuine restore can select a formerly superseded SID.
+        agent = event.get("agent_id")
+        if name in {"SubagentStart", "SubagentStop"} and event.get("session_id") != state["session_id"]:
+            binding = state.get("child_handle_sources", {}).get(agent) if isinstance(agent, str) else None
+            matched = False
+            if name == "SubagentStop" and binding == [event.get("session_id"), event.get("transcript_path")]:
+                try:
+                    _cwd(event.get("cwd"))
+                    matched = isinstance(binding[1], str) and Path(binding[1]).resolve(strict=False) == Path(binding[1])
+                except (OSError, TypeError, ValueError):
+                    pass
+            settled = matched and agent in state["active_child_handles"]
+            if settled:
+                state["active_child_handles"].remove(agent)
+            state["last_superseded_hook"] = {
+                "session_id": event.get("session_id"), "hook_event_name": name, "settled": settled,
+            }
+            return True
         prior = state.get("superseded_lifecycle")
         if not isinstance(prior, dict):
             return False
@@ -838,13 +864,12 @@ class ContextRuntime:
             self._wait_external("hook_event_invalid")
             return {}
         name = event.get("hook_event_name")
-        agent = event.get("agent_id", event.get("agentId"))
+        agent = event.get("agent_id")
         # 子代理有独立 transcript；父侧只跟踪其原生生命周期，不混用用量。
         if agent and name not in {"SubagentStart", "SubagentStop", "PreCompact"}:
             return {}
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
-            self._normalize_legacy_pause(state)
             if self._settle_superseded_hook(state, event):
                 self._save(state)
                 return {}
@@ -859,8 +884,10 @@ class ContextRuntime:
                     if name == "SubagentStart":
                         if agent not in handles:
                             handles.append(agent)
+                        state.setdefault("child_handle_sources", {})[agent] = [state["session_id"], state["source_path"]]
                     elif agent in handles:
                         handles.remove(agent)
+                    self._trim_child_sources(state)
                 else:
                     self._observe_tool_hook(state, event)
                     self._verify_config(state)
@@ -885,15 +912,9 @@ class ContextRuntime:
     def _wait_external(self, reason: str) -> dict[str, Any]:
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
-            self._normalize_legacy_pause(state)
             self._wait(state, reason)
             self._save(state)
             return self._receipt(state)
-
-    # Kept only for callers from the just-replaced local floor.  It has waiting,
-    # not paused, semantics and is not a second recovery path.
-    def _pause_external(self, reason: str) -> dict[str, Any]:
-        return self._wait_external(reason)
 
 
 def context_request(conversation_id: str, handoff: str, notes: str = "", *, configuration_reader: Callable[[Path], dict[str, Any]] = core.configuration) -> dict[str, Any]:

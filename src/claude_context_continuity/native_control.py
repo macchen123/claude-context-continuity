@@ -32,10 +32,10 @@ def require_supported_cli() -> str:
     try:
         result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise NativeControlError("无法核实 Claude Code 版本；本版本需要 2.1.266 或更新版本") from exc
+        raise NativeControlError("无法核实 Claude Code 版本；本版本需要 2.1.304 或更新版本") from exc
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", result.stdout)
-    if result.returncode != 0 or match is None or tuple(map(int, match.groups())) < (2, 1, 266):
-        raise NativeControlError("当前 Claude Code 不支持所需原生批次 hook 与消息通道；需要 2.1.266 或更新版本")
+    if result.returncode != 0 or match is None or tuple(map(int, match.groups())) < (2, 1, 304):
+        raise NativeControlError("当前 Claude Code 版本不受支持；需要 2.1.304 或更新版本")
     return match.group(0)
 
 

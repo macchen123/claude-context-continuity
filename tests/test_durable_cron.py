@@ -199,6 +199,20 @@ class DurableCronTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "applied")
         self.assertTrue(self.native_tasks()["tasks"][0]["recurring"])
 
+    def test_only_native_agent_id_classifies_a_child_hook(self) -> None:
+        before = self.tasks_path.read_bytes()
+        for fields in ({"agent_id": "native-child"}, {"agent_id": "native-child", "agentId": None}):
+            with self.subTest(fields=fields):
+                result = durable_cron.repair_created_task(self.state(), {**self.event(), **fields}, self.runtime_directory)
+                self.assertEqual(result, {"status": "skipped", "task_id": None, "reason": "agent_event"})
+                self.assertEqual(self.tasks_path.read_bytes(), before)
+                self.assertEqual(self.receipt_paths(), [])
+        result = durable_cron.repair_created_task(self.state(), {**self.event(), "agentId": "ignored-extra"},
+                                                  self.runtime_directory)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(self.native_tasks()["tasks"][0]["createdBySessionId"], self.startup_session)
+        self.assertEqual(len(self.receipt_paths()), 1)
+
     def test_large_native_task_file_is_not_limited_by_handoff_packet_size(self) -> None:
         self.other["prompt"] = "x" * 100_000
         self.write_native([self.task, self.other])

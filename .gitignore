@@ -1,6 +1,10 @@
 # Runtime state and generated local data
+.cache/
+.tmp/
 runtime/
 artifacts/
+tests/native-rv-smoke-*/
+tests/tmp*/
 logs/
 *.log
 *.sock
