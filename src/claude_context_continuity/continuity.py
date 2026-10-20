@@ -189,8 +189,16 @@ def dispatch(args):
             # obtains or persists that credential.
             # Bind the native epoch and invalidate old turn boundaries before
             # allowing a repaired observer to act on this process's state.
-            result = tui_runtime.TuiRuntime.load(args.context_id).on_hook(event)
-            tui_runtime.repair_controller_from_hook(args.context_id, event)
+            try:
+                result = tui_runtime.TuiRuntime.load(args.context_id).on_hook(event)
+                tui_runtime.repair_controller_from_hook(args.context_id, event)
+            except Exception:
+                # 恢复角色的安全检查不能被外层观测故障的 fail-open 路径吞掉。
+                from .agent_metadata import failure_hook
+                denied = failure_hook(event)
+                if denied:
+                    return denied
+                raise
             return result
         if args.action == "tui-serve":
             return tui_runtime.serve(args.context_id)
@@ -237,7 +245,7 @@ def main():
         result = dispatch(args)
         core.no_secrets(result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        failed = isinstance(result, dict) and (result.get("status") == "paused" or result.get("phase") == "paused" or
+        failed = isinstance(result, dict) and (result.get("status") == "paused" or
                  args.action == "cron-compat" and result.get("status") in {"blocked", "error"})
         return 2 if failed else 0
     except (ValueError, OSError, KeyError, TypeError) as exc:

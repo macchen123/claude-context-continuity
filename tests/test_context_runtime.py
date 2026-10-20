@@ -1,14 +1,104 @@
-"""纯 observe_budget 预算观察检查，不构造或启动 headless runtime。"""
+"""Budget observation and persisted-state contract checks; no native runtime is launched."""
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from claude_context_continuity.context_runtime import ContextRuntimeError, observe_budget  # noqa: E402
+from claude_context_continuity import core  # noqa: E402
+from claude_context_continuity.context_runtime import ContextRuntime, ContextRuntimeError, observe_budget  # noqa: E402
+
+
+class RuntimeStateContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(dir=ROOT / ".cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        home = patch.object(core, "HOME", self.root / "state")
+        home.start()
+        self.addCleanup(home.stop)
+        self.config = {"hash": "state-contract", "env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000"}}
+        self.runtime = ContextRuntime.create(cwd=self.root, session_id=str(uuid4()), configuration=self.config,
+                                             configuration_reader=lambda _: self.config)
+
+    def test_only_actual_current_protocol_phases_round_trip_without_rewrite(self) -> None:
+        for phase in ("created", "running", "rotation_requested", "waiting_safe_boundary", "clear_sent",
+                      "awaiting_tui_prompt", "continuation_dispatching", "awaiting_continuation", "closed"):
+            with self.subTest(phase=phase):
+                state = self.runtime._state()
+                state["phase"] = phase
+                self.runtime._save(state)
+                before = self.runtime.state_path.read_bytes()
+                stamp = self.runtime.state_path.stat()
+                loaded = ContextRuntime.load(self.runtime.conversation_id, configuration_reader=lambda _: self.config)
+                self.assertEqual(loaded.receipt()["phase"], phase)
+                self.assertEqual(self.runtime.state_path.read_bytes(), before)
+                after = self.runtime.state_path.stat()
+                self.assertEqual((after.st_ino, after.st_mtime_ns), (stamp.st_ino, stamp.st_mtime_ns))
+
+    def test_obsolete_unknown_missing_and_non_string_phases_fail_without_rewrite(self) -> None:
+        initial = self.runtime._state()
+        for phase in ("paused", "in_progress", "clearing", "future_phase", "", None, True, 0, [], {}, "missing"):
+            with self.subTest(phase=phase):
+                state = {**initial, "phase": phase}
+                if phase == "missing":
+                    state.pop("phase")
+                core.atomic(self.runtime.state_path, state)
+                before = self.runtime.state_path.read_bytes()
+                stamp = self.runtime.state_path.stat()
+                operations = (lambda: ContextRuntime.load(self.runtime.conversation_id), self.runtime._state,
+                              self.runtime.receipt, lambda: self.runtime.request_rotation("Do not migrate this state."))
+                with patch.object(self.runtime, "_save") as save:
+                    for operation in operations:
+                        with self.assertRaisesRegex(ContextRuntimeError, "phase.*unsupported"):
+                            operation()
+                    save.assert_not_called()
+                self.assertEqual(self.runtime.state_path.read_bytes(), before)
+                after = self.runtime.state_path.stat()
+                self.assertEqual((after.st_ino, after.st_mtime_ns), (stamp.st_ino, stamp.st_mtime_ns))
+                self.assertFalse((self.runtime.directory / "notes").exists())
+
+    def test_invalid_phase_cannot_be_persisted_by_the_current_writer(self) -> None:
+        state = self.runtime._state()
+        state["phase"] = "paused"
+        before = self.runtime.state_path.read_bytes()
+        with self.assertRaisesRegex(ContextRuntimeError, "phase.*unsupported"):
+            self.runtime._save(state)
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+
+    def test_inert_extra_fields_are_not_rejected_migrated_or_exposed_as_current_receipts(self) -> None:
+        state = self.runtime._state()
+        extras = {"pause_reason": "historical note", "observation_only_pause": True,
+                  "pause_notice_key": "historical-key", "legacy_pause_migrated": True}
+        self.assertFalse(extras.keys() & state.keys())
+        state.update(extras)
+        self.runtime._save(state)
+        before = self.runtime.state_path.read_bytes()
+        loaded = ContextRuntime.load(self.runtime.conversation_id)
+        self.assertEqual(loaded._state(), state)
+        self.assertEqual(json.loads(before)["schema"], "claude-context-runtime.v1")
+        self.assertFalse(extras.keys() & loaded.receipt().keys())
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        ContextRuntime._wait(state, "current_native_fact_pending")
+        self.assertEqual(state["reconciliation"], {"stage": "created", "reason": "current_native_fact_pending"})
+        ContextRuntime._clear_wait(state)
+        self.assertEqual({key: state[key] for key in extras}, extras)
+
+    def test_current_waits_do_not_create_obsolete_pause_fields(self) -> None:
+        state = self.runtime._state()
+        ContextRuntime._wait(state, "current_native_fact_pending")
+        ContextRuntime._clear_wait(state)
+        self.runtime._save(state)
+        for value in (self.runtime._state(), self.runtime.receipt()):
+            self.assertFalse({"pause_reason", "observation_only_pause", "pause_notice_key",
+                              "legacy_pause_migrated"} & value.keys())
 
 
 class ObserveBudgetTests(unittest.TestCase):
@@ -44,7 +134,7 @@ class ObserveBudgetTests(unittest.TestCase):
                "bootstrap_input_tokens": 125, "guard_tokens": 580000, "window_tokens": 600000}
         observed = observe_budget(old, 198068, 600000, 1)
         self.assertFalse(observed["near_limit"])
-        self.assertEqual(observed["guard_tokens"], 81536)
+        self.assertEqual(observed["guard_tokens"], 150000)
         self.assertNotIn("max_positive_growth_tokens", observed["observations"])
 
     def test_handoff_notice_is_once_per_observed_window(self) -> None:

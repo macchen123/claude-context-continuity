@@ -495,10 +495,77 @@ bf7ce41c4d2cb94952d671acfb113450d33c65edba933ae943bbb67f671efdcf
 ecc8a4c32c63a0f99a581fd03aa7c59b572bdb72aec9122d4f5a21ef08c804e4
 ```
 
+## 2026-10-07 原生会话名称元数据兼容
+
+Claude Code **2.1.283** 会在 `ai-title` 附近重复写入没有 `uuid` 的 `agent-name` 会话元数据。原解析器不认识该类型，导致真实会话的 History 读取和索引失败，待执行换窗也无法读取完整历史。首次错误分别为 `unknown record type 'agent-name'` 和 `canonical history projection failed`；普通独立窗口的原生换窗基线仍通过，故没有把故障归为传输失效或旧安装残留。
+
+修复只向现有 `_STATE_ONLY` 注册表加入 `agent-name`，不忽略任意未知类型。会话身份校验仍先于元数据跳过；真实用户指令、队列输入、来源哈希与字节定位保持。新增回归覆盖重复且无 UUID 的名称记录、其后的真实用户指令、准确定位、增量索引和错误会话拒绝。移除该注册项时，两项新测试分别复现原始错误。
+
+- 主会话范围复核和 `git diff --check` 通过；完整离线套件 **333 项通过，9.656 秒**。
+- 实际故障父会话的全部 30 条真实用户指令可读，包含元数据出现后的执行批准与最后补充输入；安装后的原失败 History 检索命令恢复，未延后任何来源。
+- 隔离构建的 wheel 与全部 **15 个源码模块**逐字节核对后离线安装，依赖不变。版本仍为 **0.3.3 的未发布本地修复**，以 wheel SHA256 `6d76dadfe86114f968a5190f46827cd93ab1f52a9a9dfe1967b9482004483864` 区分。
+- 从实际安装目录运行既有原生后台／输入／历史／存档探针：**通过，11.632 秒**。真实 2.1.283 TUI 和 hooks 在后台任务结束前完成换窗；producer 只执行一次，两次准确查史、单份延后输入、未提交草稿与完整存档校验均通过。响应与 usage 由 localhost 脚本提供，未调用外部模型；测试原生进程退出已核验。
+- 本轮本地故障修复中，核对准确实例、运行阶段和无待发 clear／交接后，仅重载该实例的监测控制器，由真实 hook 加载已安装修复。控制器锁、tmux、控制通道和健康状态均通过；用户原生进程及当前窗口未重启、未清空，旧失败请求未重放。未提交、推送或发布。
+
+## 2026-10-20 请求诊断元数据与 peer 消息门禁（源码候选）
+
+针对 Claude Code **2.1.304**、源码 **0.3.4rc1** 的本地修复候选。主会话提供的结构性记录确认了无 `uuid` 的 `api-request-shape`、`api-request-blob`、`api-request`；仅将这三类加入现有非内容白名单，保留会话身份先验核对和未知类型拒绝，诊断请求中的 `message` 不进入用户指令、History 文本或索引。
+
+`SendMessage` 的明确 peer/socket 地址与保留接收方 `main` 不再经过本地子代理恢复门禁。名称先核对 sidecar、原生 Agent/Task 启动记录及候选恢复来源；缺失或不可读的本地证据、同名代理身份不全仍拒绝恢复。发送者身份 pending 时，只有排除已知本地碰撞且通过原生只读 `claude agents --json` 发现的 peer 名称才放行；不建立独立 peer 注册表、不改写地址或替原生处理名称消歧。Agent/Task 的 `resume` 始终按本地恢复检查。无法证明名称为 peer（包括发现不可用或来源缺失）时保持 fail-closed；同名 peer 的显式地址仍交由原生验证。
+
+- 首轮定向检查复现了未知元数据导致解析/恢复失败，以及 pending 身份错误拒绝 peer；自审另复现并修正了无 sidecar 名称、缺失同名身份被另一有效身份掩盖，以及目录读取失败被误当“没有代理”的反例。原始失败日志保留。
+- 最终 **13 个受影响测试模块，271 项及 149 个 subtest 通过，9.67 秒**。包含原生允许的无空格 `name[ref]` 别名，以及生成 plugin 的真实 Python hook CLI 调用；hook 输入为隔离 fixture，没有执行原生 SendMessage。所有可重建夹具和日志均位于 `.cache/peer-message-fix-20261020/implementation/`，最终日志为 `final-tests-r3.log`。
+- 实际原生只读 discovery 返回的 JSON 已在内存中交给源码 consumer 解析通过；这是 discovery 的 producer-to-consumer 检查，不是消息送达证据。本轮未安装、恢复当前会话、发送原生消息或重启进程；安装与运行态验收由主会话另行记录。
+
+## 2026-10-20 本地安装与真实消息验收
+
+主会话完成源码范围复核及独立身份边界复核后，离线构建并安装同版本 `0.3.4rc1` 的本地修复 wheel，未提交或发布。18 个模块在源码快照、wheel、隔离安装和实际安装间逐字节一致，未更新依赖或全局设置。
+
+- 完整套件 **395 项及 268 个 subtest 通过，12.31 秒**。首次全量为 394 项通过、1 项失败：测试 runner 把原本要求短路径的 UNIX socket 夹具重定位到过长的项目缓存路径，超过 macOS 103 字节上限。改用用户缓存中的短临时路径后，同一源码和测试全部通过；首次输出保留。
+- 隔离 wheel 实际读取此前失败的原生日志，1133 条内容记录解析成功，根指令、最新指令及真实用量均可提取；三类 `api-request*` 诊断记录未进入内容投影。实际 native discovery 的命名 peer 检查也通过。
+- 仅替换本 context 的监测控制器，保留原生 PID 和 session；通过既有 `tui-recover` 入口重新观测真实日志。`pending_session_start`、reconciliation 和 diagnostic 自然清空，授权绑定与用量统计恢复，控制器锁、tmux 和控制 socket 均为 `healthy`，没有手工清状态或 `/clear`。
+- 两次真实跨会话 `SendMessage` 均返回成功入箱，其中原受阻对端回复了 `peer-guard-fix-20261020 received`。按会话名称发起的只读空闲订阅也成功，未重复发送正文；没有重启其他会话。
+- 本地记录与回退 wheel 位于 `.cache/peer-message-fix-20261020/rollout/`：`main-review.json`、`package-check.json`、`real-history-preflight.json`、`activation.json`、`live-health.json`、`live-messaging.json` 和 `RECOVERY.md`。不明确的本地名称碰撞、缺失身份及不可读 registry 仍拒绝恢复，不以 peer discovery 覆盖本地原始角色或模型。
+
+## 2026-10-20 当前原生合同清理与本地验收
+
+按用户要求移除旧版本、旧状态和旧消息格式兼容，当前最低原生版本为 **Claude Code 2.1.304**；本地包保持 **0.3.4rc1**，未创建新发布。
+
+- 删除旧 `paused` 阶段推断、`pause_reason` 等迁移字段、`_pause_external` 别名和退役 `output_budget` 的清理／receipt 路径。只接受当前九个真实阶段；过时或未知阶段明确拒绝，不改写现场、不推断阶段或重放命令。旧状态不会干扰无关会话的发现；可能属于同一会话的旧状态仍保留所有权保护。
+- tmux 只接受当前 producer 使用的 `runtime/tmux/<uuid>.sock`。hook 只读取 `agent_id`；原生工具回执中的 `agentId` 保持其当前语义。磁盘上无关的惰性扩展字段不参与当前行为，也不主动迁移或删除。
+- peer 只按当前 `cross-session-message` 及其结构化来源准确绑定；任务通知必须有原生来源，不再接受仅凭 `commandMode` 的旧格式。真实 2.1.304 通知的 `producer`／`runId` 字段得到正确处理。持久会话身份只认 `sessionId`；索引投影策略提升为 4，使此前隐藏的当前通知重新投影。
+- 实际 `api-request-shape` 确认当前 `Agent` 不再提供 `resume`，也不提供旧 `Task` 工具，因此删除对应恢复分支和名称别名。当前恢复入口为 `SendMessage`；角色、模型、权限、来源冲突和 `stoppedByUser` 保护保留。`/renew` 与 `/cclaude:renew` 的当前原生精确绑定保留。
+- 中英文 README 与原生探针改为当前合同；探针报告 `reconciliation`，不再读取已退役的暂停字段。
+
+验收：
+
+- 最终完整离线套件 **417 项及 321 个 subtest 通过，12.67 秒**。第一轮反证、失败原因和修正后的结果均保留；其中当前通知附加来源字段、无来源旧通知、snake-case 身份回退、索引缓存失效，以及旧阶段／旧 socket 接受路径均有覆盖。新封套较长造成的 snippet 截断断言改为沿准确 locator 核对完整内容，没有扩大正文展示或放宽来源校验。
+- 候选只读解析两份真实 2.1.304 原生日志：分别 **1310 条／206 条内容记录**，共 **3 条 peer、4 条任务通知**，通知保持 `meta`，真实用户指令仍可准确读取。
+- 隔离 wheel 的真实原生后台／输入／历史／存档探针 **通过，13.996 秒**：后台 producer 只执行一次，完成前换窗，两次准确查史、单份延后输入、未提交草稿及完整存档均通过。
+- 同一 wheel 的真实控制器恢复及连续两次换窗 **通过，4.337 秒**：最终 `running` 且无待协调状态，全部工具只结算一次，测试原生进程与控制器均已退出。两项探针均使用 localhost 固定响应与 usage，未调用外部模型。
+- **18 个生产模块**在源码、构建快照、wheel、隔离安装及实际安装间逐字节一致。离线安装后只重载本 context 的监测控制器，保留原生 PID 和 session；实际状态为 `healthy`，控制器锁、tmux、控制 socket 正常，无 pending resume 或 reconciliation。实际安装包再次准确读取当前原生日志。
+
+验收与回退入口：`.cache/peer-message-fix-20261020/current-contract-cleanup/` 下的 `runtime-receipt.json`、`full-suite.log`、`real-history-preflight.json` 及 `rollout/` 内的 `main-review.json`、`package-check.json`、两份 native probe 回执、`activation.json`、`live-health.json`、`installed-check.json` 和 `RECOVERY.md`。历史证据、备份和其他会话保持原样；没有提交、push 或 release。
+
+## v0.4.0 版本核验
+
+2026-10-21，用户授权更新远程并由主会话决定版本号。最低 Claude Code 版本提升至 2.1.304，旧运行状态和旧工具入口不再受支持，因此按 0.x 阶段的兼容边界变化将版本提升到 **0.4.0**，不沿用未发布的 0.3.4rc1。
+
+- 发布代码与上一节已验收实现的 **17 个运行模块逐字节相同**；第 18 个模块 `__init__.py` 只改变版本字符串，`pyproject.toml` 同步为 0.4.0。复用上一节 417 项完整回归及真实原生连接证据。
+- 版本变更后，包导入、两个 CLI 入口和生成 hook 定向检查 **19 项及 32 个 subtest 通过，3.88 秒**。
+- 使用既有依赖离线构建 wheel；CRC、18 模块白名单、源码字节、版本、固定依赖和 CLI 入口检查通过。隔离安装后再次核对全部模块，并由新解释器确认实际导入版本为 0.4.0。
+- 发布资产为 `claude_context_continuity-0.4.0-py3-none-any.whl` 和 `SHA256SUMS`，不包含本地缓存、临时探针目录、运行状态或私有回执。源码与资产发布状态以 [v0.4.0 Release](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.4.0) 为准。
+
+wheel SHA256：
+
+```text
+f8fffbe01e8fce25961797bd3e3dcb2cc8bdec1d3bd5209ab933e2b79a46252f
+```
+
 ## 复核与边界
 
 主会话已复核此前各批会话绑定、暂停恢复、输入和工具结算、存档连接、MCP 清理以及中英文说明的适用范围；最新源码候选以其独立验收节为准。
 
 - 上述集成证明原生宿主与 CLI/存档的真实连接，不证明外部模型会自主选择 History 工具，也不等同于真实大上下文模型压力测试。
-- 各次交付分别在上述原生版本核验；本次连续换窗与恢复在 **2.1.278** 实际验证。其他版本仍需适用的兼容性检查，不能只凭版本号声称全部行为已验证。
-- 运行中的已有会话不会因为源码修改而被主动重启、接管或迁移；安装和发布状态须单独报告。
+- 各次交付分别在对应原生版本核验；最新当前合同、连续换窗与控制器恢复在 **2.1.304** 实际验证。其他版本仍需适用的检查，不能只凭版本号声称全部行为已验证。
+- 源码修改不代表安装或常驻进程已更新；每批实际安装、重载和发布范围以对应验收节为准。

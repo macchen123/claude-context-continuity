@@ -171,11 +171,15 @@ class NativeControlTests(unittest.TestCase):
         self.assertEqual(list(self.home.iterdir()), [])
 
     def test_version_and_socket_length_fail_before_starting_an_unsupported_host(self):
-        with patch.object(native_control.subprocess, "run", return_value=Mock(returncode=0, stdout="2.1.266 (Claude Code)")):
-            self.assertEqual(native_control.require_supported_cli(), "2.1.266")
-        with patch.object(native_control.subprocess, "run", return_value=Mock(returncode=0, stdout="2.1.200 (Claude Code)")):
-            with self.assertRaises(native_control.NativeControlError):
-                native_control.require_supported_cli()
+        for version in ("2.1.304", "2.1.305"):
+            with self.subTest(version=version), patch.object(native_control.subprocess, "run",
+                    return_value=Mock(returncode=0, stdout=f"{version} (Claude Code)")):
+                self.assertEqual(native_control.require_supported_cli(), version)
+        for version in ("2.1.200", "2.1.266", "2.1.303"):
+            with self.subTest(version=version), patch.object(native_control.subprocess, "run",
+                    return_value=Mock(returncode=0, stdout=f"{version} (Claude Code)")):
+                with self.assertRaises(native_control.NativeControlError):
+                    native_control.require_supported_cli()
         with patch.object(core, "HOME", Path("/" + "long" * 40)):
             with self.assertRaises(native_control.NativeControlError):
                 native_control.binding(self.context_id)

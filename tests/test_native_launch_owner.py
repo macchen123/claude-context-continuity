@@ -37,6 +37,63 @@ class NativeLaunchOwnerTests(unittest.TestCase):
         config.start()
         self.addCleanup(config.stop)
 
+    def test_unrelated_unsupported_states_do_not_block_current_owner_discovery(self):
+        snapshots = {}
+        for phase in ("paused", "future_phase", None):
+            stale = TuiRuntime.create(cwd=self.cwd, session_id=str(uuid4()), configuration=self.config,
+                                      configuration_reader=lambda _: self.config)
+            state = stale._state()
+            state["phase"] = phase
+            core.atomic(stale.state_path, state)
+            snapshots[stale.state_path] = stale.state_path.read_bytes()
+        before = self.runtime.state_path.read_bytes()
+        with patch.object(tui_runtime, "_health", wraps=tui_runtime._health) as health:
+            owner, state = tui_runtime._live_launch_owner(self.cwd, {self.sid}, False)
+        self.assertEqual(owner.conversation_id, self.runtime.conversation_id)
+        self.assertEqual(state["phase"], "running")
+        self.assertEqual(health.call_count, 1)
+        self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        for path, snapshot in snapshots.items():
+            self.assertEqual(path.read_bytes(), snapshot)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_matching_unsupported_owner_is_never_adopted_or_duplicated(self):
+        initial = self.runtime._state()
+        for phase in ("paused", "future_phase", None):
+            with self.subTest(phase=phase):
+                core.atomic(self.runtime.state_path, {**initial, "phase": phase})
+                before = self.runtime.state_path.read_bytes()
+                with patch.object(tui_runtime, "_create") as native, \
+                        patch.object(tui_runtime, "_health") as health, \
+                        patch.object(tui_runtime.subprocess, "Popen") as controller:
+                    with self.assertRaisesRegex(SessionOwnerError, "不受支持|unsupported"):
+                        tui_runtime.run(self.cwd, detached=True, native_args=["--resume", self.sid])
+                    native.assert_not_called()
+                    health.assert_not_called()
+                    controller.assert_not_called()
+                self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_unsupported_pending_or_uncertain_ownership_remains_reserved(self):
+        initial = self.runtime._state()
+        target = str(uuid4())
+        cases = ({"launch_session_ids": [target]}, {"native_session_uncertain": True}, {})
+        for index, fields in enumerate(cases):
+            with self.subTest(fields=fields):
+                core.atomic(self.runtime.state_path, {**initial, **fields, "phase": "paused"})
+                before = self.runtime.state_path.read_bytes()
+                with patch.object(tui_runtime, "_create") as native, patch.object(tui_runtime, "_health") as health:
+                    with self.assertRaisesRegex(SessionOwnerError, "不受支持|unsupported"):
+                        tui_runtime._live_launch_owner(self.cwd, {target}, index == 2)
+                    native.assert_not_called()
+                    health.assert_not_called()
+                self.assertEqual(self.runtime.state_path.read_bytes(), before)
+        other_cwd = self.root / "other-workspace"
+        other_cwd.mkdir()
+        self.assertIsNone(tui_runtime._live_launch_owner(other_cwd, set(), True))
+
     def test_exact_resume_reuses_owner_without_state_input_or_process_changes(self):
         before = self.runtime.state_path.read_bytes()
         directories = set(self.runtime.directory.parent.iterdir())

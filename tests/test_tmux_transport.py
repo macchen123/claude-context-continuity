@@ -1,6 +1,7 @@
 """tmux transport 的纯本地单元测试；绝不连接或修改真实 tmux server。"""
 from __future__ import annotations
 
+import socket
 import subprocess
 import sys
 import tempfile
@@ -37,7 +38,7 @@ class TmuxTransportTests(unittest.TestCase):
     def _short_socket_path(self, conversation_id: str | None = None) -> Path:
         return self.home / "runtime" / "tmux" / f"{conversation_id or self.conversation_id}.sock"
 
-    def _context_socket_path(self) -> Path:
+    def _obsolete_socket_path(self) -> Path:
         return self.home / "runtime" / "contexts" / self.conversation_id / "tui" / "native.sock"
 
     def _binding(self, path: Path | None = None, *, pane_id: str = "%7") -> dict[str, object]:
@@ -197,18 +198,37 @@ class TmuxTransportTests(unittest.TestCase):
             "#{pane_id}\t#{pane_pid}\t#{pid}\t#{session_name}\t#{pane_current_command}",
         ])
 
-    def test_socket_path_identity_accepts_context_and_short_runtime_forms(self) -> None:
-        short = self._short_socket_path()
-        legacy = self._context_socket_path()
-        self.assertEqual(tmux_transport.attach_argv(self._binding(short)), [
-            "tmux", "-S", str(short), "attach-session", "-t", "continuity",
+    def test_socket_path_accepts_only_the_current_producer_runtime_form(self) -> None:
+        current = self._short_socket_path()
+        self.assertEqual(tmux_transport.attach_argv(self._binding(current)), [
+            "tmux", "-S", str(current), "attach-session", "-t", "continuity",
         ])
-        self.assertEqual(tmux_transport.attach_argv(self._binding(legacy)), [
-            "tmux", "-S", str(legacy), "attach-session", "-t", "continuity",
-        ])
-        wrong = self.root / "not-runtime.sock"
-        with self.assertRaises(tmux_transport.TmuxTransportError):
-            tmux_transport.attach_argv(self._binding(wrong))
+        invalid_paths = (self._obsolete_socket_path(), self.root / "not-runtime.sock",
+                         current.with_name("not-a-uuid.sock"), current.with_suffix(".socket"),
+                         current.parent / self.conversation_id / "native.sock")
+        for path in invalid_paths:
+            existed = path.parent.exists()
+            with self.subTest(path=path), patch.object(tmux_transport.subprocess, "run") as run:
+                for operation in (lambda: tmux_transport.attach_argv(self._binding(path)),
+                                  lambda: tmux_transport.inspect(self._binding(path)),
+                                  lambda: tmux_transport.create(path, self.cwd, ["claude"], {"PATH": "/usr/bin"})):
+                    with self.assertRaises(tmux_transport.TmuxTransportError):
+                        operation()
+                run.assert_not_called()
+                self.assertEqual(path.parent.exists(), existed)
+
+    def test_current_path_binds_a_real_private_socket_for_the_binding_consumer(self) -> None:
+        path = self._prepared_socket_path()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, \
+                patch.object(tmux_transport, "_MAX_MACOS_SOCKET_PATH_BYTES", 103), \
+                patch.object(tmux_transport.subprocess, "run") as run:
+            listener.bind(str(path))
+            self.assertEqual(tmux_transport._context_socket_path(path), path)
+            self.assertEqual(tmux_transport._binding(self._binding(path), require_socket=True), self._binding(path))
+            self.assertEqual(tmux_transport.attach_argv(self._binding(path)), [
+                "tmux", "-S", str(path), "attach-session", "-t", "continuity",
+            ])
+            run.assert_not_called()
 
     def test_socket_path_rejects_symlink_and_macos_length_before_client(self) -> None:
         self.home.mkdir()

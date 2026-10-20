@@ -12,7 +12,7 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from claude_context_continuity import continuity, core, native_control, tmux_transport, tui_runtime
+from claude_context_continuity import continuity, core, native_control, resume_binding, tmux_transport, tui_runtime
 from claude_context_continuity.history import HistorySource
 from claude_context_continuity.notes import NotesStore
 from claude_context_continuity.tui_runtime import TuiRuntime
@@ -30,11 +30,11 @@ class ContinuityCliExitCodeTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), receipt)
         return code
 
-    def test_paused_phase_receipt_returns_nonzero(self):
-        self.assertEqual(self._main_with_receipt({"phase": "paused"}), 2)
+    def test_phase_does_not_double_as_error_status(self):
+        self.assertEqual(self._main_with_receipt({"phase": "paused"}), 0)
 
-    def test_queued_in_progress_receipt_returns_zero(self):
-        self.assertEqual(self._main_with_receipt({"status": "queued", "phase": "in_progress"}), 0)
+    def test_queued_rotation_receipt_returns_zero(self):
+        self.assertEqual(self._main_with_receipt({"status": "queued", "phase": "rotation_requested"}), 0)
 
     def test_paused_status_receipt_returns_nonzero(self):
         self.assertEqual(self._main_with_receipt({"status": "paused"}), 2)
@@ -71,7 +71,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.control_ready = patch.object(native_control, "ready", return_value=True)
         self.control_ready.start()
         self.addCleanup(self.control_ready.stop)
-        version = patch.object(native_control, "require_supported_cli", return_value="2.1.266")
+        version = patch.object(native_control, "require_supported_cli", return_value="2.1.304")
         version.start()
         self.addCleanup(version.stop)
         self.runtime._control_auth = "isolated-test-auth-not-a-real-secret"
@@ -152,7 +152,8 @@ class TuiRuntimeTests(unittest.TestCase):
 
     @staticmethod
     def peer_message(sender, body):
-        envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+        envelope = (f'<cross-session-message from="{sender}" from-name="fixture-peer" from-mode="bypass">\n'
+                    f'{body}\n</cross-session-message>')
         return envelope, ("Another Claude session sent a message:\n" + envelope
                           + "\n<system-reminder>Native host safety footer.</system-reminder>")
 
@@ -172,7 +173,36 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(receipt["phase"], phase)
         self.assertIsInstance(receipt["reconciliation"], dict)
         self.assertTrue(receipt["reconciliation"]["reason"])
-        self.assertIsNone(receipt["pause_reason"])
+        self.assertNotIn("pause_reason", receipt)
+
+    def test_hook_child_identity_uses_only_native_agent_id(self):
+        self.runtime.on_hook(self.hook("SubagentStart", agentId="obsolete-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
+        self.assertEqual(self.runtime.receipt()["phase"], "running")
+        self.runtime.on_hook(self.hook("SubagentStart", agent_id="native-child", agentId="obsolete-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], ["native-child"])
+        self.runtime.on_hook(self.hook("SubagentStop", agentId="native-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], ["native-child"])
+        self.runtime.on_hook(self.hook("SubagentStop", agent_id="native-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
+        self.runtime.on_hook(self.hook("PreToolUse", tool_use_id="current-root-tool", agentId="ignored-extra"))
+        self.assertEqual(self.runtime.receipt()["pending_tool_ids"], ["current-root-tool"])
+        self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="current-root-tool"))
+        self.assertIsNone(self.runtime.receipt()["reconciliation"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_superseded_child_hooks_cannot_settle_from_agentId(self):
+        self.runtime.on_hook(self.hook("SubagentStart", agent_id="inherited-child"))
+        sid, source = self.resume_source(125)
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid,
+                              "cwd": str(self.cwd), "source": "clear", "transcript_path": str(source)})
+        self.runtime.on_hook(self.hook("SubagentStop", agentId="inherited-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], ["inherited-child"])
+        self.runtime.on_hook(self.hook("SubagentStop", agent_id="inherited-child"))
+        self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
 
     def test_idle_boundary_parses_once_and_does_not_rewrite_identical_state(self):
         self.runtime.on_hook(self.hook("Stop"))
@@ -338,7 +368,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
 
     def test_unavailable_native_session_does_not_change_state_or_spawn_on_recovery(self):
-        self.runtime._pause_external("observation failed")
+        self.runtime._wait_external("observation failed")
         before = self.runtime.state_path.read_bytes()
         environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)
         environment["CLAUDE_CONTINUITY_ID"] = self.runtime.conversation_id
@@ -423,7 +453,7 @@ class TuiRuntimeTests(unittest.TestCase):
 
     def test_taskstop_failure_and_duplicate_hook_do_not_clear_new_child(self):
         self.runtime.on_hook(self.hook("SubagentStart", agent_id="current-child"))
-        self.runtime._pause_external("fixture observation pause")
+        self.runtime._wait_external("fixture observation pause")
         fields = {"tool_use_id": "stop-failed", "tool_name": "TaskStop", "tool_input": {"task_id": "current-child"},
                   "tool_response": {"task_id": "current-child", "task_type": "local_agent"}}
         self.runtime.on_hook(self.hook("PreToolUse", **fields))
@@ -844,7 +874,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.send_mock.assert_not_called()
 
     def test_manual_clear_while_paused_restores_observation_without_old_handoff(self):
-        self.runtime._pause_external("observation temporarily unavailable")
+        self.runtime._wait_external("observation temporarily unavailable")
         sid, source = self.resume_source(125)
         result = self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear",
             "session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)})
@@ -872,7 +902,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self._observe_window_usage(515_908, 600_000, reset_budget=True)
         self._observe_window_usage(575_640, 600_000)
         self.assertEqual(self.runtime._state()["usage"]["total_input_and_cache_tokens"], 575_640)
-        self.assertEqual(self.runtime._state()["budget"]["guard_tokens"], 81_536)
+        self.assertEqual(self.runtime._state()["budget"]["guard_tokens"], 150_000)
         old_sid = str(uuid4())
         old_source = self.root / f"{old_sid}.jsonl"
         old_source.write_text("")
@@ -927,18 +957,24 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_paused_input_does_not_treat_pending_bytes_as_tokens(self):
+    def test_waiting_input_ignores_inert_output_budget_without_migration(self):
         self._observe_window_usage(500, 1_000, reset_budget=True)
         self.wait_for_unknown_continuation()
+        inert_projection = {"items": {"pending": {"text_bytes": 999999, "defer": True}},
+                            "total_text_bytes": 999999}
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
-            state["output_budget"] = {"items": {"pending": {"text_bytes": 999999, "defer": True}},
-                                      "total_text_bytes": 999999}
+            state["output_budget"] = inert_projection
             self.runtime._save(state)
         result = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="界界界界"))
         self.assertNotIn("continue", result)
         state = self.runtime._state()
-        self.assertNotIn("output_budget", state)
+        self.assertEqual(state["output_budget"], inert_projection)
+        receipt = self.runtime.receipt()
+        self.assertNotIn("output_budget", receipt)
+        self.assertEqual(receipt["usage"]["total_context_tokens"], 500)
+        self.assertEqual(receipt["usage"]["remaining_context_tokens"], 500)
+        self.assertFalse(receipt["budget_handoff_required"])
         self.assertEqual(state.get("deferred_inputs", []), [])
         self.assert_waiting(state, "awaiting_continuation")
         self.clear_mock.assert_not_called()
@@ -973,20 +1009,49 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_paused_batch_ignores_old_byte_based_defer_flags(self):
+    def test_waiting_batch_ignores_inert_output_budget_without_migration(self):
         self._observe_window_usage(500, 1_000, reset_budget=True)
         self.wait_for_unknown_continuation()
         before_rotation = json.loads(json.dumps(self.runtime._state()["rotation"]))
+        inert_projection = {"items": {"deferred-output": {"defer": True}}, "total_text_bytes": 999999}
         with core.lock(self.runtime.lock_path):
             state = self.runtime._state()
-            state["output_budget"] = {"items": {"deferred-output": {"defer": True}}, "total_text_bytes": 999999}
+            state["output_budget"] = inert_projection
             self.runtime._save(state)
         batch = self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
         self.assertNotIn("continue", batch)
         state = self.runtime._state()
         self.assert_waiting(state, "awaiting_continuation")
         self.assertEqual(state["rotation"], before_rotation)
-        self.assertNotIn("output_budget", state)
+        self.assertEqual(state["output_budget"], inert_projection)
+        receipt = self.runtime.receipt()
+        self.assertNotIn("output_budget", receipt)
+        self.assertEqual(receipt["usage"]["total_context_tokens"], 500)
+        self.assertEqual(receipt["usage"]["remaining_context_tokens"], 500)
+        self.assertFalse(receipt["budget_handoff_required"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_inert_output_budget_survives_clear_and_resume_without_affecting_usage(self):
+        inert_projection = {"items": {"historical-output": {"defer": True}}, "total_text_bytes": 999999}
+        for source_kind in ("clear", "resume"):
+            with self.subTest(source_kind=source_kind):
+                with core.lock(self.runtime.lock_path):
+                    state = self.runtime._state()
+                    state["output_budget"] = inert_projection
+                    self.runtime._save(state)
+                sid, source = self.resume_source(125)
+                self.runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid, "cwd": str(self.cwd),
+                                      "source": source_kind, "transcript_path": str(source)})
+                self.runtime.on_hook({"hook_event_name": "PostToolBatch", "session_id": sid, "cwd": str(self.cwd),
+                                      "transcript_path": str(source), "tool_calls": []})
+                self.assertEqual(self.runtime._state()["output_budget"], inert_projection)
+                receipt = self.runtime.receipt()
+                self.assertNotIn("output_budget", receipt)
+                self.assertEqual(receipt["usage"]["total_context_tokens"], 125)
+                self.assertEqual(receipt["usage"]["remaining_context_tokens"], 875)
+                self.assertFalse(receipt["rotation_pending"])
+                self.assertFalse(receipt["budget_handoff_required"])
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
@@ -1361,6 +1426,42 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime._state()["usage"]["remaining_context_tokens"], 875)
         self.assertNotIn("output_budget", self.runtime._state())
 
+    def test_cross_session_and_renew_alias_deferred_inputs_finish_one_rotation(self):
+        self.threshold()
+        human = HistorySource(self.source, self.sid).latest_instruction()
+        body = "Existing peer result; do not restart completed work."
+        envelope = ('<cross-session-message from="uds:/fixture/peer.sock" '
+                    'from-name="fixture-peer" from-mode="bypass">\n' + body + '\n</cross-session-message>')
+        pending = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))
+        self.assertFalse(pending["continue"])
+        peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
+                "promptSource": "system", "origin": {"kind": "peer", "from": "uds:/fixture/peer.sock",
+                "name": "fixture-peer", "fromMode": "bypass", "body": body},
+                "message": {"role": "user", "content": "Another Claude session sent a message:\n" + envelope}}
+        self.append_records(peer)
+        pending = self.runtime.on_hook(self.hook("UserPromptSubmit", prompt="/renew"))
+        self.assertFalse(pending["continue"])
+        command = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+                   "origin": {"kind": "human"}, "userType": "external", "promptId": str(uuid4()),
+                   "message": {"role": "user", "content": "<command-name>/cclaude:renew</command-name>\n"
+                       "<command-message>cclaude:renew</command-message>\n<command-args></command-args>"}}
+        self.append_records(command)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        next_sid = str(uuid4())
+        next_source = self.root / f"{next_sid}.jsonl"
+        next_source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": next_sid,
+                              "cwd": str(self.cwd), "transcript_path": str(next_source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        text = self.send_mock.call_args.args[2]
+        packet = json.loads(text.split("\n", 1)[1].split("\n", 1)[1])
+        self.assertEqual([item["source_kind"] for item in packet["deferred_inputs"]], ["meta", "local_command"])
+        self.assertEqual(packet["latest_instruction_locator"], human)
+        self.assertNotIn(body, text)
+        self.assertNotIn("/renew", text)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
     def test_wrapped_peer_deferred_input_crosses_clear_with_partial_trailing_append(self):
         self.threshold()
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
@@ -1371,7 +1472,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertFalse(deferred["continue"])
         peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
                 "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
-                "body": body, "senderTaskId": "worker-id"},
+                "name": "fixture-peer", "fromMode": "bypass", "body": body},
                 "message": {"role": "user", "content": persisted}}
         with self.source.open("ab") as handle:
             handle.write(json.dumps(peer, ensure_ascii=False).encode("utf-8") + b"\n")
@@ -1394,6 +1495,28 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_called_once()
         self.send_mock.assert_called_once()
 
+    def test_conflicting_senderTaskId_cannot_bind_a_deferred_peer_envelope(self):
+        self.threshold()
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        body = "A peer result with conflicting structured sender metadata."
+        envelope, persisted = self.peer_message("worker-id", body)
+        self.assertFalse(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))["continue"])
+        peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
+                "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
+                "name": "fixture-peer", "fromMode": "bypass", "body": body, "senderTaskId": "other-worker"},
+                "message": {"role": "user", "content": persisted}}
+        self.append_records(peer)
+        sid = str(uuid4())
+        source = self.root / f"{sid}.jsonl"
+        source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": sid,
+                              "cwd": str(self.cwd), "transcript_path": str(source)})
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_tui_prompt")
+        self.assertIsNone(self.runtime._deferred_input_locators(self.runtime._state()))
+        self.assertEqual(len(self.runtime._state()["deferred_inputs"]), 1)
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_not_called()
+
     def test_identical_deferred_peer_envelopes_bind_distinct_native_records(self):
         self.threshold()
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
@@ -1404,7 +1527,7 @@ class TuiRuntimeTests(unittest.TestCase):
             self.assertFalse(deferred["continue"])
         peers = [{"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
                   "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
-                  "body": body, "senderTaskId": "worker-id"},
+                  "name": "fixture-peer", "fromMode": "bypass", "body": body},
                   "message": {"role": "user", "content": persisted}}
                  for _ in range(2)]
         self.append_records(*peers)
@@ -1762,7 +1885,7 @@ class TuiRuntimeTests(unittest.TestCase):
         frontend.mkdir()
         self.runtime.on_hook(self.hook("PostToolUse", tool_use_id="completed-cd", cwd=str(frontend)))
         self.usage(125, cwd=frontend)
-        self.assertTrue(tui_runtime._owner_workspace_matches(self.runtime._state(), self.cwd))
+        self.assertTrue(resume_binding._owner_workspace_matches(self.runtime._state(), self.cwd))
         for delayed in (False, True):
             with self.subTest(delayed=delayed):
                 runtime, _, _ = self.resume_runtime()
@@ -1857,7 +1980,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.send_mock.assert_called_once()
 
     def test_recovery_reobserves_but_does_not_clear_or_replay(self):
-        self.runtime._pause_external("hook_state_or_source_drift")
+        self.runtime._wait_external("hook_state_or_source_drift")
         before = self.source.read_bytes()
         result = self.runtime.recover_observation(self.sid)
         self.assertEqual(result["phase"], "running")
@@ -1980,7 +2103,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertFalse(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=envelope))["continue"])
         peer = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid, "isMeta": True,
                 "promptSource": "system", "origin": {"kind": "peer", "from": "worker-id",
-                "body": body, "senderTaskId": "worker-id"},
+                "name": "fixture-peer", "fromMode": "bypass", "body": body},
                 "message": {"role": "user", "content": persisted}}
         self.append_records(peer)
         old_peer_locator = HistorySource(self.source, self.sid).locator(peer["uuid"])
@@ -2065,7 +2188,7 @@ class TuiRuntimeTests(unittest.TestCase):
         self.send_mock.assert_not_called()
 
     def test_recovery_without_bound_native_credentials_does_not_start_or_change_state(self):
-        self.runtime._pause_external("hook_state_or_source_drift")
+        self.runtime._wait_external("hook_state_or_source_drift")
         before = self.runtime.state_path.read_bytes()
         environment = {native_control.AUTH_ENV: "", "CLAUDE_CONTINUITY_ID": self.runtime.conversation_id,
                        native_control.SOCKET_ENV: self.runtime._state()["native_control"]["socket_path"]}
@@ -2078,7 +2201,7 @@ class TuiRuntimeTests(unittest.TestCase):
 
     def test_recovery_cli_starts_only_an_unowned_controller(self):
         from claude_context_continuity import continuity
-        self.runtime._pause_external("hook_state_or_source_drift")
+        self.runtime._wait_external("hook_state_or_source_drift")
         args = continuity.parser().parse_args(["tui-recover", "--context-id", self.runtime.conversation_id,
                                                "--session-id", self.sid])
         environment = native_control.environment(self.runtime._state()["native_control"], self.runtime._control_auth)

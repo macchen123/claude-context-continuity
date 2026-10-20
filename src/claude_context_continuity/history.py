@@ -22,11 +22,11 @@ _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CHARS, _MAX_RECORDS = 8_000, 20
 _MAX_UPDATE_RECORDS, _MAX_UPDATE_BYTES = 32, 64 * 1024
 _META = frozenset({"system", "file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "custom-title", "progress", "agent-progress", "session-start", "session-end", "context", "compaction", "hook", "notification", "meta"})
-_STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "cost-state", "pr-link"})
+_STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "cost-state", "pr-link", "agent-name", "api-request-shape", "api-request-blob", "api-request"})
 _META = _META | _STATE_ONLY
 _RUNTIME = ("<system-reminder>", "<task-notification>", "[request interrupted", "<local-command-",
             "<cross-session-message", "<teammate-message", "[cross-session idle notice]",
-            "<agent-message", "another claude session sent a message:", "<continuity-host-event>")
+            "another claude session sent a message:", "<continuity-host-event>")
 _PATH_FIELDS = ("saved_output", "saved_output_path", "persisted_output", "persisted_output_path", "output_path", "output_file", "file_path", "path")
 _ASSIGNMENT = re.compile(r"(?ix)(?P<key>\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|secret|client[_-]?secret|private[_-]?key|token)\b)(?P<sep>\s*(?:=|:)\s*)(?P<value>(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:bearer\s+)?[^\s,;]+))")
 _BEARER = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}")
@@ -149,7 +149,12 @@ def _peer_message_envelope(record: Mapping[str, Any]) -> str | None:
     if (not isinstance(sender, str) or not sender or any(c in sender for c in '<>"\r\n')
             or not isinstance(body, str) or origin.get("senderTaskId") not in (None, sender)):
         return None
-    envelope = f'<agent-message from="{sender}">\n{body}\n</agent-message>'
+    name, mode = origin.get("name"), origin.get("fromMode")
+    if not all(isinstance(value, str) and value and not any(c in value for c in '<>"\r\n')
+               for value in (name, mode)):
+        return None
+    envelope = (f'<cross-session-message from="{sender}" from-name="{name}" '
+                f'from-mode="{mode}">\n{body}\n</cross-session-message>')
     text = _plain_user_text(record)
     if text is None:
         return None
@@ -159,9 +164,23 @@ def _peer_message_envelope(record: Mapping[str, Any]) -> str | None:
             return envelope
         if text.startswith(prefix + "\n"):
             suffix = text[len(prefix):]
-            if "<agent-message" not in suffix and "</agent-message>" not in suffix:
+            if not any(tag in suffix for tag in ("<cross-session-message", "</cross-session-message>")):
                 return envelope
     return None
+
+
+def _renew_prompt_aliases(record: Mapping[str, Any], text: str) -> tuple[str, ...]:
+    """原生把 /renew 展示为插件全名；仅绑定本工具已知的无参数别名。"""
+    origin = record.get("origin")
+    if (not isinstance(origin, dict) or origin.get("kind") != "human"
+            or record.get("promptSource") is not None or record.get("userType") != "external"
+            or not isinstance(record.get("promptId"), str) or not record["promptId"]
+            or record.get("isMeta") or record.get("sourceToolAssistantUUID")):
+        return ()
+    markup = (r"<command-name>/cclaude:renew</command-name>\s*"
+              r"<command-message>cclaude:renew</command-message>\s*"
+              r"<command-args>\s*</command-args>")
+    return ("/renew", "/cclaude:renew") if re.fullmatch(markup, text) else ()
 
 
 def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
@@ -173,7 +192,9 @@ def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
             return ()
         text = "\n".join(_texts(_content(record))).strip()
         envelope = _peer_message_envelope(record)
-        return (text, envelope) if envelope is not None and envelope != text else (text,)
+        if envelope is not None and envelope != text:
+            return text, envelope
+        return (text, *_renew_prompt_aliases(record, text))
     if _task_notice(record) is not None:
         return ("\n".join(_texts(record["attachment"]["prompt"])).strip(),)
     return ()
@@ -258,16 +279,18 @@ def _task_notice(record: Mapping[str, Any]) -> tuple[str, str, str | None] | Non
     """只认原生 task-notification 来源，不采信用户粘贴的同名标签。"""
     if record.get("isSidechain"):
         return None
-    if record.get("type") == "user" and record.get("origin") == {"kind": "task-notification"} and record.get("promptSource") == "system":
+    origin = record.get("origin")
+    if (record.get("type") == "user" and isinstance(origin, dict)
+            and origin.get("kind") == "task-notification" and record.get("promptSource") == "system"):
         content = record.get("message", {}).get("content", "")
     else:
         attachment = record.get("attachment", {})
         if (record.get("type") != "attachment" or not isinstance(attachment, dict)
-                or attachment.get("type") != "queued_command"):
+                or attachment.get("type") != "queued_command"
+                or attachment.get("commandMode") != "task-notification"):
             return None
-        native_origin = attachment.get("origin") == {"kind": "task-notification"}
-        native_mode = attachment.get("commandMode") == "task-notification" and "origin" not in attachment
-        if not (native_origin or native_mode):
+        origin = attachment.get("origin")
+        if not isinstance(origin, dict) or origin.get("kind") != "task-notification":
             return None
         content = attachment.get("prompt", "")
     text = "\n".join(_texts(content)).partition("<task-notification>")[2]
@@ -432,9 +455,8 @@ class HistorySource:
                         deferred_tail = True
                         break
                     data = _decode(raw, start)
-                    # 原生 JSONL 的 sessionId 标识持久会话；session_id 可保留另一层传输身份。
-                    # 只有无原生字段的记录才使用 stream 字段，不能用它覆盖错误的持久身份。
-                    identity = data.get("sessionId", data.get("session_id"))
+                    # 持久会话身份只认原生 sessionId；session_id 是独立的传输元数据。
+                    identity = data.get("sessionId")
                     if ("sessionId" in data or "session_id" in data) and identity != self.session_id:
                         raise HistoryError(f"record at byte {start} belongs to another session")
                     kind = source_kind(data)
@@ -779,6 +801,26 @@ class HistorySource:
     def activity(self) -> dict[str, Any]:
         """从准确原生日志重建未结算工具和后台句柄，不复制业务状态。"""
         return self._activity_from_records(self._records(include_task_notifications=True))
+
+    def agent_launch_names(self) -> dict[str, set[str]]:
+        """Potential native local names, keyed by their original Agent call.
+
+        These are routing evidence only, never user authority or permission to
+        restore an identity. A missing sidecar cannot erase a possible local name.
+        """
+        names: dict[str, set[str]] = {}
+        for info in self._records(defer_incomplete_tail=True):
+            if info.kind != "assistant":
+                continue
+            for block in _blocks(_content(info.data)):
+                if (not isinstance(block, dict) or block.get("type") != "tool_use"
+                        or block.get("name") != "Agent"):
+                    continue
+                request, call = block.get("input"), block.get("id")
+                if (isinstance(request, dict) and isinstance(call, str) and call
+                        and isinstance(name := request.get("name"), str) and name.strip()):
+                    names.setdefault(call, set()).add(name)
+        return names
 
     @staticmethod
     def _activity_from_records(records: list[_Record]) -> dict[str, Any]:

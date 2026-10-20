@@ -571,7 +571,7 @@ def main(argv=None):
                     model.completion_response_id is not None
                     and batch_artifacts["response_sessions"].get(model.completion_response_id) == [state["session_id"]])
             result.update(native_version=state.get("native_cli_version"), phase=state["phase"],
-                          pause_reason=state.get("pause_reason"), diagnostic=state.get("diagnostic"),
+                          reconciliation=state.get("reconciliation"), diagnostic=state.get("diagnostic"),
                           new_session_confirmed=state["session_id"] != initial_sid,
                           switch_before_background_finished=switched_before_finish,
                           background_producer_runs=len(starts), producer_finished=(workspace / "producer.done").exists(),
