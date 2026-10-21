@@ -464,6 +464,26 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(refreshed["refresh"]["parsed_sources"], 1)
             self.assertEqual(index.search([spec], None, source_kinds=("original_user",))["entries"], [])
 
+    def test_native_loop_policy_rebuilds_hidden_command_intent(self) -> None:
+        self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 5)
+        command = self.record("", "loop", "user", "<command-name>/loop</command-name>\n"
+            "<command-message>loop</command-message>\n<command-args>unique loop task</command-args>",
+            userType="external", promptId=str(uuid4()))
+        spec, path, sid = self.source(0, command)
+        previous = HistorySource(path, sid).index_projection()
+        previous["entries"] = []
+        cache = self.work / "native-loop-policy.sqlite"
+        with patch.object(history_index, "_REDACTION_POLICY_VERSION", 4), \
+                patch.object(HistorySource, "index_projection", return_value=previous):
+            with HistoryIndex(cache) as index:
+                self.assertEqual(index.search([spec], "unique loop task")["entries"], [])
+        with HistoryIndex(cache) as index:
+            result = index.search([spec], "unique loop task", source_kinds=("local_command",))
+            self.assertEqual(self.ids(result), ["loop"])
+            self.assertEqual(index.search([spec], None, source_kinds=("original_user",))["entries"], [])
+            self.assertEqual(result["refresh"]["parsed_sources"], 1)
+            self.assertIn("unique loop task", HistorySource(path, sid).read(result["entries"][0]["locator"])["text"])
+
     def test_question_policy_rebuilds_cached_answer_authority(self) -> None:
         self.assertGreaterEqual(history_index._REDACTION_POLICY_VERSION, 3)
         questions = [{"question": "Publish?"}]

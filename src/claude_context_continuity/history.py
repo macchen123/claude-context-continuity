@@ -169,18 +169,20 @@ def _peer_message_envelope(record: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _renew_prompt_aliases(record: Mapping[str, Any], text: str) -> tuple[str, ...]:
-    """原生把 /renew 展示为插件全名；仅绑定本工具已知的无参数别名。"""
+def _native_command_invocation(record: Mapping[str, Any], text: str) -> tuple[str, str] | None:
+    """读取当前原生 slash 封装的精确形态，不改变记录的来源身份。"""
     origin = record.get("origin")
-    if (not isinstance(origin, dict) or origin.get("kind") != "human"
+    if (record.get("type") != "user" or record.get("isSidechain")
+            or (origin is not None and (not isinstance(origin, dict) or origin.get("kind") != "human"))
             or record.get("promptSource") is not None or record.get("userType") != "external"
             or not isinstance(record.get("promptId"), str) or not record["promptId"]
             or record.get("isMeta") or record.get("sourceToolAssistantUUID")):
-        return ()
-    markup = (r"<command-name>/cclaude:renew</command-name>\s*"
-              r"<command-message>cclaude:renew</command-message>\s*"
-              r"<command-args>\s*</command-args>")
-    return ("/renew", "/cclaude:renew") if re.fullmatch(markup, text) else ()
+        return None
+    match = re.fullmatch(
+        r"<command-name>/([\w:./-]+)</command-name>\s*"
+        r"<command-message>\1</command-message>\s*"
+        r"<command-args>([\s\S]*)</command-args>", text)
+    return (match[1], match[2]) if match is not None else None
 
 
 def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
@@ -194,7 +196,13 @@ def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
         envelope = _peer_message_envelope(record)
         if envelope is not None and envelope != text:
             return text, envelope
-        return (text, *_renew_prompt_aliases(record, text))
+        invocation = _native_command_invocation(record, text)
+        if invocation is None:
+            return (text,)
+        name, args = invocation
+        prompt = (f"/{name}" + (" " + args if args else "")).strip()
+        aliases = ("/renew",) if name == "cclaude:renew" and not args.strip() else ()
+        return (text, prompt, *aliases)
     if _task_notice(record) is not None:
         return ("\n".join(_texts(record["attachment"]["prompt"])).strip(),)
     return ()
@@ -589,7 +597,10 @@ class HistorySource:
         elif kind == "meta" and (_peer_message_envelope(info.data) is not None or _task_notice(info.data) is not None):
             content = info.data["attachment"]["prompt"] if info.data.get("type") == "attachment" else _content(info.data)
             text = "\n".join(_texts(content))
-        elif kind in {"meta", "sidechain", "local_command"}:
+        elif kind == "local_command":
+            content = "\n".join(_texts(_content(info.data))).strip()
+            text = content if _native_command_invocation(info.data, content) is not None else ""
+        elif kind in {"meta", "sidechain"}:
             text = ""
         elif kind == "summary" and isinstance(info.data.get("summary"), str):
             text = info.data["summary"]

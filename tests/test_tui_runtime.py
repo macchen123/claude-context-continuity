@@ -1462,6 +1462,62 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_called_once()
         self.send_mock.assert_called_once()
 
+    def test_deferred_loop_inputs_and_task_notice_finish_the_existing_clear_once(self):
+        self.threshold()
+        bounds = HistorySource(self.source, self.sid).instruction_bounds()
+        authorization = {"root_instruction_locator": bounds["first"], "latest_instruction_locator": bounds["last"]}
+        state = self.runtime._state()
+        state["authorization"] = authorization
+        self.runtime._save(state)
+        self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
+        args = "Continue the existing task; retain completed tools and evidence."
+        prompt = "/loop " + args
+        markup = ("<command-name>/loop</command-name>\n<command-message>loop</command-message>\n"
+                  f"<command-args>{args}</command-args>")
+        old_command = {"type": "user", "uuid": str(uuid4()), "sessionId": self.sid,
+                       "userType": "external", "promptId": str(uuid4()),
+                       "turnOrigin": "scheduled", "scheduledTaskId": "fixture-schedule",
+                       "message": {"role": "user", "content": markup}}
+        self.assertFalse(self.runtime.on_hook(self.hook("UserPromptSubmit", prompt=prompt))["continue"])
+        self.append_records(old_command)
+        next_sid = str(uuid4())
+        next_source = self.root / f"{next_sid}.jsonl"
+        next_source.write_bytes(b"")
+        self.runtime.on_hook({"hook_event_name": "SessionStart", "source": "clear", "session_id": next_sid,
+                              "cwd": str(self.cwd), "transcript_path": str(next_source)})
+        new_command = {**old_command, "uuid": str(uuid4()), "sessionId": next_sid, "promptId": str(uuid4())}
+        hook = {"hook_event_name": "UserPromptSubmit", "session_id": next_sid,
+                "cwd": str(self.cwd), "transcript_path": str(next_source)}
+        self.assertFalse(self.runtime.on_hook({**hook, "prompt": prompt})["continue"])
+        with next_source.open("a") as handle:
+            handle.write(json.dumps(new_command) + "\n")
+        notice = ("<task-notification><task-id>finished-worker</task-id><status>completed</status>"
+                  "<summary>Preserved completion</summary></task-notification>")
+        self.assertFalse(self.runtime.on_hook({**hook, "prompt": notice})["continue"])
+        with next_source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": next_sid,
+                "isMeta": True, "promptSource": "system",
+                "origin": {"kind": "task-notification", "producer": "session-task"},
+                "message": {"role": "user", "content": notice}}) + "\n")
+        self.assertEqual(self.runtime.advance()["phase"], "awaiting_continuation")
+        text = self.send_mock.call_args.args[2]
+        packet = json.loads(text.split("\n", 1)[1].split("\n", 1)[1])
+        locators = packet["deferred_inputs"]
+        self.assertEqual([item["source_kind"] for item in locators], ["local_command", "local_command", "meta"])
+        self.assertEqual([item["message_id"] for item in locators[:2]], [old_command["uuid"], new_command["uuid"]])
+        self.assertEqual(packet["latest_instruction_locator"], authorization["latest_instruction_locator"])
+        self.runtime._verify_authorization(self.runtime._state())
+        for locator in locators[:2]:
+            self.assertIn(args, HistorySource(Path(locator["source_path"]), locator["session_id"]).read(locator)["text"])
+        self.runtime.advance()
+        with next_source.open("a") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": str(uuid4()), "sessionId": next_sid,
+                "isMeta": True, "message": {"role": "user", "content": text}}) + "\n")
+        self.assertEqual(self.runtime.advance()["phase"], "running")
+        self.assertEqual(self.runtime._state()["deferred_inputs"], [])
+        self.clear_mock.assert_called_once()
+        self.send_mock.assert_called_once()
+
     def test_wrapped_peer_deferred_input_crosses_clear_with_partial_trailing_append(self):
         self.threshold()
         self.assertEqual(self.runtime.advance()["phase"], "clear_sent")
