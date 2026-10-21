@@ -562,6 +562,36 @@ wheel SHA256：
 f8fffbe01e8fce25961797bd3e3dcb2cc8bdec1d3bd5209ab933e2b79a46252f
 ```
 
+## 2026-10-21 当前 slash 输入定位修复（0.4.1rc1 本地补丁）
+
+真实会话已确认清屏，但一直停在 `awaiting_tui_prompt`／`new_window_history_prefix_pending`。历史本身完整可读；阻塞来自两个原生定时触发的 `/loop` 输入：hook 保存的是准确 slash 文本的 hash，持久记录则使用 `command-name`／`command-message`／`command-args` 封装。原实现只处理 `/renew` 别名，无法为这两条 `/loop` 找到准确 locator；同批任务完成通知能够正常定位。
+
+修复复用同一原生命令解析器，准确保留命令名、参数和字节定位；只从符合当前来源条件的命令记录提供可核对的输入形态，不模糊搜索正文。`local_command` 分类保持不变，精确命令文本可以经脱敏 History／Index 读取；本地 stdout 和不符合来源条件的封装仍隐藏。索引策略提升到 5，以更新此前的空文本投影。
+
+首次候选曾将 `/loop` 提升为 `original_user`。独立复核发现真实记录带有 `turnOrigin:scheduled`，主会话也复现了这会使已有授权 locator 报 `native authorization locator drifted`；因此该候选没有安装。最终修复保持原始来源分类和授权定位，当前通知仍是 `meta`，不把定时触发当作新的人工批准。
+
+- 首轮定向反证为 **5 个失败（含 2 个 subtest）**，准确输入无法绑定和接续受阻均被复现。修正来源处理后，最终完整套件 **422 项、335 个 subtest 通过，11.63 秒**，覆盖已绑定授权、跨清屏的重复命令、通知、缓存重建、脱敏、隐藏 stdout 和单次 clear／handoff。
+- 源码及隔离 wheel 的真实 consumer 均通过：三条输入按 `local_command, local_command, meta` 定位，命令参数可读，原授权校验通过且 locator 不变，当前窗口无越过 deferred 输入的新工作，已有交接可完整生成。检查没有写运行状态。
+- 离线安装 `0.4.1rc1`，18 个模块与已审 wheel 一致。只停止并恢复已核对的目标监测控制器，原生进程、SID、业务任务和已经确认的 clear 保持不变；通过一条真实原生 peer 事件，让目标 hook 使用自身继承的控制能力重建监测，没有提取凭证或伪造 hook。
+- 实际恢复后为 **running／healthy**，`continuation_observed=true`，原有待处理输入已结算。原生日志中恰好有一条对应旧窗口的交接，保留两条 `local_command`、任务通知及本次维护通知；最新人工授权 locator 不变，clear 确认计数仍为 2，没有再次清屏。
+
+本地诊断、首次失败、被撤回候选、复核反例及最终回执保存在 `.cache/loop-binding-20261021/`；实际安装与恢复使用 `rollout-r2/`，不是较早的 `rollout/` 候选。本次未提交、push 或发布，远程发行版仍为 v0.4.0。
+
+## v0.4.1 版本核验
+
+2026-10-21，用户在本地修复和真实恢复验收后授权更新远程。版本由 0.4.1rc1 提升为 **0.4.1**，保持 Claude Code >=2.1.304 的现有兼容边界。
+
+- 与最终已安装的 r2 候选比较，17 个运行模块逐字节相同，`__init__.py` 只改变版本字符串；复用上节 422 项／335 个 subtest 及真实接续恢复证据。
+- 升版本后的包、CLI 与生成 hook 定向检查 **19 项、32 个 subtest 通过，2.78 秒**。
+- 离线构建及隔离安装均通过；wheel CRC、18 模块白名单、源码字节、版本、固定依赖和两个 CLI 入口核验通过。发布资产仅包含 wheel 和 `SHA256SUMS`，不包含本地运行数据。
+- 发行状态见 [v0.4.1 Release](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.4.1)。发布步骤不再次重启已经恢复的用户会话。
+
+wheel SHA256：
+
+```text
+aa99edbbc9881a451c2c1126ccb82efc28a1348ba632ee8cf49dacacb8edadc5
+```
+
 ## 复核与边界
 
 主会话已复核此前各批会话绑定、暂停恢复、输入和工具结算、存档连接、MCP 清理以及中英文说明的适用范围；最新源码候选以其独立验收节为准。

@@ -2,7 +2,11 @@
 
 日期：2026-09-20。
 
-当前发行线（2026-10-21）：**v0.4.0 按 Claude Code 2.1.304 当前合同运行，不再迁移旧运行状态。** 核心实现已通过 417 项及 321 个 subtest、隔离原生换窗和控制器恢复验证，并先以 0.3.4rc1 本地修复完成实际安装验收；v0.4.0 只提升版本元数据，不改变已审运行逻辑。验收见 [原生接续验证记录](native-continuity-fix-validation.md)，远程发行状态以 [v0.4.0 Release](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.4.0) 为准。下文各历史阶段保留其当时的方案与安装／发布边界。
+当前发行线（2026-10-21）：**v0.4.1 按 Claude Code 2.1.304 当前合同运行，修复 slash 输入定位，同时保留命令来源身份和已有授权。** 最终 422 项及 335 个 subtest、真实输入 consumer 和目标监测控制器恢复均已通过；发行状态以 [v0.4.1 Release](https://github.com/macchen123/claude-context-continuity/releases/tag/v0.4.1) 为准。验收见 [原生接续验证记录](native-continuity-fix-validation.md)。下文各历史阶段保留其当时的方案与安装／发布边界。
+
+## 2026-10-21 slash 输入接续修复
+
+该修复先以 `0.4.1rc1` 本地补丁验收，随后纳入 v0.4.1。它修复当前原生 slash 文本与持久命令封装之间的准确定位，尤其是定时触发的 `/loop`。命令参数可以经 History 读取，但 `local_command` 来源和已有人工授权 locator 保持不变；不通过提升来源身份解决绑定问题。422 项及 335 个 subtest、真实 consumer 与目标监测控制器恢复均通过；原交接恰好投递一次，未重复清屏。详见验证记录中的本地补丁与 v0.4.1 版本核验节。
 
 ## 目标与范围
 

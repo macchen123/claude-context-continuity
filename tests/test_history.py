@@ -110,6 +110,60 @@ class HistorySourceTests(unittest.TestCase):
             with self.subTest(variant=variant):
                 self.assertNotIn("/renew", _submitted_prompt_texts(variant))
 
+    def test_native_loop_command_binds_exact_input_without_authority_promotion(self) -> None:
+        from claude_context_continuity.history import _submitted_prompt_texts
+        args = "Continue the existing task.\nPreserve results; do not replay tools."
+        markup = ("<command-name>/loop</command-name>\n"
+                  "  <command-message>loop</command-message>\n"
+                  f"  <command-args>{args}</command-args>")
+        command = self.record("loop-command", "user", markup, userType="external", promptId=str(uuid4()),
+                              turnOrigin="scheduled", scheduledTaskId="fixture-schedule")
+        self.assertIn("/loop " + args, _submitted_prompt_texts(command))
+        self.assertEqual(source_kind(command), "local_command")
+        self.write_records(self.record("human-root", "user", "Existing task."), command)
+        self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
+        self.assertIn(args, self.source().read(self.source().locator("loop-command"))["text"])
+        for origin in (None, {"kind": "human"}):
+            with self.subTest(origin=origin):
+                self.assertIn("/loop " + args, _submitted_prompt_texts({**command, "origin": origin}))
+        variants = [dict(command, promptSource="typed"), dict(command, promptSource="system"),
+                    dict(command, origin={"kind": "peer"}), dict(command, origin={"kind": "task-notification"}),
+                    dict(command, sourceToolAssistantUUID="tool-output"), dict(command, isMeta=True),
+                    dict(command, isSidechain=True), dict(command, promptId=None),
+                    dict(command, userType="internal"),
+                    dict(command, message={"role": "user", "content": markup.replace(
+                        "<command-message>loop", "<command-message>other")})]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertNotIn("/loop " + args, _submitted_prompt_texts(variant))
+                self.assertNotEqual(source_kind(variant), "original_user")
+
+    def test_other_native_slash_commands_bind_without_becoming_human_tasks(self) -> None:
+        from claude_context_continuity.history import _submitted_prompt_texts
+        for name, args in (("clear", ""), ("example:command", "exact  argument\nnext line")):
+            with self.subTest(name=name):
+                markup = (f"<command-name>/{name}</command-name>\n"
+                          f"<command-message>{name}</command-message>\n<command-args>{args}</command-args>")
+                command = self.record("local-command", "user", markup, userType="external", promptId=str(uuid4()))
+                self.assertIn(f"/{name}" + (" " + args if args else ""), _submitted_prompt_texts(command))
+                self.assertEqual(source_kind(command), "local_command")
+                self.write_records(command)
+                self.assertEqual(self.source().read(self.source().locator("local-command"))["text"], markup)
+
+    def test_native_command_visibility_still_redacts_secrets_and_hides_stdout(self) -> None:
+        secret = "fixture-command-credential-never-visible"
+        markup = ("<command-name>/loop</command-name><command-message>loop</command-message>"
+                  f"<command-args>Continue with API_KEY={secret}</command-args>")
+        command = self.record("command", "user", markup, userType="external", promptId=str(uuid4()))
+        stdout = self.record("stdout", "user", f"<local-command-stdout>{secret}</local-command-stdout>",
+                             userType="external", promptId=str(uuid4()))
+        self.write_records(self.record("human-root", "user", "Existing task."), command, stdout)
+        visible = self.source().read(self.source().locator("command"), secrets=(secret,))["text"]
+        self.assertIn("API_KEY=[REDACTED]", visible)
+        self.assertNotIn(secret, visible)
+        self.assertEqual(self.source().read(self.source().locator("stdout"))["text"], "")
+        self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
+
     def test_pr_link_metadata_without_uuid_preserves_history_and_usage(self) -> None:
         original = self.record("user-1", "user", "continue the authorized task")
         assistant = self.record("assistant-1", "assistant", "public result")
