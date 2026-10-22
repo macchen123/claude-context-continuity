@@ -85,6 +85,39 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertEqual(json.loads(second.read_text()), self.metadata)
         self.assertEqual(self.runtime.receipt()["active_child_handles"], [])
 
+    def test_finished_after_clear_preserves_identity_and_current_completion_state(self):
+        before = self.original.read_bytes()
+        self.clear()
+        target = self.sidecar(self.sid)
+        completed = {**self.metadata, "finished": True}
+        target.write_text(json.dumps(completed))
+        target_before = target.read_bytes()
+        modified = target.stat().st_mtime_ns
+        result = self.send()
+        self.assertNotEqual(result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual(target.stat().st_mtime_ns, modified)
+        self.assertEqual(self.original.read_bytes(), before)
+        self.clear()
+        self.assertEqual(json.loads(self.sidecar(self.sid).read_text()), completed)
+        self.assertNotEqual(self.send().get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+    def test_finished_removed_in_current_window_is_not_restored_from_old_window(self):
+        self.original.write_text(json.dumps({**self.metadata, "finished": True}))
+        before = self.original.read_bytes()
+        self.clear()
+        target = self.sidecar(self.sid)
+        target.write_text(json.dumps(self.metadata))
+        target_before = target.read_bytes()
+        modified = target.stat().st_mtime_ns
+        result = self.send()
+        self.assertNotEqual(result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+        self.assertEqual(target.read_bytes(), target_before)
+        self.assertEqual(target.stat().st_mtime_ns, modified)
+        self.assertEqual(self.original.read_bytes(), before)
+        self.clear()
+        self.assertEqual(json.loads(self.sidecar(self.sid).read_text()), self.metadata)
+
     def test_resume_lazily_restores_legacy_missing_sidecar_by_id_and_name(self):
         self.metadata["name"] = "bounded-worker"
         self.original.write_text(json.dumps(self.metadata))
@@ -310,16 +343,17 @@ class AgentMetadataTests(unittest.TestCase):
     def test_unknown_metadata_and_model_conflicts_are_never_overwritten(self):
         self.clear()
         target = self.sidecar(self.sid)
-        for change in ({"agentType": "research-scout"}, {"model": "haiku"},
+        for change in ({"agentType": "research-scout"}, {"model": "haiku"}, {"toolUseId": "other-call"},
                        {"futureNativeField": {"keep": False}}, {"permissionMode": "bypassPermissions"}):
             with self.subTest(change=change):
-                target.write_text(json.dumps({**self.metadata, **change}))
+                target.write_text(json.dumps({**self.metadata, "finished": True, **change}))
                 before = target.read_bytes()
                 self.assertEqual(self.send()["hookSpecificOutput"]["permissionDecision"], "deny")
                 self.assertEqual(target.read_bytes(), before)
 
     def test_stop_marker_is_not_lost_after_migration(self):
         self.clear()
+        self.sidecar(self.sid).write_text(json.dumps({**self.metadata, "finished": True}))
         self.original.write_text(json.dumps({**self.metadata, "stoppedByUser": True}))
         result = self.send()
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")

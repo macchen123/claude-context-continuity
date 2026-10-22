@@ -143,7 +143,7 @@ Native Claude Code reads a subagent's `.meta.json` from the current session when
 cclaude inherits native agent metadata from its catalogued sessions at `SessionStart` and revalidates it before `SendMessage`, the current native resume entry:
 
 - Native role, explicit model, permission/isolation fields, and opaque extension fields are preserved. Agent definitions, global settings, and official binaries are untouched.
-- Both running and completed agents survive multiple context rotations without being restarted or stopped by this repair.
+- Both running and completed agents survive multiple context rotations without being restarted or stopped by this repair. Changes to the native `finished` flag are lifecycle updates, not identity conflicts; an existing current-session value is left untouched.
 - Missing, conflicting, unreadable, or unsafe identity metadata blocks that resume instead of silently choosing a generic agent. Messages to `main` and identifiable non-local peers are unaffected.
 - A narrowly recognized native default-fallback record can be restored from a verified original sidecar only after the agent stops. Source hashes and the previous value are kept in the context's private `agent_metadata/` directory; other identity conflicts are not overwritten.
 - Native `stoppedByUser` markers remain effective. Native fork, model, tool, and current-permission checks still apply; preservation does not grant new authority.

@@ -14,7 +14,7 @@ from .history import HistorySource
 _METADATA_NAME = re.compile(r"agent-([A-Za-z0-9_-]{1,128})\.meta\.json\Z")
 _NATIVE_ID = re.compile(r"a[0-9a-f]{7,64}\Z")
 _MUTABLE = frozenset({"stoppedByUser", "worktreeCleanlyRemoved", "isObserver", "observerStopped",
-                      "observerTaskId", "armingPermissionMode"})
+                      "observerTaskId", "armingPermissionMode", "finished"})
 _FALLBACK_FIELDS = frozenset({"agentType", "spawnDepth", "requestShape", "requestNonInteractive", "stoppedByUser"})
 _UNSPECIFIED_SESSION = object()
 
