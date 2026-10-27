@@ -621,6 +621,8 @@ aa99edbbc9881a451c2c1126ccb82efc28a1348ba632ee8cf49dacacb8edadc5
 
 推送前使用 `pytest tests` 同时收集 unittest 类和函数式测试，结果为 **606 passed、351 subtests passed，15.54 秒，无失败或跳过**，完整输出保存在 `rollout/publish-pytest.log`。此前 437 项是 `unittest discover` 的收集范围，并非全部 pytest 测试。
 
+正式包 **0.4.2** 仅将上述已验收候选的版本元数据由 `0.4.2.dev2` 转正，功能源码没有改变。22 个 wheel 模块与正式源码、隔离安装一致，且除 `__init__.py` 的版本常量外，与已实测候选逐字节相同；包版本与 distribution metadata 同为 `0.4.2`。构建、校验与 `SHA256SUMS` 位于 `rollout/release-0.4.2/`。本会话原先安装的 `0.4.2.dev2` 保留，不为版本标签变化再次中断控制器。
+
 ## 复核与边界
 
 主会话已复核此前各批会话绑定、暂停恢复、输入和工具结算、存档连接、MCP 清理以及中英文说明的适用范围；最新源码候选以其独立验收节为准。
