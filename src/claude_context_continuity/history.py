@@ -788,25 +788,17 @@ class HistorySource:
             if info.kind != "assistant":
                 continue
             message = info.data.get("message", {})
-            usage = message.get("usage")
-            model = message.get("model")
-            if model == "<synthetic>":
-                continue  # 原生宿主生成的状态记录不是模型调用，零用量不能覆盖真实计量。
-            if not isinstance(usage, dict) or not isinstance(model, str) or not model:
-                raise HistoryError("latest native assistant record has no actual model/input usage")
-            names = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-            values = {name: usage.get(name, 0) for name in names}
-            if "input_tokens" not in usage or any(type(value) is not int or value < 0 for value in values.values()):
-                raise HistoryError("latest native input usage is incomplete")
-            output = usage.get("output_tokens", 0)
-            if type(output) is not int or output < 0:
-                raise HistoryError("latest native output usage is invalid")
+            from .native_usage import message_usage
+            try:
+                usage = message_usage(message)
+            except ValueError as exc:
+                raise HistoryError(str(exc)) from exc
+            if usage is None:
+                continue
             request_id = message.get("id")
-            return {"locator": self._locator(info, info.kind), "actual_model": model,
-                    "cwd": info.data.get("cwd"), "usage": values, "total_input_tokens": sum(values.values()),
-                    "output_tokens": output, "timestamp": info.data.get("timestamp"),
-                    "request_id": request_id if isinstance(request_id, str) and request_id else info.message_id,
-                    "cache_fields_complete": all(name in usage for name in names[1:])}
+            return {**usage, "locator": self._locator(info, info.kind),
+                    "cwd": info.data.get("cwd"), "timestamp": info.data.get("timestamp"),
+                    "request_id": request_id if isinstance(request_id, str) and request_id else info.message_id}
         raise HistoryError("no native main-session usage is available")
 
     def activity(self) -> dict[str, Any]:

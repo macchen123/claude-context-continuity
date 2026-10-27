@@ -248,13 +248,6 @@ def _source(path: Any, session_id: str) -> HistorySource:
         raise ContextRuntimeError("hook transcript_path is not this native session history") from exc
 
 
-def _locator_source(locator: dict[str, Any]) -> HistorySource:
-    try:
-        return HistorySource(Path(locator["source_path"]), locator["session_id"])
-    except (KeyError, TypeError, HistoryError) as exc:
-        raise ContextRuntimeError("native instruction locator is invalid") from exc
-
-
 def _safe_note(value: str, label: str) -> str:
     if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_HANDOFF_BYTES:
         raise ContextRuntimeError(f"{label} exceeds its packet-derived bound")
@@ -273,6 +266,10 @@ def context_prompt() -> str:
             "用户也可随时输入 /renew 提前请求带交接的新上下文；手动和自动共用同一安全切换流程。"
             "hook 会提供真实 input+cache 用量、窗口来源和剩余预算。"
             "宿主在工具批次结算后、下一次模型请求前检查预算；后台任务无须全部结束，输入和结果可跨窗口继续处理。"
+            "子代理使用独立预算：提前保存简短产物交接并返回，不调用父会话 context-request。"
+            "主会话收到子代理预算交接后，先核旧执行终态、原始委派、最新限制/取消及现有产物；"
+            "只对未完成且仍获授权的工作，以原角色、模型槽、权限和叶子边界创建新上下文。"
+            "不恢复超限旧历史，不重跑已完成工具。"
             "History/Notes 使用下列现有 CLI，在整个任务期间持续可用；"
             "缺少旧约束、决定或结果位置时查回原记录，不凭交接摘要补猜。"
             "若剩余预算不足以覆盖下一步与交接，主动执行 "
@@ -865,11 +862,19 @@ class ContextRuntime:
             return {}
         name = event.get("hook_event_name")
         agent = event.get("agent_id")
-        # 子代理有独立 transcript；父侧只跟踪其原生生命周期，不混用用量。
-        if agent and name not in {"SubagentStart", "SubagentStop", "PreCompact"}:
-            return {}
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
+            child_result = {}
+            if agent and name != "PreCompact":
+                from . import agent_runtime
+                try:
+                    self._verify_config(state)
+                    child_result = agent_runtime.on_hook(state, event, self.directory)
+                except (OSError, TypeError, ValueError, core.ContinuityError):
+                    child_result = {}
+                if name not in {"SubagentStart", "SubagentStop"}:
+                    self._save(state)
+                    return child_result
             if self._settle_superseded_hook(state, event):
                 self._save(state)
                 return {}

@@ -138,17 +138,23 @@ Since rotating context involves session boundaries, this package includes a ligh
 <a id="agent-compat"></a>
 ## Subagent Identity Across Context Windows
 
-Native Claude Code reads a subagent's `.meta.json` from the current session when resuming it. If a background agent continues across `/clear` while its identity sidecar remains in the old session, a later `SendMessage` can silently fall back to `general-purpose` and lose the original model slot.
+Native Claude Code needs both a subagent's identity (`.meta.json`) and native history (`agent-<id>.jsonl`) in the current session to resume a completed child. Metadata alone can report a preserved role while native `SendMessage` still fails with `No transcript found for agent ID`.
 
-cclaude inherits native agent metadata from its catalogued sessions at `SessionStart` and revalidates it before `SendMessage`, the current native resume entry:
+cclaude establishes both native loader inputs from its catalogued sessions at `SessionStart` and revalidates them before `SendMessage`, the current native resume entry:
 
 - Native role, explicit model, permission/isolation fields, and opaque extension fields are preserved. Agent definitions, global settings, and official binaries are untouched.
-- Both running and completed agents survive multiple context rotations without being restarted or stopped by this repair. Changes to the native `finished` flag are lifecycle updates, not identity conflicts; an existing current-session value is left untouched.
-- Missing, conflicting, unreadable, or unsafe identity metadata blocks that resume instead of silently choosing a generic agent. Messages to `main` and identifiable non-local peers are unaffected.
-- A narrowly recognized native default-fallback record can be restored from a verified original sidecar only after the agent stops. Source hashes and the previous value are kept in the context's private `agent_metadata/` directory; other identity conflicts are not overwritten.
+- Old and new parent sessions share the original native child-history file through an exclusive hard link. Native appends remain visible across repeated rotations; histories are not copied, rewritten or merged, and a parent rotation does not restart a child. A child's own budget can stop it through the handoff below. The current native `finished` lifecycle flag is left untouched.
+- Identity and history-path conflicts block restoration instead of reporting metadata-only success. A new cross-window connection also requires a complete, readable, bounded history. Existing native/current or already linked streams retain native append semantics: a partial last line or large record does not by itself block messaging; identity and child-budget guards still apply. A different existing history is never replaced, even if its current bytes match. Hard-link publication must be supported on the same filesystem; there is no stale-copy fallback. Messages to `main` and identifiable non-local peers are unaffected.
+- A narrowly recognized native default-fallback record can be restored from a verified original sidecar only after the agent stops. Identity repair evidence is kept in the context's private `agent_metadata/` directory; native-history publication evidence is in `agent_history/`. Other identity conflicts are not overwritten.
 - Native `stoppedByUser` markers remain effective. Native fork, model, tool, and current-permission checks still apply; preservation does not grant new authority.
 
 Inspect `agent_metadata_compat` with `claude-context tui-status --context-id "$CLAUDE_CONTINUITY_ID"`. Investigate a blocked restore rather than changing the role or repeatedly resending to bypass it.
+
+Each child reads input, cache and output usage from its own native transcript, never from its parent. Without an observed child window, the configured ceiling is an estimate with a 25% reserve. Missing usage and windows remain unknown; file bytes are not token counts.
+
+At the reserve boundary, native `PostToolBatch` stops the next request after direct tools settle and records a handoff in the runtime context's `agent-budgets/<agent_id>.json`. The parent verifies native terminal state, original delegation, latest cancellations/restrictions and existing artifacts before starting a fresh agent with the same role, model slot, permissions and leaf boundary for unfinished, still-authorized work only. Completed work is delivered; background side effects are not restarted. This is not an in-place child `/clear` and does not use compact. `SendMessage` rejects histories already at the budget or containing a native context-length failure, including agents created before the upgrade.
+
+The runtime context's `events.jsonl` records parent/child identities, usage/window sources, budget decisions and error origin. It retains the current file plus three backups, each at most 64 KiB, without prompts, tool bodies or credentials. `request_sent: null` means there is no send evidence; it does not establish whether CPA or an upstream service received the request. Diagnostic write failures never block tools.
 
 ---
 

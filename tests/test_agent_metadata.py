@@ -18,7 +18,9 @@ from claude_context_continuity.tui_runtime import TuiRuntime
 
 class AgentMetadataTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="agent-metadata-", dir=Path(__file__).parent)
+        scratch = ROOT / ".cache" / "tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="agent-metadata-", dir=scratch)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.cwd = self.root / "workspace"
@@ -44,6 +46,11 @@ class AgentMetadataTests(unittest.TestCase):
         self.original = self.sidecar(self.sid)
         self.original.parent.mkdir(parents=True)
         self.original.write_text(json.dumps(self.metadata))
+        self.original.with_name(f"agent-{self.agent}.jsonl").write_text(json.dumps({
+            "type": "assistant", "sessionId": self.sid, "agentId": self.agent, "isSidechain": True,
+            "uuid": str(uuid4()), "message": {"role": "assistant", "content": [{"type": "text", "text": "fixture"}],
+            "model": "opus", "usage": {"input_tokens": 1, "output_tokens": 1,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}) + "\n")
 
     def sidecar(self, sid, agent=None):
         return self.root / sid / "subagents" / f"agent-{agent or self.agent}.meta.json"
@@ -61,6 +68,72 @@ class AgentMetadataTests(unittest.TestCase):
     def send(self, to=None):
         return self.runtime.on_hook(self.event("PreToolUse", tool_name="SendMessage", tool_use_id=str(uuid4()),
             tool_input={"to": to or self.agent, "message": "Continue the existing bounded task."}))
+
+    def test_native_current_and_established_streams_remain_sendable_during_append(self):
+        transcript = self.original.with_name(f"agent-{self.agent}.jsonl")
+        valid = transcript.read_bytes()
+        large = (json.dumps({"type": "user", "sessionId": self.sid, "agentId": self.agent,
+                             "isSidechain": True, "message": {"role": "user", "content": "x" * (8 * 1024 * 1024)}})
+                 + "\n").encode()
+        for rotated in (False, True):
+            if rotated:
+                transcript.write_bytes(valid)
+                self.clear()
+            for tail in (b'{"type":', large):
+                with self.subTest(rotated=rotated, tail_bytes=len(tail)):
+                    transcript.write_bytes(valid + tail)
+                    self.assertNotEqual(self.send().get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+    def test_live_append_cannot_bypass_known_child_budget_denial(self):
+        transcript = self.original.with_name(f"agent-{self.agent}.jsonl")
+        row = json.loads(transcript.read_bytes())
+        row["message"]["usage"]["input_tokens"] = 900
+        valid = (json.dumps(row) + "\n").encode()
+        transcript.write_bytes(valid)
+        self.assertIn("超限子代理", self.send()["hookSpecificOutput"]["permissionDecisionReason"])
+        large = (json.dumps({"type": "user", "sessionId": self.sid, "agentId": self.agent,
+                             "isSidechain": True, "message": {"role": "user", "content": "x" * (8 * 1024 * 1024)}})
+                 + "\n").encode()
+        for tail in (b'{"type":', large):
+            with self.subTest(tail_bytes=len(tail)):
+                transcript.write_bytes(valid + tail)
+                guard = self.send()["hookSpecificOutput"]
+                self.assertEqual(guard["permissionDecision"], "deny")
+                self.assertIn("超限子代理", guard["permissionDecisionReason"])
+
+    def test_current_native_foreign_history_is_still_denied(self):
+        transcript = self.original.with_name(f"agent-{self.agent}.jsonl")
+        row = json.loads(transcript.read_bytes())
+        row["agentId"] = "a99999999"
+        transcript.write_text(json.dumps(row) + "\n")
+        guard = self.send()["hookSpecificOutput"]
+        self.assertEqual(guard["permissionDecision"], "deny")
+        self.assertIn("agent_history_identity_mismatch", guard["permissionDecisionReason"])
+
+    def test_missing_history_never_reports_metadata_only_resume_ready(self):
+        self.original.with_name(f"agent-{self.agent}.jsonl").unlink()
+        self.clear()
+        self.assertTrue(self.sidecar(self.sid).exists())
+        compatibility = self.runtime._state()["agent_metadata_compat"]
+        self.assertEqual(compatibility["status"], "blocked")
+        guard = self.send()["hookSpecificOutput"]
+        self.assertEqual(guard["permissionDecision"], "deny")
+        self.assertIn("original_agent_history_missing", guard["permissionDecisionReason"])
+
+    def test_shared_history_mixed_parent_sessions_cannot_bypass_child_budget(self):
+        self.clear()
+        transcript = self.sidecar(self.sid).with_name(f"agent-{self.agent}.jsonl")
+        with transcript.open("a") as stream:
+            stream.write(json.dumps({"type": "assistant", "sessionId": self.sid, "agentId": self.agent,
+                "isSidechain": True, "uuid": str(uuid4()), "message": {"role": "assistant", "model": "opus",
+                "id": "oversized-after-native-resume", "content": [{"type": "text", "text": "synthetic continuation"}],
+                "usage": {"input_tokens": 900, "output_tokens": 1,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}) + "\n")
+        guard = self.send()["hookSpecificOutput"]
+        self.assertEqual(guard["permissionDecision"], "deny")
+        self.assertIn("超限子代理", guard["permissionDecisionReason"])
+        self.clear()
+        self.assertIn("超限子代理", self.send()["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_clear_preserves_active_custom_role_model_and_opaque_fields(self):
         self.runtime.on_hook(self.event("SubagentStart", agent_id=self.agent, agent_type="implementation-worker"))

@@ -9,6 +9,7 @@ import re
 import stat
 
 from . import core, native_addressing
+from .agent_history import AgentHistoryError, establish
 from .history import HistorySource
 
 _METADATA_NAME = re.compile(r"agent-([A-Za-z0-9_-]{1,128})\.meta\.json\Z")
@@ -148,6 +149,7 @@ def _inventory(sources):
                 safe = core.safe_path(project, path, exists=True)
                 record = _snapshot(safe)
                 record["relative"] = path.relative_to(directory)
+                record["project"] = project
                 records.setdefault(agent, []).append(record)
             except (ValueError, OSError, TypeError) as error:
                 faults[agent] = type(error).__name__
@@ -262,8 +264,8 @@ def failure_hook(event, reason="agent_metadata_unavailable"):
     if recipient(event) is None:
         return {}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-        "permissionDecisionReason": "cclaude 无法保持原子代理身份，已阻止本次恢复，避免退回 general-purpose。"
-                                    f"原因：{reason}。不要重发或改角色绕过；先核对原生 metadata。"}}
+        "permissionDecisionReason": "cclaude 无法确认原子代理身份与原生历史可安全恢复，已阻止本次恢复。"
+                                    f"原因：{reason}。不要重发或改角色绕过；先核对原生 metadata、历史与发布回执。"}}
 
 
 def stopped_handles(state, entries):
@@ -327,10 +329,21 @@ def synchronize(state, entries, directory, *, to=None, session_id=_UNSPECIFIED_S
             if agent in faults:
                 raise MetadataError("unreadable_agent_metadata")
             outcome = _restore(agent, records[agent], target, state, directory)
-            if to is not None and outcome.get("stopped_by_user"):
-                outcome = {"status": "blocked", "agent_id": agent, "reason": "agent_stopped_by_user"}
+            if outcome["status"] == "blocked":
+                outcomes.append(outcome)
+                continue
+            outcome["tool_use_id"] = _origin(records[agent])[1].get("toolUseId")
+            if outcome.get("stopped_by_user"):
+                if to is not None:
+                    outcome = {"status": "blocked", "agent_id": agent, "reason": "agent_stopped_by_user"}
+            else:
+                sessions = {entry["session_id"] for entry in entries} | {state["session_id"]}
+                outcome["history"] = establish(agent, records[agent], target, sessions, directory)
+                outcome["history_session_ids"] = sorted(sessions)
+                outcome["transcript_sources"] = [{"source_path": outcome["history"]["path"],
+                                                  "session_id": state["session_id"]}]
         except (ValueError, OSError, TypeError) as error:
-            reason = str(error) if isinstance(error, MetadataError) else type(error).__name__
+            reason = str(error) if isinstance(error, (MetadataError, AgentHistoryError)) else type(error).__name__
             outcome = {"status": "blocked", "agent_id": agent, "reason": reason}
         outcomes.append(outcome)
     blocked = [row for row in outcomes if row["status"] == "blocked"]

@@ -20,7 +20,12 @@ from claude_context_continuity import core, tmux_transport
 
 class TmuxTransportTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory(dir=TESTS_ROOT)
+        # One real AF_UNIX bind needs a short address on macOS. All other
+        # scratch stays in the repository cache; only our fresh fixture is removed.
+        real_bind = self._testMethodName == "test_current_path_binds_a_real_private_socket_for_the_binding_consumer"
+        scratch = Path.home() / ".cache" if real_bind else TESTS_ROOT.parent / ".cache" / "tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="cct-" if real_bind else "tmux-", dir=scratch)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.home = self.root / "global"

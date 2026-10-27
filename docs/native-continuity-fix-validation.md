@@ -592,6 +592,35 @@ wheel SHA256：
 aa99edbbc9881a451c2c1126ccb82efc28a1348ba632ee8cf49dacacb8edadc5
 ```
 
+## 2026-10-27 子代理历史到原生恢复入口的连接修复（0.4.2.dev2 已本地安装）
+
+本轮确认的缺口不是消息路由：旧实现只在新父会话发布 `.meta.json`，却没有把 `agent-<id>.jsonl` 放到原生 loader 会读取的位置，因此身份验证通过后，真实 `SendMessage` 仍会报 `No transcript found for agent ID`。早期仅检查 hook 不拒绝的测试不构成原生恢复成功证据。
+
+现在由 `agent_history.py` 负责唯一的历史可用性发布，沿用已登记的原生来源、路径安全和身份门禁：验证完整、稳定的 native JSONL 后，排他创建指向原始历史 inode 的硬链接。当前父会话中的原生 loader 因而能读取原历史，活动子代理后续的原生追加也在各父会话中保持可见。没有复制快照、拼接分叉、改写历史、替代 executor、SDK/provider 路由或官方二进制补丁。不同 inode 的历史即使当前内容相同也拒绝合并；首次发布所需的历史缺失、半条记录、外来身份、symlink、源变化、并发目标和不支持的跨文件系统链接均 fail closed，不覆盖现场。已在当前原生位置或已建立硬链接的流只核对路径、文件类型和 inode 关系，不再为每次消息要求稳定快照；活动 writer 的末尾半条记录或单条超过 8 MiB 的合法记录沿用原生／预算 consumer 的容忍语义。预算 consumer 确认的外来身份仍拒绝发送，已知超限状态也不会因半写入或大记录被清除。`stoppedByUser` 与子代理超限拒绝恢复仍先于发送生效；合法跨父会话的同一历史按登记 session 集合核对，不把父会话预算当子代理预算。
+
+验收范围与结果：
+
+- `tests/native_agent_resume_probe.py` 复用既有 localhost `_handler` 和隔离环境，使用私有 PTY 执行真实 Claude Code **2.1.304**、真实 hooks、工具、`/clear` 和 `SendMessage`。profile、历史及 receipt 全在仓库 `.cache/`；不用活动用户 profile。PTY 避免仓库绝对路径超过 macOS 控制 socket 限制，没有增加生产执行路线。
+- 已完成子代理场景 **通过，13.101 秒**：同窗恢复及两次真实 `/clear` 后均由原生恢复同一 agent ID；三个原生会话引用同一历史 inode，原始 prompt、原始工具结果及新消息到达子代理请求，producer 恰好执行一次。父会话使用 Opus、子代理使用独立 Sonnet 槽；实际子请求模型在各次恢复间一致，没有回落父模型。原生身份 profile 一致，CLI 维持 `default` 权限模式。该次证据属于初版候选；之后的 stop 短路与活动流修正均以下述最终重验为准。
+- 主会话复核修正后再跑活动子代理跨窗场景 **通过，12.403 秒**：第一次 clear 恢复已完成子代理；第二次 clear 时该子代理的真实 Bash 仍在运行，之后原执行继续、结果保留，再成功处理同 ID 的消息。两次 clear、三条历史路径、同一 inode、原身份及模型槽、完整历史和 producer 单次副作用均通过。测试原生 CLI 由 `/exit` 正常退出，无遗留进程；未调用付费或外部模型。
+- `unittest discover` 套件 **437 项全部通过，13.586 秒，无跳过**。初版 431 项中的唯一环境错误是 `test_tmux_transport.test_current_path_binds_a_real_private_socket_for_the_binding_consumer` 的 fixture 绝对路径超过 macOS `AF_UNIX` 限制；主会话批准后，仅为该项真实 socket 测试使用 `~/.cache/cct-*` 短私有临时目录，并只清理该测试生成的 fixture，其余 scratch 仍在仓库 `.cache/`。真实 `bind`、103 字节上限、原 consumer 校验均保留，没有改生产路径或放宽／跳过断言。定向 **71 项 agent 检查及 11 项 tmux 检查通过**，包括同窗／已建立连接下的半条追加和 >8 MiB 记录、首次发布仍拒绝坏／外来历史、当前流外来身份拒绝，以及已知子代理超限不可绕过。
+- 主会话复核指出初版对已有流仍执行发布快照校验，会误拒绝合法活动追加；补充回归先复现 **8 个 subtest 失败**，日志为 `review-live-stream-first.log`，修正后全部通过。首次全量 socket 路径错误及此前所有失败均保持原样。
+- 首次 native fixture 失败来自继承的 `CLAUDE_CODE_CHILD_SESSION` 禁止持久化，以及把嵌套工具参数误当子代理文本；第二轮发现后台完成通知可合法产生额外父请求。另一个 fixture 断言错误是假定 `sonnet` 必定解析为固定版本；最终核对真实解析模型在恢复前后一致且不同于父模型，不自行规定原生别名映射。单测首次失败来自测试 patch 了共享 `os.link`、误伤 receipt 的排他发布；已限定为历史目标后重验。所有首次失败及原因保留。
+
+清理已核对完整生产模块、CLI 入口和测试引用：删除唯一无任何引用的 `context_runtime._locator_source`；删除 metadata 模块中只给预算收集路径、却不建立 native availability 的旧循环，改由新唯一发布结果提供预算来源。没有删除仍工作的身份回退保护、预算／诊断／native usage、新增未跟踪模块、历史证据或用户运行数据。此前已退役的 `Agent.resume`／`Task.resume`、旧阶段和旧 socket 路由未恢复。
+
+源码候选与恢复索引在 `.cache/subagent-resume-repair-20261027/WORKING.json`；完整套件日志为 `review-full-final.log`，最终源码 native receipt 为 `native-23b8e7f2/receipt.json`，初版已完成场景 receipt 为 `native-2f3c95ec/receipt.json`。首次失败记录继续保留。
+
+主会话完成复核及本地安装：
+
+- 使用 `--no-index --no-deps --no-build-isolation` 构建 `claude_context_continuity-0.4.2.dev2-py3-none-any.whl`；22 个模块与已审源码、wheel 及隔离安装逐字节一致。
+- 从隔离安装的 wheel 再执行原有原生探针，**通过，13.164 秒**，同样覆盖两次真实 `/clear`、完成／活动子代理、原 ID／历史／模型槽和 producer 单次执行。原生 CLI 为 2.1.304，模型响应由 localhost 脚本提供。
+- 本地 `aether` 环境已安装 **0.4.2.dev2**；只停止本会话确切的旧 cclaude 控制器，再通过既有 `tui-recover` 启动新版。独立 `tui-status` 显示新版控制器为 **healthy / running**，原生 Claude 进程与会话保持不变，无待完成的 clear 或 rotation。其他会话控制器未重启。
+
+构建、安装及健康证据集中在同任务的 `rollout/`：`main-review.json`、`wheel-verification.json`、`wheel-native.log`、`activation.json`、`health-after.json`；准确回退 wheel 与独立健康命令见 `rollout/RECOVERY.md`。本轮原生测试未调用付费外部模型。
+
+推送前使用 `pytest tests` 同时收集 unittest 类和函数式测试，结果为 **606 passed、351 subtests passed，15.54 秒，无失败或跳过**，完整输出保存在 `rollout/publish-pytest.log`。此前 437 项是 `unittest discover` 的收集范围，并非全部 pytest 测试。
+
 ## 复核与边界
 
 主会话已复核此前各批会话绑定、暂停恢复、输入和工具结算、存档连接、MCP 清理以及中英文说明的适用范围；最新源码候选以其独立验收节为准。

@@ -138,17 +138,23 @@ cclaude
 <a id="agent-compat"></a>
 ## 子代理跨窗口恢复
 
-原生 Claude Code 的恢复路径会在当前 session 中读取子代理的 `.meta.json`。后台代理跨 `/clear` 继续运行时，角色 sidecar 可能仍留在旧 session；之后用 `SendMessage` 恢复，会静默退回 `general-purpose`，连原模型槽位也可能丢失。
+原生 Claude Code 恢复已完成的子代理时，需要在当前 session 中同时找到身份记录（`.meta.json`）和原生历史（`agent-<id>.jsonl`）。只恢复 metadata，即使角色验证通过，原生 `SendMessage` 仍会报 `No transcript found for agent ID`。
 
-cclaude 在原生 `SessionStart` 继承已登记会话的子代理 metadata，并在当前原生恢复入口 `SendMessage` 执行前再次验证：
+cclaude 在原生 `SessionStart` 从已登记会话中建立这两项恢复输入，并在当前原生恢复入口 `SendMessage` 执行前再次验证：
 
-- 保留原生角色、显式模型选择、权限／隔离字段及未知扩展字段；不改agent定义、全局设置或官方二进制。
-- 活动和已完成的代理都可跨多次换窗恢复；不会因此重启或停止它们。原生`finished`标记的变化属于生命周期更新，不视为身份冲突，也不覆盖当前会话中的已有状态。
-- 原始metadata缺失、冲突、不可读或路径不安全时，拒绝该次恢复，绝不静默换成通用代理。发往`main`与可确认的非本地peer地址不受影响。
-- 对能够由原始sidecar严格确认的原生默认回退，可在该代理停止后恢复身份；修改前的值和来源hash保存在当前context的`agent_metadata/`中。其它身份冲突不覆盖。
+- 保留原生角色、显式模型选择、权限／隔离字段及未知扩展字段；不改 agent 定义、全局设置或官方二进制。
+- 通过排他创建的硬链接，让新旧父会话共用原始子代理历史文件；原生进程后续追加的记录在多次换窗后仍可见，不复制、改写或合并历史，也不因父会话换窗重启子代理。子代理自身预算达到预留区时按下述交接流程停止。当前原生 `finished` 生命周期状态保持不变。
+- 身份或历史路径冲突时拒绝恢复，不再把 metadata 单独通过当作恢复就绪。首次建立跨窗连接还须有完整、可读且大小受控的历史；当前原生流或已建立连接的流保持原生追加语义，不因末尾半条记录或单条大记录就阻止消息，但身份及子代理预算门禁仍然有效。已有的不同历史即使当前内容相同也不覆盖；硬链接须由同一文件系统支持，不回退为会过时的副本。发往 `main` 与可确认的非本地 peer 地址不受影响。
+- 对能够由原始 sidecar 严格确认的原生默认回退，可在该代理停止后恢复身份；身份修复证据保存在当前 context 的 `agent_metadata/`，原生历史发布证据保存在 `agent_history/`。其它身份冲突不覆盖。
 - 原生`stoppedByUser`标记不会因复制而消失；fork、模型、工具和当前权限仍由原生宿主继续校验，不提供新授权。
 
 用`claude-context tui-status --context-id "$CLAUDE_CONTINUITY_ID"`查看`agent_metadata_compat`。拒绝恢复时先排查其原因，不通过改角色或反复重发绕过检查。
+
+子代理分别读取自身原生 transcript 的 input、cache 与 output 用量，不使用父会话的用量或窗口观测。没有子代理窗口观测时，配置值只是带 25% 预留的估计上限；缺失用量和窗口保持未知，不从文件大小推算 token。
+
+进入预留区后，原生 `PostToolBatch` 在直接工具结算后阻止下一次模型请求，交接保存到当前 runtime context 的 `agent-budgets/<agent_id>.json`。主会话核对原生终态、原始委派、最新取消/限制和已有产物后，只对未完成且仍获授权的工作，以相同角色、模型槽、权限和叶子边界创建新代理。已完成任务直接交付；后台副作用不重启。这不是在原 agent 上执行 `/clear`，也不使用 compact。`SendMessage` 会拦截已达预算或已有原生超长错误的旧历史，包括升级前产生的代理。
+
+当前 runtime context 的 `events.jsonl` 记录主/子会话关联、用量和窗口来源、预算决定及错误来源；保留当前文件和三个轮转备份，每个最多 64 KiB。日志不包含 prompt、工具正文或凭证。`request_sent: null` 表示没有发送证据，不能据此判定请求到达 CPA 或上游。诊断写入失败不阻断工具执行。
 
 ---
 
