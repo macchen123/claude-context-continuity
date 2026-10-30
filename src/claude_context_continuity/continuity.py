@@ -43,6 +43,8 @@ def parser():
     search.add_argument("--recent-first", action="store_true")
     search.add_argument("--cursor", help="沿用相同范围、查询、过滤和顺序的下一页游标")
     search.add_argument("--page-size", type=int, default=10)
+    peers = sub.add_parser("peer-lineage", help="只读查询原生 peer 与既有连续会话历史的关联，不提供授权")
+    peers.add_argument("--session-id", help="在完整已验证目录中查找旧或当前原生 Session ID")
     windows = sub.add_parser("history-windows", help="列举当前连续会话的历史窗口")
     windows.add_argument("--context-id", default=os.environ.get("CLAUDE_CONTINUITY_ID"))
     windows.add_argument("--offset", type=int, default=0)
@@ -164,6 +166,9 @@ def dispatch_history_search(args):
 
 
 def dispatch(args):
+    if args.action == "peer-lineage":
+        from .peer_lineage import peer_lineage
+        return peer_lineage(args.session_id)
     if args.action == "cron-compat":
         from . import durable_cron
         from .tui_runtime import TuiRuntime

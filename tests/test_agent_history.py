@@ -119,6 +119,170 @@ class AgentHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divergent_agent_histories"):
             self.establish(records=[self.record, second])
 
+    def fragment(self, *, parent=None, competing=False):
+        root, bridge, end = str(uuid4()), str(uuid4()), str(uuid4())
+        def row(kind, uid, previous, text):
+            return (json.dumps({"type": kind, "uuid": uid, "parentUuid": previous,
+                "agentId": self.agent, "sessionId": self.old, "isSidechain": True,
+                "message": {"role": kind, "content": text}}) + "\n").encode()
+        original = row("user", root, None, "original prompt") + row("assistant", bridge, root, "original tool result")
+        if competing:
+            original += row("user", str(uuid4()), bridge, "competing branch")
+        suffix = row("attachment", str(uuid4()), parent or bridge, "native attachment")
+        suffix += row("user", end, parent or bridge, "resume message")
+        self.source.write_bytes(original)
+        self.target.mkdir(parents=True, exist_ok=True)
+        self.destination.write_bytes(suffix)
+        second = {**self.record, "path": self.target / self.relative}
+        return [self.record, second], original, suffix
+
+    def test_native_fragments_publish_complete_history_and_preserve_originals(self):
+        records, original, suffix = self.fragment()
+        old_identity = self.destination.stat().st_ino
+        result = self.establish(records=records)
+        self.assertEqual(result["status"], "reconstructed")
+        self.assertEqual(self.destination.read_bytes(), original + suffix)
+        self.assertEqual(self.source.read_bytes(), original)
+        receipt = core.read_json(result["receipt"])
+        self.assertEqual([Path(row["preserved_path"]).read_bytes() for row in receipt["sources"]], [original, suffix])
+        self.assertNotEqual(self.destination.stat().st_ino, old_identity)
+        before = self.destination.stat()
+        self.assertEqual(self.establish(records=records)["status"], "available")
+        self.assertEqual(self.destination.stat(), before)
+        # The repaired stream is native-writer-owned, even while appending a partial/large record.
+        for tail in (b'{"type":', self.row(text="x" * (agent_history._MAX_LINE + 1))):
+            self.destination.write_bytes(original + suffix + tail)
+            self.assertEqual(self.establish(records=records)["status"], "available")
+
+    def test_contained_suffix_does_not_hide_missing_predecessor(self):
+        rows = [json.loads(self.row()), json.loads(self.row())]
+        rows[0]["parentUuid"] = str(uuid4())
+        rows[1]["parentUuid"] = rows[0]["uuid"]
+        original = b"".join((json.dumps(row) + "\n").encode() for row in rows)
+        suffix = (json.dumps(rows[1]) + "\n").encode()
+        self.source.write_bytes(original)
+        self.target.mkdir(parents=True)
+        self.destination.write_bytes(suffix)
+        second = {**self.record, "path": self.target / self.relative}
+        before = self.destination.stat()
+        with self.assertRaisesRegex(ValueError, "missing_agent_history_predecessor"):
+            self.establish(records=[self.record, second])
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(self.destination.read_bytes(), suffix)
+        self.assertEqual(self.destination.stat(), before)
+
+    def test_missing_predecessor_and_competing_branch_do_not_publish(self):
+        for missing, competing in ((True, False), (False, True)):
+            with self.subTest(missing=missing, competing=competing):
+                records, original, suffix = self.fragment(parent=str(uuid4()) if missing else None, competing=competing)
+                before = self.destination.stat()
+                with self.assertRaisesRegex(ValueError, "missing_agent_history_predecessor|divergent_agent_histories"):
+                    self.establish(records=records)
+                self.assertEqual(self.source.read_bytes(), original)
+                self.assertEqual(self.destination.read_bytes(), suffix)
+                self.assertEqual(self.destination.stat(), before)
+
+    def test_fragment_recovery_survives_another_rotation(self):
+        records, original, suffix = self.fragment()
+        complete = self.establish(records=records)
+        third = str(uuid4())
+        self.target = self.project / third / "subagents"
+        self.destination = self.target / self.source.name
+        result = self.establish(records=records, sid=third)
+        self.assertTrue(os.path.samefile(complete["path"], result["path"]))
+        self.assertEqual(self.destination.read_bytes(), original + suffix)
+
+    def test_current_suffix_alias_is_replaced_without_changing_earlier_suffix(self):
+        records, original, suffix = self.fragment()
+        suffix_path = self.destination
+        third = str(uuid4())
+        self.target = self.project / third / "subagents"
+        self.target.mkdir(parents=True)
+        self.destination = self.target / self.source.name
+        os.link(suffix_path, self.destination)
+        current_record = {**self.record, "path": self.target / self.relative}
+        result = self.establish(records=[*records, current_record], sid=third)
+        self.assertEqual(result["status"], "reconstructed")
+        self.assertEqual(self.destination.read_bytes(), original + suffix)
+        self.assertEqual(suffix_path.read_bytes(), suffix)
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertFalse(os.path.samefile(suffix_path, self.destination))
+        with self.destination.open("ab") as stream:
+            stream.write(b'{"type":')
+        self.assertEqual(self.establish(records=[*records, current_record], sid=third)["status"], "available")
+
+    def test_fragment_chain_does_not_replace_unregistered_destination(self):
+        records, original, suffix = self.fragment()
+        third = str(uuid4())
+        self.target = self.project / third / "subagents"
+        self.target.mkdir(parents=True)
+        self.destination = self.target / self.source.name
+        foreign = self.row(text="unregistered stream")
+        self.destination.write_bytes(foreign)
+        before = self.destination.stat()
+        with self.assertRaisesRegex(ValueError, "destination_agent_history_conflict"):
+            self.establish(records=records, sid=third)
+        self.assertEqual(self.destination.stat(), before)
+        self.assertEqual(self.destination.read_bytes(), foreign)
+        self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fragment_source_change_before_publication_does_not_replace_destination(self):
+        records, original, suffix = self.fragment()
+        atomic = core.atomic
+        def change_source(path, value, **kwargs):
+            result = atomic(path, value, **kwargs)
+            if Path(path).name == "intent.json":
+                with self.source.open("ab") as stream:
+                    stream.write(self.row(text="native append"))
+            return result
+        before = self.destination.stat()
+        with patch.object(core, "atomic", side_effect=change_source):
+            with self.assertRaisesRegex(ValueError, "agent_history_changed_before_publish"):
+                self.establish(records=records)
+        self.assertEqual(self.destination.read_bytes(), suffix)
+        self.assertEqual(self.destination.stat().st_ino, before.st_ino)
+        self.assertTrue(self.source.read_bytes().startswith(original))
+
+    def test_fragment_publication_receipt_interruption_recovers(self):
+        records, original, suffix = self.fragment()
+        atomic = core.atomic
+        def fail_receipt(path, value, **kwargs):
+            if Path(path).name == "applied.json":
+                raise OSError("fixture receipt interruption")
+            return atomic(path, value, **kwargs)
+        with patch.object(core, "atomic", side_effect=fail_receipt):
+            with self.assertRaises(OSError):
+                self.establish(records=records)
+        self.assertEqual(self.destination.read_bytes(), original + suffix)
+        self.establish(records=records)
+        self.assertEqual(self.destination.read_bytes(), original + suffix)
+        self.assertEqual(self.source.read_bytes(), original)
+
+    def test_fragment_chain_order_is_native_not_catalogue_order(self):
+        records, original, suffix = self.fragment()
+        third = self.project / str(uuid4()) / "subagents"
+        third.mkdir(parents=True)
+        last_parent = json.loads(suffix.splitlines()[-1])["uuid"]
+        final = (json.dumps({"type": "assistant", "uuid": str(uuid4()), "parentUuid": last_parent,
+                 "agentId": self.agent, "sessionId": self.old, "isSidechain": True}) + "\n").encode()
+        (third / self.source.name).write_bytes(final)
+        third_record = {**self.record, "path": third / self.relative}
+        result = self.establish(records=[third_record, *reversed(records)])
+        self.assertEqual(Path(result["path"]).read_bytes(), original + suffix + final)
+
+    def test_two_continuations_of_same_predecessor_are_a_branch(self):
+        records, original, suffix = self.fragment()
+        third = self.project / str(uuid4()) / "subagents"
+        third.mkdir(parents=True)
+        branch = json.loads(suffix.splitlines()[-1])
+        branch["uuid"] = str(uuid4())
+        (third / self.source.name).write_text(json.dumps(branch) + "\n")
+        third_record = {**self.record, "path": third / self.relative}
+        with self.assertRaisesRegex(ValueError, "divergent_agent_histories"):
+            self.establish(records=[*records, third_record])
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(self.destination.read_bytes(), suffix)
+
     def test_symlink_sources_and_destinations_are_not_followed(self):
         original = self.source.with_suffix(".original")
         self.source.rename(original)

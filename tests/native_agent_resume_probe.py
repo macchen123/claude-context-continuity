@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 from http.server import ThreadingHTTPServer
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -108,6 +109,7 @@ class ResumeModel:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--running-crossing", action="store_true", help="Keep a native child tool running across the second clear")
+    parser.add_argument("--fragmented-history", action="store_true", help="Split the private native child stream before its first cross-window resume")
     args = parser.parse_args()
     home = ROOT / ".cache" / "subagent-resume-repair-20261027" / ("native-" + uuid4().hex[:8])
     home.mkdir(parents=True, mode=0o700)
@@ -194,6 +196,27 @@ def main():
                     if args.running_crossing and phase == 2:
                         (workspace / "release-child").write_text("parent clear observed\n")
                     time.sleep(.4)
+                    if args.fragmented_history and phase == 1:
+                        original = next(config.glob(f"projects/*/{sessions[0]}/subagents/agent-{model.agent}.jsonl"))
+                        project = original.parents[2]
+                        current = project / sessions[1] / "subagents" / original.name
+                        lines = original.read_bytes().splitlines(keepends=True)
+                        rows = [json.loads(line) for line in lines]
+                        cut = next(index for index, row in enumerate(rows)
+                                   if row.get("type") == "user" and "RESUME_PHASE_0" in json.dumps(row))
+                        bridge = rows[cut]["parentUuid"]
+                        while cut and rows[cut - 1].get("type") == "attachment" and rows[cut - 1].get("parentUuid") == bridge:
+                            cut -= 1
+                        prefix, suffix = b"".join(lines[:cut]), b"".join(lines[cut:])
+                        assert MARKER.encode() in prefix and b"ORIGINAL_PRODUCER_RECEIPT" in prefix
+                        temporary_history = current.with_suffix(".fixture")
+                        temporary_history.write_bytes(suffix)
+                        os.replace(temporary_history, current)
+                        original.write_bytes(prefix)
+                        result["fragment_fixture"] = {"original_path": str(original), "bridge_uuid": bridge,
+                            "original_sha256": hashlib.sha256(prefix).hexdigest(),
+                            "suffix_sha256": hashlib.sha256(suffix).hexdigest(),
+                            "prefix_rows": cut, "suffix_rows": len(rows) - cut}
                 submit(f"PARENT_RESUME_FIXTURE_PHASE_{phase}: perform only the scripted local fixture.")
                 wait(lambda: model.done_phase == phase or model.failed, f"phase {phase} native SendMessage")
                 if model.failed:
@@ -214,7 +237,21 @@ def main():
                 preserved_metadata_profile=len({core.digest({key: value for key, value in row.items() if key != "finished"})
                                                 for row in metadata}) == 1,
                 permission_mode="default", parent_rotations=len(sessions) - 1)
-            success = (producer_once and len(histories) == 3 and len(identities) == 1
+            if args.fragmented_history:
+                fixture = result["fragment_fixture"]
+                receipts = list(home.rglob("agent_history/*/applied.json"))
+                reconstruction = [path for path in receipts if core.read_json(path).get("method") == "native_history_continuation"]
+                preserved = {hashlib.sha256(path.read_bytes()).hexdigest()
+                             for path in home.rglob("agent_history/*/source-*.jsonl")}
+                result["fragment_preservation"] = {
+                    "original_unchanged": hashlib.sha256(Path(fixture["original_path"]).read_bytes()).hexdigest() == fixture["original_sha256"],
+                    "inputs_preserved": {fixture["original_sha256"], fixture["suffix_sha256"]} <= preserved,
+                    "receipts": [str(path) for path in reconstruction]}
+                history_identity_ok = (len(identities) == 2 and len(reconstruction) >= 1
+                                       and all(value for key, value in result["fragment_preservation"].items() if key != "receipts"))
+            else:
+                history_identity_ok = len(identities) == 1
+            success = (producer_once and len(histories) == 3 and history_identity_ok
                        and model.child_count == 5 + int(args.running_crossing)
                        and all(row["original_prompt"] and row["original_tool_result"] for row in model.history_checks)
                        and model.history_checks[-1]["resume_message"]

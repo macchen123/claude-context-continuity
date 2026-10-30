@@ -241,6 +241,33 @@ class ResumeBindingMixin:
             raise ContextRuntimeError("恢复来源存在相互冲突的已验证授权 lineage")
         return min(owners, key=lambda owner: owner[0])[1:]
 
+    def _inherit_registered_catalogue(self, candidate, source, *, incoming_state=None, include_registered=False):
+        """Preserve registered history references without adopting an old owner's authority."""
+        target = candidate["session_id"], str(source.path)
+        local = self._catalogue_entries(self) if include_registered else []
+        seen = {(entry["session_id"], entry["source_path"]) for entry in local}
+        targets, references = seen | {target}, list(local)
+        for owner, owner_state in self._owner_states():
+            if not _owner_workspace_matches(owner_state, candidate["cwd"]):
+                continue
+            try:
+                entries = self._catalogue_entries(owner)
+            except (OSError, TypeError, ValueError, KeyError):
+                continue  # An unreadable registry supplies no provenance.
+            generations = [entry["generation"] for entry in entries
+                           if (entry["session_id"], entry["source_path"]) in targets]
+            if not generations:
+                continue
+            through = max(generations)
+            for entry in entries:
+                key = entry["session_id"], entry["source_path"]
+                if entry["generation"] <= through and key not in seen:
+                    seen.add(key)
+                    references.append(entry)
+        if len(references) > len(local):
+            self._adopt_lineage_catalogue(candidate, candidate if incoming_state is None else incoming_state,
+                                          source, references)
+
     def _adopt_lineage_catalogue(self, candidate, incoming_state, source, references):
         """Copy validated source references into this context without touching another owner's registry."""
         entries = self._catalogue_entries(self)
@@ -359,6 +386,8 @@ class ResumeBindingMixin:
             candidate["authorization"] = deepcopy(authorization)
             self._verify_authorization(candidate)
             self._adopt_lineage_catalogue(candidate, owner_state, source, references)
+        else:
+            self._inherit_registered_catalogue(candidate, source, incoming_state=owner_state)
         self._verify_authorization(candidate)
         if not binding.get("activity_observed"):
             candidate["resume_safe_boundary"] = True

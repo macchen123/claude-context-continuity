@@ -144,6 +144,125 @@ class ResumeBindingTests(unittest.TestCase):
         self.send_mock.assert_called_once()
         return self.send_mock.call_args.args[2]
 
+    def _assert_genuine_resume_child_history(self, *, recover=False, rotate=False):
+        root_sid, root_path = self._resumable()
+        sid, path = self._new_source()
+        self._append(path, self._user(sid, "Continue the same authorized work."),
+                     self._assistant(sid, 900 if rotate else 400, self.cwd))
+        sources = [(root_sid, root_path), (sid, path)]
+        if rotate:
+            sources.append(self._resumable())
+        owner = self._owner(sources, self._snapshot(*sources[0], *sources[-1]))
+        agent = "a1234567890abcdef"
+        metadata = {"agentType": "ui-design-worker", "toolUseId": "original-launch", "finished": True}
+        original = self.root / root_sid / "subagents"
+        current = self.root / sid / "subagents"
+        for directory in (original, current):
+            directory.mkdir(parents=True)
+            (directory / f"agent-{agent}.meta.json").write_text(json.dumps(metadata))
+        original_history = original / f"agent-{agent}.jsonl"
+        original_history.write_text(json.dumps({
+            "type": "assistant", "agentId": agent, "sessionId": root_sid,
+            "isSidechain": True, "uuid": str(uuid4()),
+            "message": {"role": "assistant", "content": "Completed original leaf."}
+        }) + "\n")
+        owner_before = owner.state_path.read_bytes()
+        authorization = self._snapshot(sid, path, sid, path)
+        runtime, _, _ = self._manager()
+
+        if recover:
+            with patch.object(runtime, "_inherit_registered_catalogue"):
+                runtime.on_hook(self._event("SessionStart", sid, path, source="resume"))
+            self.assertEqual(runtime._state()["agent_metadata_compat"]["status"], "blocked")
+            if rotate:
+                self.assertEqual(runtime.advance()["phase"], "clear_sent")
+                continuation = self._complete_rotation(runtime)
+                rotated = runtime._state()
+                sid, path = rotated["session_id"], Path(rotated["source_path"])
+                self._append(path, self._user(sid, continuation), self._assistant(sid, 400, self.cwd))
+                self.assertEqual(runtime.advance()["phase"], "running")
+                self.clear_mock.assert_called_once()
+                self.clear_mock.reset_mock()
+                self.send_mock.reset_mock()
+                current = self.root / sid / "subagents"
+            runtime.recover_observation(sid)
+        else:
+            runtime.on_hook(self._event("SessionStart", sid, path, source="resume"))
+
+        state = runtime._state()
+        self.assertEqual(state["session_id"], sid)
+        self.assertIn((root_sid, str(root_path)), self._catalogue_pairs(runtime))
+        if rotate:
+            self.assertNotIn((sources[-1][0], str(sources[-1][1])), self._catalogue_pairs(runtime))
+        self.assertEqual(state["authorization"], authorization)
+        self.assertEqual(state["agent_metadata_compat"]["status"], "verified")
+        self.assertTrue(os.path.samefile(original_history, current / original_history.name))
+        if recover:
+            catalogue = runtime._catalogue_entries(runtime)
+            history_before = original_history.read_bytes()
+            runtime.recover_observation(sid)
+            repeated = runtime._state()
+            self.assertEqual(runtime._catalogue_entries(runtime), catalogue)
+            for key in ("session_id", "window_generation", "rotation", "authorization", "phase"):
+                self.assertEqual(repeated[key], state[key])
+            self.assertTrue(os.path.samefile(original_history, current / original_history.name))
+            self.assertEqual(original_history.read_bytes(), history_before)
+        self.assertEqual(owner.state_path.read_bytes(), owner_before)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_resume_with_genuine_input_retains_catalogued_child_history(self):
+        self._assert_genuine_resume_child_history()
+
+    def test_recover_restores_previously_dropped_child_catalogue_without_resuming_work(self):
+        self._assert_genuine_resume_child_history(recover=True)
+
+    def test_recover_restores_dropped_catalogue_after_another_rotation(self):
+        self._assert_genuine_resume_child_history(recover=True, rotate=True)
+
+    def test_catalogue_inheritance_excludes_future_windows_and_foreign_workspaces(self):
+        root_sid, root_path = self._resumable()
+        sid, path = self._resumable()
+        future_sid, future_path = self._resumable()
+        self._owner([(root_sid, root_path), (sid, path), (future_sid, future_path)],
+                    self._snapshot(root_sid, root_path, future_sid, future_path))
+        foreign_sid, foreign_path = self._resumable()
+        self._owner([(foreign_sid, foreign_path), (sid, path)],
+                    self._snapshot(foreign_sid, foreign_path, sid, path), launch_cwd=self.foreign)
+        runtime, _, _ = self._manager()
+
+        runtime.on_hook(self._event("SessionStart", sid, path, source="resume"))
+
+        self.assertEqual(runtime._state()["session_id"], sid)
+        pairs = self._catalogue_pairs(runtime)
+        self.assertIn((root_sid, str(root_path)), pairs)
+        self.assertNotIn((future_sid, str(future_path)), pairs)
+        self.assertNotIn((foreign_sid, str(foreign_path)), pairs)
+        self.assertEqual(runtime._state()["authorization"]["root_instruction_locator"],
+                         self._bounds(sid, path)["first"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_repeated_native_source_keeps_intervening_history_but_not_later_windows(self):
+        root = self._resumable()
+        target = self._resumable()
+        intervening = self._resumable()
+        later = self._resumable()
+        self._owner([root, target, intervening, target, later],
+                    self._snapshot(*root, *later))
+        runtime, _, _ = self._manager()
+
+        runtime.on_hook(self._event("SessionStart", *target, source="resume"))
+
+        pairs = self._catalogue_pairs(runtime)
+        self.assertIn((root[0], str(root[1])), pairs)
+        self.assertIn((intervening[0], str(intervening[1])), pairs)
+        self.assertNotIn((later[0], str(later[1])), pairs)
+        self.assertEqual(runtime._state()["authorization"]["root_instruction_locator"],
+                         self._bounds(*target)["first"])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_api_request_metadata_does_not_leave_resume_history_prefix_pending(self):
         sid, path = self._resumable()
         self._append(path,

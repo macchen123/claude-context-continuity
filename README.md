@@ -142,13 +142,30 @@ Native Claude Code needs both a subagent's identity (`.meta.json`) and native hi
 
 cclaude establishes both native loader inputs from its catalogued sessions at `SessionStart` and revalidates them before `SendMessage`, the current native resume entry:
 
+- Resuming a session retains its validated earlier history references, including when that session contains new user instructions. Those instructions remain authoritative; inheriting the catalogue does not adopt an older owner's authorization.
 - Native role, explicit model, permission/isolation fields, and opaque extension fields are preserved. Agent definitions, global settings, and official binaries are untouched.
-- Old and new parent sessions share the original native child-history file through an exclusive hard link. Native appends remain visible across repeated rotations; histories are not copied, rewritten or merged, and a parent rotation does not restart a child. A child's own budget can stop it through the handoff below. The current native `finished` lifecycle flag is left untouched.
-- Identity and history-path conflicts block restoration instead of reporting metadata-only success. A new cross-window connection also requires a complete, readable, bounded history. Existing native/current or already linked streams retain native append semantics: a partial last line or large record does not by itself block messaging; identity and child-budget guards still apply. A different existing history is never replaced, even if its current bytes match. Hard-link publication must be supported on the same filesystem; there is no stale-copy fallback. Messages to `main` and identifiable non-local peers are unaffected.
+- A single native child-history stream is shared across parent sessions through hard links, so native appends remain visible across repeated rotations. If registered sessions instead contain consecutive fragments, native `parentUuid` ancestry orders the fragments into a complete loader stream, including the original prompt and tool results—not just the latest suffix. Each input is retained byte-for-byte under `agent_history/` before publishing the complete stream; earlier source files are not rewritten. An existing current-session suffix can be replaced only when it is one of those verified inputs. Later rotations share the complete stream through hard links. This does not restart a child or change its current native `finished` lifecycle flag. A child's own budget can stop it through the handoff below.
+- Identity conflicts, competing continuation branches, missing predecessors, and unrelated destination histories block restoration instead of reporting metadata-only success. A new cross-window connection requires complete, readable, bounded input histories. Existing native/current or already established streams retain native append semantics: a partial last line or large record does not by itself block messaging; identity and child-budget guards still apply. Separate files with identical bytes alone do not establish ancestry. Hard-link publication must be supported on the same filesystem. Messages to `main` and identifiable non-local peers are unaffected.
 - A narrowly recognized native default-fallback record can be restored from a verified original sidecar only after the agent stops. Identity repair evidence is kept in the context's private `agent_metadata/` directory; native-history publication evidence is in `agent_history/`. Other identity conflicts are not overwritten.
 - Native `stoppedByUser` markers remain effective. Native fork, model, tool, and current-permission checks still apply; preservation does not grant new authority.
 
 Inspect `agent_metadata_compat` with `claude-context tui-status --context-id "$CLAUDE_CONTINUITY_ID"`. Investigate a blocked restore rather than changing the role or repeatedly resending to bypass it.
+
+When collaborating with another session, its native Session ID changes after renewal. After `ListAgents`, cclaude gives the model verified cross-window associations to help recognize the continuing session. You can also find its current live entry using an old ID, including one from several renewals ago:
+
+```sh
+claude-context peer-lineage --session-id "<old-session-UUID>"
+```
+
+Omit the option for a brief overview; an exact lookup searches all confirmed windows. Associations use the live native session's Session ID, process ID and registered history; uncertain or conflicting bindings are not guessed. A successful `SendMessage` to a uniquely identified named peer can receive the same context; socket addresses are not inferred. Native routing still delivers messages, and the user's instructions still determine whether work should continue.
+
+If an earlier version dropped the resumed session's catalogue references, run this after upgrading, using the exact `session_id` from `tui-status`:
+
+```sh
+claude-context tui-recover --context-id "$CLAUDE_CONTINUITY_ID" --session-id "<session-id>"
+```
+
+This rechecks the bound source, restores validated catalogue references and refreshes the native subagent loader inputs. It does not replay work or overwrite conflicting histories; repeating it does not add duplicate catalogue entries.
 
 Each child reads input, cache and output usage from its own native transcript, never from its parent. Without an observed child window, the configured ceiling is an estimate with a 25% reserve. Missing usage and windows remain unknown; file bytes are not token counts.
 

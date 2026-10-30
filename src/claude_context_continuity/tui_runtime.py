@@ -246,7 +246,8 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         result = self._on_hook(event)
         if isinstance(event, dict) and not event.get("agent_id"):
             self._diagnose(event, result)
-        return result
+        from .peer_lineage import hook_context
+        return hook_context(self, event, result)
 
     def _on_hook(self, event):
         if not isinstance(event, dict):
@@ -721,6 +722,10 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                     self._usage(state, True, sample=source._usage_from_records(records))
                     if state.get("authorization"):
                         self._verify_authorization(state)
+                    if not state.get("pending_session_start"):
+                        self._inherit_registered_catalogue(state, source, include_registered=True)
+                        self._agent_metadata(state, {"hook_event_name": "ManualRecovery", "session_id": session_id},
+                                             inherit=True, delivery_allowed=False)
                 except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
                     self._wait(state, "manual_observation_prefix_pending")
                     state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
