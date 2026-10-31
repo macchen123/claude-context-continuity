@@ -762,6 +762,157 @@ class TuiRuntimeTests(unittest.TestCase):
         self.runtime.advance()
         self.clear_mock.assert_called_once()
 
+    def test_stop_before_native_history_creation_recovers_without_another_hook(self):
+        self._assert_delayed_stop_recovers("missing")
+
+    def test_stop_before_native_input_flush_recovers_without_another_hook(self):
+        self._assert_delayed_stop_recovers("empty")
+
+    def test_stop_accepts_native_parent_order_not_append_order(self):
+        self._assert_delayed_stop_recovers("assistant_first")
+
+    def _assert_delayed_stop_recovers(self, prefix):
+        runtime, sid, source = self.resume_runtime(history_present=prefix != "missing")
+        prompt_id, user_id, assistant_id, attachment_id = (str(uuid4()) for _ in range(4))
+        event = self.hook("UserPromptSubmit", session_id=sid, transcript_path=str(source),
+                          prompt_id=prompt_id, prompt="Continue the authorized local test.")
+        runtime.on_hook(event)
+        user = {"type": "user", "uuid": user_id, "sessionId": sid, "promptId": prompt_id,
+                "parentUuid": None, "message": {"role": "user", "content": event["prompt"]}}
+        attachment = {"type": "attachment", "uuid": attachment_id, "sessionId": sid,
+                      "parentUuid": user_id, "attachment": {"type": "hook_additional_context", "content": "runtime context"}}
+        assistant = {"type": "assistant", "uuid": assistant_id, "sessionId": sid,
+                     "parentUuid": attachment_id, "cwd": str(self.cwd), "message": {
+                         "role": "assistant", "content": "OK", "model": "native-model",
+                         "usage": {"input_tokens": 125, "cache_creation_input_tokens": 0,
+                                   "cache_read_input_tokens": 0}}}
+        if prefix == "assistant_first":
+            source.write_text(json.dumps(assistant) + "\n")
+        runtime.on_hook(self.hook("Stop", session_id=sid, transcript_path=str(source),
+                                  prompt_id=prompt_id, last_assistant_message="OK"))
+        self.assertTrue(runtime._state()["at_turn_boundary"], "Stop is a native completion fact")
+        runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.assertIsNone(runtime._state()["authorization"])
+        if prefix != "assistant_first":
+            self.assertIsNone(runtime._state()["usage"])
+        if prefix == "assistant_first":
+            with source.open("a") as handle:
+                handle.write(json.dumps(user) + "\n")
+        else:
+            source.write_text(json.dumps(user) + "\n" + json.dumps(assistant) + "\n")
+        runtime.advance()
+        self.clear_mock.assert_not_called()  # The intermediate native parent is still missing.
+        with source.open("a") as handle:
+            handle.write(json.dumps(attachment) + "\n")
+        runtime.advance()
+        state = runtime._state()
+        self.assertTrue(state["at_turn_boundary"])
+        self.assertIsNone(state.get("reconciliation"))
+        self.assertEqual(state["authorization"]["root_instruction_locator"]["message_id"], user_id)
+        self.assertEqual(state["usage"]["total_input_and_cache_tokens"], 125)
+        runtime.request_rotation("Continue only the authorized local test.")
+        self.assertEqual(runtime.advance()["phase"], "clear_sent")
+        self.clear_mock.assert_called_once()
+
+    def test_native_stop_preserves_boundary_while_previous_same_text_reply_is_latest(self):
+        runtime, sid, source = self.resume_runtime()
+        old_prompt_id, prompt_id, old_user_id, old_reply_id, user_id = (str(uuid4()) for _ in range(5))
+        old_user = {"type": "user", "uuid": old_user_id, "sessionId": sid, "promptId": old_prompt_id,
+                    "parentUuid": None, "message": {"role": "user", "content": "Previous authorized turn"}}
+        old_reply = {"type": "assistant", "uuid": old_reply_id, "sessionId": sid,
+                     "parentUuid": old_user_id, "cwd": str(self.cwd), "message": {
+                         "role": "assistant", "content": "OK", "model": "native-model",
+                         "usage": {"input_tokens": 125, "cache_creation_input_tokens": 0,
+                                   "cache_read_input_tokens": 0}}}
+        source.write_text(json.dumps(old_user) + "\n" + json.dumps(old_reply) + "\n")
+        runtime.on_hook(self.hook("UserPromptSubmit", session_id=sid, transcript_path=str(source),
+                                  prompt_id=prompt_id, prompt="Current authorized turn"))
+        user = {"type": "user", "uuid": user_id, "sessionId": sid, "promptId": prompt_id,
+                "parentUuid": old_reply_id, "message": {"role": "user", "content": "Current authorized turn"}}
+        with source.open("a") as handle:
+            handle.write(json.dumps(user) + "\n")
+        runtime.on_hook(self.hook("Stop", session_id=sid, transcript_path=str(source),
+                                  prompt_id=prompt_id, last_assistant_message="OK"))
+        runtime.request_rotation("Continue after this exact current turn becomes durable.")
+        runtime.advance()
+        self.clear_mock.assert_not_called()
+        self.assertTrue(runtime._state()["at_turn_boundary"], "An earlier same-text reply cannot invalidate current Stop")
+        self.assertIsNone(runtime._state()["rotation"]["clear"])
+        current_reply = dict(old_reply, uuid=str(uuid4()), parentUuid=user_id)
+        with source.open("a") as handle:
+            handle.write(json.dumps(current_reply) + "\n")
+        self.assertEqual(runtime.advance()["phase"], "clear_sent")  # No new hook after the delayed append.
+        self.clear_mock.assert_called_once()
+        self.assertEqual(runtime._state()["authorization"]["latest_instruction_locator"]["message_id"], user_id)
+
+    def test_native_stop_never_rotates_without_matching_durable_history(self):
+        for fault in ("missing", "missing_prompt", "missing_parent", "wrong_text", "later_human", "malformed", "foreign_session"):
+            with self.subTest(fault=fault):
+                runtime, sid, source = self.resume_runtime(history_present=False)
+                prompt_id, user_id = str(uuid4()), str(uuid4())
+                runtime.on_hook(self.hook("UserPromptSubmit", session_id=sid, transcript_path=str(source),
+                                          prompt_id=prompt_id, prompt="Authorized fixture turn"))
+                runtime.request_rotation("Do not clear until this exact native turn is durable.")
+                user = {"type": "user", "uuid": user_id, "sessionId": sid, "promptId": prompt_id,
+                        "parentUuid": None, "message": {"role": "user", "content": "Authorized fixture turn"}}
+                assistant = {"type": "assistant", "uuid": str(uuid4()), "sessionId": sid,
+                             "parentUuid": user_id, "cwd": str(self.cwd), "message": {
+                                 "role": "assistant", "content": "OK", "model": "native-model",
+                                 "usage": {"input_tokens": 125, "cache_creation_input_tokens": 0,
+                                           "cache_read_input_tokens": 0}}}
+                records = [user, assistant]
+                if fault == "missing_prompt":
+                    user["promptId"] = str(uuid4())
+                elif fault == "missing_parent":
+                    assistant["parentUuid"] = str(uuid4())
+                elif fault == "wrong_text":
+                    assistant["message"]["content"] = "not this Stop reply"
+                elif fault == "later_human":
+                    later = dict(user, uuid=str(uuid4()), promptId=str(uuid4()), parentUuid=user_id)
+                    records.insert(1, later)
+                    assistant["parentUuid"] = later["uuid"]
+                elif fault == "foreign_session":
+                    assistant["sessionId"] = str(uuid4())
+                if fault != "missing":
+                    source.write_text("".join(json.dumps(row) + "\n" for row in records)
+                                      + ("{invalid JSON}\n" if fault == "malformed" else ""))
+                runtime.on_hook(self.hook("Stop", session_id=sid, transcript_path=str(source),
+                                          prompt_id=prompt_id, last_assistant_message="OK"))
+                runtime.advance()
+                self.clear_mock.assert_not_called()
+                self.send_mock.assert_not_called()
+                self.assertIsNone(runtime._state()["rotation"]["clear"])
+                if fault == "later_human":
+                    self.assertFalse(runtime._state()["at_turn_boundary"], "A proven later native prompt invalidates this Stop")
+                if fault in {"missing", "malformed", "foreign_session"}:
+                    self.assertIsNotNone(runtime._state().get("reconciliation"))
+                    self.assertTrue(runtime._state().get("diagnostic"))
+
+    def test_stop_rejects_invalid_source_and_stale_native_prompt(self):
+        for fault in ("relative", "wrong_name", "symlink", "stale_prompt"):
+            with self.subTest(fault=fault):
+                runtime, sid, source = self.resume_runtime()
+                prompt_id = str(uuid4())
+                runtime.on_hook(self.hook("UserPromptSubmit", session_id=sid, transcript_path=str(source),
+                                          prompt_id=prompt_id, prompt="Current turn"))
+                path = str(source)
+                if fault == "relative":
+                    path = source.name
+                elif fault == "wrong_name":
+                    path = str(self.source)
+                elif fault == "symlink":
+                    alias = source.parent / str(uuid4())
+                    alias.symlink_to(source.parent, target_is_directory=True)
+                    path = str(alias / source.name)
+                result = runtime.on_hook(self.hook("Stop", session_id=sid, transcript_path=path,
+                    prompt_id=str(uuid4()) if fault == "stale_prompt" else prompt_id, last_assistant_message="OK"))
+                self.assertFalse(runtime._state()["at_turn_boundary"])
+                self.assertNotIn("stop_serial", runtime._state())
+                self.clear_mock.assert_not_called()
+                if fault != "stale_prompt":
+                    self.assertIn("systemMessage", result)
+
     def test_stop_can_precede_final_transcript_flush(self):
         self.runtime.on_hook(self.hook("Stop", last_assistant_message="late final reply"))
         self.runtime.advance()

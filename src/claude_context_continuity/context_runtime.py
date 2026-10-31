@@ -495,7 +495,7 @@ class ContextRuntime:
             notice_key = core.digest([state["session_id"], reconciliation.get("stage"), reason])
             if state.get("wait_notice_key") != notice_key:
                 result["systemMessage"] = (
-                    "cclaude 自动换窗正在等待原生事实并持续观察；不会重复未确认的清屏或交接。原因：" + reason)
+                    "cclaude 正在等待原生状态确认，确认后自动继续。原因：" + reason)
                 state["wait_notice_key"] = notice_key
         else:
             state.pop("wait_notice_key", None)
