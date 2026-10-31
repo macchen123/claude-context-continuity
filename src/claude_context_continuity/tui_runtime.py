@@ -269,7 +269,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 self._save(state)
                 from .agent_metadata import failure_hook
                 return failure_hook(event, "superseded_native_session")
-            if (name == "StopFailure" and event.get("prompt_id") and state.get("native_prompt_id")
+            if (name in {"Stop", "StopFailure"} and event.get("prompt_id") and state.get("native_prompt_id")
                     and event["prompt_id"] != state["native_prompt_id"]):
                 return {}
             permission = event.get("permission_mode")
@@ -288,14 +288,45 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         if name == "UserPromptSubmit":
             return self._user_prompt(event)
         if name != "SessionStart":
+            rejected = name == "StopFailure" and is_context_rejection(
+                event.get("error"), event.get("last_assistant_message"))
             if name in {"Stop", "StopFailure"}:
                 with core.lock(self.lock_path, wait_seconds=5):
                     state = self._state()
-                    if event.get("session_id") != state["session_id"]:
+                    try:
+                        self._observe_native_context(state, event)
+                    except (OSError, TypeError, ValueError, ContextRuntimeError) as exc:
                         self._wait(state, "stop_session_identity_pending")
-                    else:
-                        state["at_turn_boundary"] = False
-                        state["stop_observed_at"] = time.monotonic()
+                        state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
+                        self._save(state)
+                        return self._hook_output(state, name)
+                    state["at_turn_boundary"] = False
+                    state["stop_observed_at"] = time.monotonic()
+                    if name == "Stop" or rejected:
+                        # Stop is a native completion receipt, not a synchronous
+                        # transcript flush. Persist it before any history read.
+                        final_text = event.get("last_assistant_message")
+                        state["stop_text_hash"] = core.digest(final_text.strip()) if isinstance(final_text, str) else None
+                        state["at_turn_boundary"] = True
+                        state["stop_serial"] = state.get("stop_serial", 0) + 1
+                        state["stop_turn_generation"] = state.get("turn_generation", 0)
+                        head = (state.get("authorization") or {}).get("latest_instruction_locator")
+                        state["stop_snapshot"] = {
+                            "prompt_id": event.get("prompt_id") or state.get("native_prompt_id"),
+                            "instruction_head": head if head and head["source_path"] == state["source_path"] else None,
+                        }
+                        if rejected:
+                            usage = state.get("usage") or {}
+                            state["failure_boundary"] = {
+                                "session_id": state["session_id"], "turn_generation": state.get("turn_generation", 0),
+                                "message_hash": state["stop_text_hash"],
+                                "after_byte": max(usage.get("usage_locator", {}).get("end_byte", 0),
+                                                  state.get("input_observed_after_byte", 0)),
+                            }
+                        else:
+                            state.pop("failure_boundary", None)
+                            state.pop("context_failure", None)
+                        state.pop("tool_batch_boundary", None)
                     self._save(state)
             result = super().on_hook(event)
             # 从真实 hook 绑定的新 JSONL 确认接续已被原生宿主消费。
@@ -306,31 +337,17 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                         result = self._bound_output(event, result)
                     elif name == "PostToolBatch":
                         result = self._finish_batch(state, event, result)
-                rejected = name == "StopFailure" and is_context_rejection(
-                    event.get("error"), event.get("last_assistant_message"))
-                if (name == "Stop" or rejected) and event.get("session_id") == state["session_id"] and state.get("source_path"):
-                    source = HistorySource(Path(state["source_path"]), state["session_id"])
-                    records = source._records(defer_incomplete_tail=True)
-                    final_text = event.get("last_assistant_message")
-                    state["stop_text_hash"] = core.digest(final_text.strip()) if isinstance(final_text, str) else None
-                    state["at_turn_boundary"] = True
-                    state["stop_serial"] = state.get("stop_serial", 0) + 1
-                    state["stop_turn_generation"] = state.get("turn_generation", 0)
-                    state["stop_snapshot"] = {"instruction_head": source._bounds_from_records(records)["last"]}
-                    if rejected:
-                        usage = state.get("usage") or {}
-                        state["failure_boundary"] = {
-                            "session_id": state["session_id"], "turn_generation": state.get("turn_generation", 0),
-                            "message_hash": state["stop_text_hash"],
-                            "after_byte": max(usage.get("usage_locator", {}).get("end_byte", 0),
-                                              state.get("input_observed_after_byte", 0)),
-                        }
-                    else:
-                        state.pop("failure_boundary", None)
-                        state.pop("context_failure", None)
-                    # 新 Stop 改由最终响应与输入快照核验，不再沿用旧工具批次的响应身份。
-                    state.pop("tool_batch_boundary", None)
-                    self._save(state)
+                if ((name == "Stop" or rejected) and event.get("session_id") == state["session_id"]
+                        and not state.get("stop_snapshot", {}).get("prompt_id")):
+                    # Older receipts without a native prompt identity still need
+                    # the existing exact input snapshot; never invent one.
+                    try:
+                        source = _source(state.get("source_path"), state["session_id"])
+                        records = source._records(defer_incomplete_tail=True)
+                        state["stop_snapshot"]["instruction_head"] = source._bounds_from_records(records)["last"]
+                    except (OSError, ValueError, HistoryError, ContextRuntimeError) as exc:
+                        self._wait(state, "stop_history_prefix_pending")
+                        state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
                 if state.get("continuation_hash"):
                     try:
                         self._confirm_continuation(state)
@@ -781,22 +798,53 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         if state.get("turn_generation", 0) != state.get("stop_turn_generation", 0):
             state["at_turn_boundary"] = False
             return False
+        snapshot = state.get("stop_snapshot", {})
+        prompt_id = snapshot.get("prompt_id")
+        prompt = next((row for row in records if row.data.get("type") == "user"
+                       and row.data.get("promptId") == prompt_id), None) if prompt_id else None
+        if prompt_id and prompt is None:
+            return False  # The Stop receipt survives a not-yet-written input.
         head = source._bounds_from_records(records)["last"]
-        if head != state.get("stop_snapshot", {}).get("instruction_head"):
-            info = next((row for row in records if head is not None and row.message_id == head["message_id"]), None)
-            if info is None or info.data.get("type") != "attachment":
-                state["at_turn_boundary"] = False
-                return False
-            # 尚未执行的原生排队输入留在队列中，不必为了清空队列继续消耗旧窗口。
+        by_id = {row.message_id: row for row in records}
+        head_record = by_id.get(head["message_id"]) if head is not None else None
+        queued = head_record is not None and head_record.data.get("type") == "attachment"
+        if prompt is None and head != snapshot.get("instruction_head") and not queued:
+            state["at_turn_boundary"] = False
+            return False
         latest = next((row for row in reversed(records) if row.kind == "assistant"
                        and row.data.get("message", {}).get("model") != "<synthetic>"), None)
         if latest is None or not state.get("stop_text_hash"):
             return False
-        last_input = max((row.start for row in records if row.data.get("type") == "user"), default=-1)
-        if latest.start <= last_input:
-            return False  # 相同的最终文本也可能属于上一轮，必须晚于本轮输入/工具回执。
         text = "\n".join(_texts(_content(latest.data))).strip()
-        return core.digest(text) == state["stop_text_hash"]
+        if core.digest(text) != state["stop_text_hash"]:
+            return False
+        if prompt is not None:
+            # Native append order is not conversation order: an assistant may
+            # precede its user/attachment ancestors. Prove both the exact prompt
+            # and current instruction head from that response's native chain.
+            parent, seen, prompt_seen = latest.data.get("parentUuid"), set(), False
+            intervening_input = False
+            while isinstance(parent, str) and parent not in seen:
+                seen.add(parent)
+                row = by_id.get(parent)
+                if row is None:
+                    return False  # An ancestor may still be awaiting its flush.
+                if parent == prompt.message_id:
+                    if intervening_input:
+                        state["at_turn_boundary"] = False
+                        return False  # A different human input follows this exact prompt.
+                    prompt_seen = True
+                elif not prompt_seen and row.kind == "original_user":
+                    # It is only a later turn if this chain subsequently reaches
+                    # the current prompt. Otherwise it may be an earlier reply
+                    # with the same text while the current reply is unflushed.
+                    intervening_input = True
+                if prompt_seen and (head is None or queued or head["message_id"] in seen):
+                    return True
+                parent = row.data.get("parentUuid")
+            return False
+        last_input = max((row.start for row in records if row.data.get("type") == "user"), default=-1)
+        return latest.start > last_input  # Existing snapshots without prompt IDs retain their ordering check.
 
     def _continuation(self, state):
         value = json.loads(super()._continuation(state))
@@ -1060,7 +1108,9 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                         if getattr(self, "_idle_observation", None) == (stamp, core.digest(state)):
                             return self._receipt(state)
                         self._idle_observation = None
-                        records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
+                        records, incomplete = source._records(
+                            include_attachments=bool(state.get("stop_snapshot", {}).get("prompt_id")),
+                            defer_incomplete_tail=True, _report_deferred_tail=True)
                         if incomplete or self._history_stamp(state)[1] != stamp:
                             self._wait(state, "native_history_prefix_appending")
                             self._save(state)
@@ -1071,6 +1121,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                         if not stable:
                             self._save(state)
                             return self._receipt(state)
+                        self._observe_authorization_records(state, source, records)
                         activity = source._activity_from_records(records)
                         self._reconcile_lifecycle(state, activity)
                         try:

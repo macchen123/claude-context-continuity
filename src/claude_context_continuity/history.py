@@ -436,6 +436,7 @@ class HistorySource:
         self,
         *,
         include_task_notifications: bool = True,
+        include_attachments: bool = False,
         defer_incomplete_tail: bool = False,
         _report_deferred_tail: bool = False,
     ) -> list[_Record] | tuple[list[_Record], bool]:
@@ -444,10 +445,14 @@ class HistorySource:
         Ordinary public HistorySource operations retain strict JSONL behavior. The
         index and runtime snapshots may defer an unterminated final append so an
         actively written transcript does not invalidate its complete prefix.
-        A complete malformed line remains an error.
+        A complete malformed line remains an error. Native Stop reconciliation
+        may retain attachments to verify parentUuid ancestry; ordinary history
+        reads keep their existing filtered projection.
         """
         if type(include_task_notifications) is not bool:
             raise HistoryError("include_task_notifications must be a boolean")
+        if type(include_attachments) is not bool:
+            raise HistoryError("include_attachments must be a boolean")
         if type(defer_incomplete_tail) is not bool or type(_report_deferred_tail) is not bool:
             raise HistoryError("history reader options must be booleans")
         records, seen, deferred_tail = [], set(), False
@@ -468,7 +473,9 @@ class HistorySource:
                     if ("sessionId" in data or "session_id" in data) and identity != self.session_id:
                         raise HistoryError(f"record at byte {start} belongs to another session")
                     kind = source_kind(data)
-                    if kind == "meta" and data["type"] in _STATE_ONLY and not (include_task_notifications and _task_notice(data)):
+                    if (kind == "meta" and data["type"] in _STATE_ONLY
+                            and not (include_task_notifications and _task_notice(data))
+                            and not (include_attachments and data["type"] == "attachment")):
                         continue  # 用户指令和显式需要的原生任务终态不能跳过。
                     message_id = _message_id(data)
                     if message_id in seen:
