@@ -136,6 +136,86 @@ class AgentHistoryTests(unittest.TestCase):
         second = {**self.record, "path": self.target / self.relative}
         return [self.record, second], original, suffix
 
+    def parallel_fragment(self, *, reverse_results=False, first_result_in_source=False):
+        response_id = str(uuid4())
+        root, first, second = str(uuid4()), str(uuid4()), str(uuid4())
+        def row(kind, uid, parent, content, **fields):
+            return {"type": kind, "uuid": uid, "parentUuid": parent, "agentId": self.agent,
+                    "sessionId": self.old, "isSidechain": True,
+                    "message": {"role": kind, "content": content}, **fields}
+        original = [row("user", root, None, "Original authorized fixture"),
+                    row("assistant", first, root, [{"type": "tool_use", "id": "call-a", "name": "Read", "input": {}}]),
+                    row("assistant", second, first, [{"type": "tool_use", "id": "call-b", "name": "Read", "input": {}}])]
+        for item in original[1:]:
+            item["message"]["id"] = response_id
+        results = [row("user", str(uuid4()), parent, [{"type": "tool_result", "tool_use_id": tool,
+                                                     "content": "Original tool result"}])
+                   for parent, tool in [(first, "call-a"), (second, "call-b")]]
+        if first_result_in_source:
+            original.append(results.pop(0))
+        if reverse_results:
+            results.reverse()
+        suffix = [{"type": "attachment", "uuid": str(uuid4()), "parentUuid": second,
+                   "attachment": {"type": "hook_success"}}, *results]
+        suffix.append(row("assistant", str(uuid4()), results[-1]["uuid"], "Continued response"))
+        self.target.mkdir(parents=True, exist_ok=True)
+        records = [self.record, {**self.record, "path": self.target / self.relative}]
+        return records, original, suffix
+
+    @staticmethod
+    def encode_rows(rows):
+        return b"".join((json.dumps(row) + "\n").encode() for row in rows)
+
+    def test_parallel_tool_results_publish_exact_history_without_losing_source(self):
+        for reverse_results, first_result_in_source in ((False, False), (True, False), (False, True)):
+            with self.subTest(reverse_results=reverse_results, first_result_in_source=first_result_in_source):
+                records, before, after = self.parallel_fragment(
+                    reverse_results=reverse_results, first_result_in_source=first_result_in_source)
+                original, suffix = self.encode_rows(before), self.encode_rows(after)
+                self.source.write_bytes(original)
+                self.destination.write_bytes(suffix)
+                result = self.establish(records=list(reversed(records)))
+                self.assertEqual(result["status"], "reconstructed")
+                self.assertEqual(self.destination.read_bytes(), original + suffix)
+                self.assertEqual(self.source.read_bytes(), original)
+                receipt = core.read_json(result["receipt"])
+                self.assertEqual({Path(item["preserved_path"]).read_bytes() for item in receipt["sources"]},
+                                 {original, suffix})
+                self.assertEqual(self.establish(records=records)["status"], "available")
+
+    def test_parallel_boundary_still_rejects_unproven_or_competing_history(self):
+        for fault in ("different_response", "missing_response_id", "wrong_tool_id", "wrong_result_parent",
+                      "duplicate_result", "already_settled", "human_branch", "later_response", "missing_parent"):
+            with self.subTest(fault=fault):
+                records, before, after = self.parallel_fragment()
+                if fault == "different_response":
+                    before[2]["message"]["id"] = str(uuid4())
+                elif fault == "missing_response_id":
+                    del before[1]["message"]["id"]
+                elif fault == "wrong_tool_id":
+                    after[1]["message"]["content"][0]["tool_use_id"] = "unknown-call"
+                elif fault == "wrong_result_parent":
+                    after[1]["parentUuid"] = before[2]["uuid"]
+                    after[2]["parentUuid"] = before[1]["uuid"]
+                elif fault == "duplicate_result":
+                    after.insert(2, {**after[1], "uuid": str(uuid4())})
+                elif fault == "already_settled":
+                    before.append({**after[1], "uuid": str(uuid4())})
+                elif fault == "human_branch":
+                    after[1]["message"]["content"] = "Unrelated human branch"
+                elif fault == "later_response":
+                    before.append({**before[2], "uuid": str(uuid4()), "parentUuid": before[2]["uuid"],
+                                   "message": {"id": str(uuid4()), "role": "assistant", "content": "New turn"}})
+                elif fault == "missing_parent":
+                    after[1]["parentUuid"] = str(uuid4())
+                original, suffix = self.encode_rows(before), self.encode_rows(after)
+                self.source.write_bytes(original)
+                self.destination.write_bytes(suffix)
+                with self.assertRaisesRegex(ValueError, "divergent_agent_histories|missing_agent_history_predecessor"):
+                    self.establish(records=records)
+                self.assertEqual(self.source.read_bytes(), original)
+                self.assertEqual(self.destination.read_bytes(), suffix)
+
     def test_native_fragments_publish_complete_history_and_preserve_originals(self):
         records, original, suffix = self.fragment()
         old_identity = self.destination.stat().st_ino
@@ -269,6 +349,14 @@ class AgentHistoryTests(unittest.TestCase):
         third_record = {**self.record, "path": third / self.relative}
         result = self.establish(records=[third_record, *reversed(records)])
         self.assertEqual(Path(result["path"]).read_bytes(), original + suffix + final)
+
+    def test_unidentified_child_of_bridge_keeps_existing_conflict_guard(self):
+        records, original, suffix = self.fragment()
+        bridge = json.loads(original.splitlines()[-1])["uuid"]
+        self.source.write_bytes(original + self.encode_rows([{"type": "system", "parentUuid": bridge}]))
+        with self.assertRaisesRegex(ValueError, "divergent_agent_histories"):
+            self.establish(records=records)
+        self.assertEqual(self.destination.read_bytes(), suffix)
 
     def test_two_continuations_of_same_predecessor_are_a_branch(self):
         records, original, suffix = self.fragment()

@@ -71,6 +71,20 @@ class RuntimeFixture:
         self.runtime.on_hook(self.hook("SessionStart", source="clear"))
         return old_sid, old_source
 
+    def queued_prompt(self, text, **fields):
+        return {"type": "attachment", "uuid": str(uuid4()), "sessionId": self.sid,
+                "isSidechain": False, "userType": "external", "attachment": {
+                    "type": "queued_command", "origin": {"kind": "human"}, "commandMode": "prompt",
+                    "source_uuid": str(uuid4()), "prompt": text}, **fields}
+
+    def dispatch_continuation(self):
+        self.append(self.assistant(800))
+        self.runtime.on_hook(self.hook("PostToolBatch", tool_calls=[]))
+        assert self.runtime.advance()["phase"] == "clear_sent"
+        self.clear_epoch()
+        assert self.runtime.advance()["phase"] == "awaiting_continuation"
+        return self.continuation.call_args.args[2]
+
     def sidecar(self, agent, *, sid=None, stopped=False):
         path = self.root / (sid or self.sid) / "subagents" / f"agent-{agent}.meta.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +222,100 @@ def test_verified_native_limit_failure_rotates_below_estimated_threshold(managed
     f.append(f.user(text))
     assert f.runtime.advance()["phase"] == "running"
     assert f.runtime.receipt()["continuation_observed"]
+    f.continuation.assert_called_once()
+
+
+@pytest.mark.parametrize("content_blocks", [False, True])
+def test_queued_continuation_recovers_after_deadline_without_replay(managed_runtime, content_blocks):
+    f = managed_runtime
+    text = f.dispatch_continuation()
+    authority = f.runtime.receipt()["authorization"]
+    with core.lock(f.runtime.lock_path):
+        state = f.runtime._state()
+        state["rotation_deadline"] = 0
+        f.runtime._save(state)
+    assert f.runtime.advance()["reconciliation"]["reason"] == "continuation_history_confirmation_deadline_elapsed"
+    prompt = [{"type": "text", "text": text}] if content_blocks else text
+    f.append(f.queued_prompt(prompt), f.assistant())
+    recovered = f.runtime.recover_observation(f.sid)
+    assert recovered["phase"] == "running"
+    assert recovered["continuation_observed"]
+    assert recovered["reconciliation"] is None
+    assert not recovered["rotation_pending"]
+    assert not recovered["clear_pending"]
+    result = f.runtime.on_hook(f.hook("UserPromptSubmit", prompt="Pause development; check the runtime only."))
+    assert result.get("continue") is not False
+    assert f.runtime.receipt()["authorization"] == authority
+    f.clear.assert_called_once()
+    f.continuation.assert_called_once()
+
+
+def test_queued_continuation_preserves_later_pause_input(managed_runtime):
+    f = managed_runtime
+    text = f.dispatch_continuation()
+    pause = "Pause development; do not restart completed work."
+    assert f.runtime.on_hook(f.hook("UserPromptSubmit", prompt=pause))["continue"] is False
+    f.append(f.queued_prompt(pause))
+    deferred = f.runtime._state()["deferred_inputs"]
+    locators = f.runtime._deferred_input_locators(f.runtime._state())
+    assert locators is not None and len(locators) == 1
+    f.append(f.queued_prompt(text))
+    result = f.runtime.recover_observation(f.sid)
+    assert result["continuation_observed"]
+    assert f.runtime._state()["deferred_inputs"] == deferred
+    assert not f.runtime._state()["at_turn_boundary"]
+    f.clear.assert_called_once()
+    f.continuation.assert_called_once()
+
+
+@pytest.mark.parametrize("fault", [
+    "queue_only", "wrong_body", "rendered_only", "sidechain", "wrong_session",
+    "wrong_origin", "wrong_mode", "missing_source_uuid", "tool_result",
+])
+def test_continuation_requires_exact_delivered_native_input(managed_runtime, fault):
+    f = managed_runtime
+    text = f.dispatch_continuation()
+    record = f.queued_prompt(text)
+    if fault == "queue_only":
+        record = {"type": "queue-operation", "sessionId": f.sid, "operation": "enqueue", "content": text}
+    elif fault == "wrong_body":
+        record["attachment"]["prompt"] += " changed"
+    elif fault == "rendered_only":
+        record["attachment"]["prompt"] = "Different input"
+        record["rendered"] = [{"role": "system", "content": text}]
+    elif fault == "sidechain":
+        record["isSidechain"] = True
+    elif fault == "wrong_session":
+        record["sessionId"] = str(uuid4())
+    elif fault == "wrong_origin":
+        record["attachment"]["origin"] = {"kind": "agent"}
+    elif fault == "wrong_mode":
+        record["attachment"]["commandMode"] = "bash"
+    elif fault == "missing_source_uuid":
+        del record["attachment"]["source_uuid"]
+    elif fault == "tool_result":
+        record = f.user([{"type": "tool_result", "tool_use_id": "fixture-tool", "content": text},
+                         {"type": "text", "text": text}])
+    f.append(record)
+    result = f.runtime.recover_observation(f.sid)
+    assert result["phase"] == "awaiting_continuation"
+    assert not result["continuation_observed"]
+    assert result["rotation_pending"] and result["clear_pending"]
+    f.clear.assert_called_once()
+    f.continuation.assert_called_once()
+
+
+def test_queued_continuation_waits_for_complete_record_but_not_later_append(managed_runtime):
+    f = managed_runtime
+    text = f.dispatch_continuation()
+    raw = (json.dumps(f.queued_prompt(text)) + "\n").encode()
+    with f.source.open("ab") as handle:
+        handle.write(raw[:80])
+    assert not f.runtime.recover_observation(f.sid)["continuation_observed"]
+    with f.source.open("ab") as handle:
+        handle.write(raw[80:] + b'{"type":"assistant"')
+    assert f.runtime.recover_observation(f.sid)["continuation_observed"]
+    f.clear.assert_called_once()
     f.continuation.assert_called_once()
 
 

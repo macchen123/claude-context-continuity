@@ -1,3 +1,3 @@
 """Bounded context continuation helpers for native Claude Code sessions."""
 
-__version__ = "0.4.6"
+__version__ = "0.4.7.dev2"

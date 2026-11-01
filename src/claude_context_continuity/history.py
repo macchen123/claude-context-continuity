@@ -189,6 +189,9 @@ def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
     """原生输入的精确公开形态；不模糊搜索或重建用户正文。"""
     if record.get("isSidechain"):
         return ()
+    queued = _queued_user_text(record)
+    if queued is not None:
+        return (queued.strip(),)
     if record.get("type") == "user":
         if _results(record):
             return ()
@@ -227,8 +230,9 @@ def source_kind(record: Mapping[str, Any]) -> str:
         return "sidechain"
     if record_type == "summary":
         return "summary"
-    if not _flag(record, "isMeta") and _queued_user_text(record) is not None:
-        return "original_user"
+    queued = _queued_user_text(record)
+    if not _flag(record, "isMeta") and queued is not None:
+        return "meta" if queued.lstrip().lower().startswith(_RUNTIME) else "original_user"
     if record_type in _META:
         return "meta"
     if record_type == "tool_result":

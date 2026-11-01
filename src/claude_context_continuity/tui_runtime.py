@@ -886,15 +886,16 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         return encoded
 
     def _confirm_continuation(self, state):
-        from .history import _content, _texts
+        from .history import _submitted_prompt_texts
         path = state.get("source_path")
         if not path or not Path(path).exists() or not state.get("continuation_hash"):
             return False
         source = _source(path, state["session_id"])
         # A complete continuation record remains decisive even while native is
         # appending a later record.  Never infer delivery from the transport.
-        observed = any(core.digest("\n".join(_texts(_content(info.data)))) == state["continuation_hash"]
-                       for info in source._records(defer_incomplete_tail=True) if info.data.get("type") == "user")
+        observed = any(core.digest(text) == state["continuation_hash"]
+                       for info in source._records(include_attachments=True, defer_incomplete_tail=True)
+                       for text in _submitted_prompt_texts(info.data))
         if observed:
             state["continuation_observed"] = True
             state.pop("continuation_hash", None)

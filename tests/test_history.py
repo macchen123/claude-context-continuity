@@ -448,6 +448,19 @@ class HistorySourceTests(unittest.TestCase):
         self.assertIn("图像未包含", projection)
         self.assertNotIn("not-public", projection)
 
+    def test_queued_runtime_messages_do_not_replace_human_authority(self) -> None:
+        human = self.record("human-1", "user", "Pause development until the runtime is repaired.")
+        for prefix in ("<continuity-host-event>", "<system-reminder>", "<task-notification>"):
+            with self.subTest(prefix=prefix):
+                queued = self.record("queued-1", "attachment", isSidechain=False, userType="external",
+                                     attachment={"type": "queued_command", "origin": {"kind": "human"},
+                                                 "commandMode": "prompt", "source_uuid": self.SID,
+                                                 "prompt": prefix + "\nRuntime notice, not a new instruction."})
+                self.write_records(human, queued)
+                self.assertEqual(source_kind(queued), "meta")
+                self.assertEqual(self.source().latest_instruction()["message_id"], "human-1")
+                self.assertEqual(self.source().instruction_updates_since(self.source().locator("human-1")), [])
+
     def test_attested_peer_and_task_notifications_are_readable_meta_without_authority(self) -> None:
         human = self.record("human-1", "user", "Keep the existing human instruction.")
         peer_body = "peer completion public marker"
