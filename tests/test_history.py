@@ -164,6 +164,32 @@ class HistorySourceTests(unittest.TestCase):
         self.assertEqual(self.source().read(self.source().locator("stdout"))["text"], "")
         self.assertEqual(self.source().latest_instruction()["message_id"], "human-root")
 
+    def test_tools_used_metadata_preserves_history_usage_and_authorization(self) -> None:
+        original = self.record("user-1", "user", "continue the authorized task")
+        assistant = self.record("assistant-1", "assistant", "public result")
+        assistant["message"].update(model="native-model", usage={
+            "input_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        tools = {"type": "tools-used", "sessionId": self.SID,
+                 "tools": ["Bash", "tools-metadata-only"]}
+        self.write_records(original, assistant)
+        before = self.source().instruction_bounds()
+        with self.path.open("ab") as handle:
+            handle.write(self.line(tools) * 2)
+        self.assertEqual(source_kind(tools), "meta")
+        self.assertEqual(self.source().instruction_bounds(), before)
+        self.assertEqual(self.source().latest_usage()["total_input_tokens"], 125)
+        self.assertEqual([record.message_id for record in self.source()._records()],
+                         ["user-1", "assistant-1"])
+        self.assertEqual(self.source().read(before["last"])["text"], "continue the authorized task")
+        self.assertEqual(self.source().search("tools-metadata-only")["entries"], [])
+        self.assertNotIn("tools-metadata-only", json.dumps(self.source().index_projection()))
+
+    def test_tools_used_metadata_still_rejects_another_session(self) -> None:
+        self.write_records(self.record("user-1", "user", "authorized task"),
+                           {"type": "tools-used", "sessionId": str(uuid4()), "tools": ["Bash"]})
+        with self.assertRaisesRegex(HistoryError, "another session"):
+            self.source().instruction_bounds()
+
     def test_pr_link_metadata_without_uuid_preserves_history_and_usage(self) -> None:
         original = self.record("user-1", "user", "continue the authorized task")
         assistant = self.record("assistant-1", "assistant", "public result")
