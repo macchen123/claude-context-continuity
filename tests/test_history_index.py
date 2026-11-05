@@ -111,6 +111,18 @@ class HistoryIndexTests(unittest.TestCase):
             self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
             self.assertEqual(index.search([spec], "agent-name-metadata-only")["entries"], [])
 
+    def test_tools_used_metadata_append_preserves_index_and_authorization(self) -> None:
+        spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "tools-used.sqlite") as index:
+            before = index.search([spec], "needle", source_kinds=("original_user",))
+            tools = {"type": "tools-used", "sessionId": sid, "tools": ["tools-metadata-only"]}
+            self.append(path, tools)
+            self.append(path, tools)
+            after = index.search([spec], "needle", source_kinds=("original_user",))
+            self.assertEqual(self.ids(after), ["user-1"])
+            self.assertEqual(after["entries"][0]["locator"], before["entries"][0]["locator"])
+            self.assertEqual(index.search([spec], "tools-metadata-only")["entries"], [])
+
     def test_api_request_metadata_append_preserves_index_and_authorization(self) -> None:
         spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
         with HistoryIndex(self.work / "api-request.sqlite") as index:

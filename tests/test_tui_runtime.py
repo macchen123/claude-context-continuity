@@ -175,6 +175,32 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertTrue(receipt["reconciliation"]["reason"])
         self.assertNotIn("pause_reason", receipt)
 
+    def test_startup_catalogue_waits_for_first_native_transcript_write(self):
+        runtime, sid, source = self.resume_runtime(history_present=False)
+        catalogue = runtime.directory / "history"
+        self.assertEqual(list(catalogue.glob("*.json")), [])
+        self.usage(125, source, sid)
+        runtime.on_hook({"hook_event_name": "PreToolUse", "session_id": sid,
+                         "cwd": str(self.cwd), "transcript_path": str(source),
+                         "tool_use_id": "first-history-probe"})
+        entries = [core.read_json(path) for path in catalogue.glob("*.json")]
+        self.assertEqual(entries, [{"generation": 0, "session_id": sid, "source_path": str(source)}])
+
+    def test_resume_from_unwritten_startup_keeps_history_search_available(self):
+        from claude_context_continuity.history_index import HistoryIndex
+        runtime, _, startup_path = self.resume_runtime(history_present=False)
+        sid, source = self.resume_source(125)
+        runtime.on_hook({"hook_event_name": "SessionStart", "session_id": sid,
+                         "cwd": str(self.cwd), "source": "resume", "transcript_path": str(source)})
+        entries = [core.read_json(path) for path in (runtime.directory / "history").glob("*.json")]
+        self.assertEqual([entry["session_id"] for entry in entries], [sid])
+        self.assertFalse(startup_path.exists())
+        with HistoryIndex(self.root / "startup-resume.sqlite") as index:
+            result = index.search(entries, None, source_kinds=("original_user",))
+        self.assertEqual([entry["locator"]["session_id"] for entry in result["entries"]], [sid])
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_hook_child_identity_uses_only_native_agent_id(self):
         self.runtime.on_hook(self.hook("SubagentStart", agentId="obsolete-child"))
         self.assertEqual(self.runtime.receipt()["active_child_handles"], [])

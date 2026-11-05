@@ -683,7 +683,9 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 raise ContextRuntimeError("未安排的会话切换；保留状态，不自动接管")
             if path is not None:
                 state["source_path"] = path
-                self._catalogue_source(state)
+                # SessionStart can precede file creation; later history observation registers it.
+                if Path(path).exists():
+                    self._catalogue_source(state)
             self._window(state, event)
             if event.get("model") is not None:
                 state["native_session_model"] = event["model"]
