@@ -65,6 +65,33 @@ class NotesStoreTests(unittest.TestCase):
         self.assertEqual(self.store.read("plan")["text"], "replacement")
         self.assertEqual(replacement["revision"], replacement["sha256"])
 
+    def test_unchanged_write_and_historical_reuse_preserve_immutable_revisions(self) -> None:
+        first = self.store.write("plan", "first", None)
+        revisions = self.root / "notes" / "plan" / "revisions"
+        original = revisions / f"{first['revision']}.json"
+        pointer = revisions.parent / "current.json"
+        original_inode, pointer_inode = original.stat().st_ino, pointer.stat().st_ino
+
+        unchanged = self.store.write("plan", "first", first["sha256"])
+        self.assertFalse(unchanged["created"])
+        self.assertEqual(pointer.stat().st_ino, pointer_inode)
+        second = self.store.write("plan", "second", first["sha256"])
+        reverted = self.store.write("plan", "first", second["sha256"])
+        self.assertEqual(reverted["revision"], first["revision"])
+        self.assertEqual(original.stat().st_ino, original_inode)
+        self.assertEqual(len(list(revisions.iterdir())), 2)
+
+    def test_reusing_a_corrupted_historical_revision_does_not_move_pointer(self) -> None:
+        first = self.store.write("plan", "first", None)
+        second = self.store.write("plan", "second", first["sha256"])
+        revisions = self.root / "notes" / "plan" / "revisions"
+        original = revisions / f"{first['revision']}.json"
+        original.write_text("{}", encoding="utf-8")
+        with self.assertRaises(NotesError):
+            self.store.write("plan", "first", second["sha256"])
+        self.assertEqual(self.store.read("plan")["sha256"], second["sha256"])
+        self.assertEqual(original.read_text(encoding="utf-8"), "{}")
+
     def test_stale_hash_and_explicit_preconditions_are_rejected(self) -> None:
         created = self.store.write("plan", "first", None)
         current = self.store.append("plan", " second", created["sha256"])

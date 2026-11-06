@@ -27,6 +27,53 @@ from claude_context_continuity.tui_runtime import TuiRuntime, _write_plugin
 from native_runtime_probe import _handler, isolated_environment
 
 MARKER = "NATIVE_PRESERVED_CHILD_HISTORY"
+PARALLEL_MARKER = "SYNTHETIC_PARALLEL_READ_RECEIPT"
+
+
+def parallel_fragments(raw, workspace):
+    """Derive a parallel-response fixture only from this probe's private history."""
+    lines = raw.splitlines(keepends=True)
+    rows = [json.loads(line) for line in lines]
+    call_index = next(index for index, row in enumerate(rows)
+                      if row.get("type") == "assistant" and any(
+                          isinstance(block, dict) and block.get("type") == "tool_use" for block in row["message"]["content"]))
+    first = rows[call_index]
+    call = next(block for block in first["message"]["content"] if block.get("type") == "tool_use")
+    result_index = next(index for index, row in enumerate(rows)
+                        if row.get("type") == "user" and any(
+                            isinstance(block, dict) and block.get("tool_use_id") == call["id"] for block in row["message"]["content"]))
+    second = json.loads(json.dumps(first))
+    second["uuid"], second["parentUuid"] = str(uuid4()), first["uuid"]
+    second_call = {"type": "tool_use", "id": "tool_parallel_" + uuid4().hex,
+                   "name": "Read", "input": {"file_path": str(workspace / "parallel.txt")}}
+    second["message"]["content"] = [second_call]
+    attachment = {key: first[key] for key in ("agentId", "sessionId", "isSidechain", "cwd") if key in first}
+    attachment.update(type="attachment", uuid=str(uuid4()), parentUuid=second["uuid"],
+                      attachment={"type": "hook_success", "hookName": "PostToolUse:Read",
+                                  "hookEvent": "PostToolUse", "content": "", "exitCode": 0})
+    first_result = json.loads(json.dumps(rows[result_index]))
+    first_result["parentUuid"] = first["uuid"]
+    second_result = json.loads(json.dumps(first_result))
+    second_result["uuid"], second_result["parentUuid"] = str(uuid4()), second["uuid"]
+    second_result["message"]["content"] = [{"type": "tool_result", "tool_use_id": second_call["id"],
+                                              "content": PARALLEL_MARKER}]
+    second_result.pop("toolUseResult", None)
+    following = []
+    for line, row in zip(lines[result_index + 1:], rows[result_index + 1:]):
+        if row.get("parentUuid") == first_result["uuid"]:
+            row["parentUuid"] = second_result["uuid"]
+            line = (json.dumps(row, ensure_ascii=False) + "\n").encode()
+        following.append(line)
+
+    def encode(row):
+        return (json.dumps(row, ensure_ascii=False) + "\n").encode()
+
+    prefix = b"".join(lines[:call_index + 1]) + encode(second)
+    suffix = (encode(attachment) + b"".join(lines[call_index + 1:result_index])
+              + encode(first_result) + encode(second_result) + b"".join(following))
+    return prefix, suffix, {"response_id": first["message"]["id"],
+                            "tool_ids": [call["id"], second_call["id"]],
+                            "parent_uuids": [first["uuid"], second["uuid"]]}
 
 
 class ResumeModel:
@@ -36,6 +83,7 @@ class ResumeModel:
         self.requests, self.child_count, self.parent_count = [], 0, 0
         self.phase, self.done_phase, self.failed, self.agent = 0, -1, None, None
         self.history_checks = []
+        self.parallel_fixture, self.parallel_checks = None, []
 
     def wait(self, predicate):
         deadline = time.monotonic() + 20
@@ -82,6 +130,27 @@ class ResumeModel:
                     str(self.workspace / "release-child")])
                 return "Bash", {"command": command, "description": "Wait for the private parent rotation gate"}, 100
             expected = f"RESUME_PHASE_{self.phase}"
+            if self.parallel_fixture and self.phase:
+                fixture = self.parallel_fixture
+                messages = body.get("messages", [])
+                blocks = [block for message in messages if isinstance(message.get("content"), list)
+                          for block in message["content"] if isinstance(block, dict)]
+                calls = [block.get("id") for block in blocks if block.get("type") == "tool_use"]
+                results = [block.get("tool_use_id") for block in blocks if block.get("type") == "tool_result"]
+                check = {"phase": self.phase, "tool_calls_once": all(calls.count(uid) == 1 for uid in fixture["tool_ids"]),
+                         "tool_results_once": all(results.count(uid) == 1 for uid in fixture["tool_ids"]),
+                         "same_response": any(set(fixture["tool_ids"]) <= {
+                             block.get("id") for block in message.get("content", []) if isinstance(block, dict)
+                             and block.get("type") == "tool_use"} for message in messages
+                             if message.get("role") == "assistant" and isinstance(message.get("content"), list)),
+                         "parallel_result": PARALLEL_MARKER in rendered,
+                         "resume_message": expected in rendered}
+                if self.phase == 1:
+                    published = Path(fixture["published_path"]).read_bytes()
+                    expected_bytes = fixture["published_bytes"]
+                    check.update(published_exact_prefix=published.startswith(expected_bytes),
+                                 published_prefix_sha256=hashlib.sha256(published[:len(expected_bytes)]).hexdigest())
+                self.parallel_checks.append(check)
             self.history_checks.append({"phase": self.phase, "original_prompt": MARKER in rendered,
                                         "original_tool_result": "ORIGINAL_PRODUCER_RECEIPT" in rendered,
                                         "resume_message": expected in rendered})
@@ -110,8 +179,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--running-crossing", action="store_true", help="Keep a native child tool running across the second clear")
     parser.add_argument("--fragmented-history", action="store_true", help="Split the private native child stream before its first cross-window resume")
+    parser.add_argument("--parallel-tool-fragments", action="store_true",
+                        help="Restore a synthetic parallel tool response split across private native fragments (implies --fragmented-history)")
     args = parser.parse_args()
-    home = ROOT / ".cache" / "subagent-resume-repair-20261027" / ("native-" + uuid4().hex[:8])
+    if args.parallel_tool_fragments:
+        args.fragmented_history = True
+    home = ROOT / ".cache" / "native-parallel-tool-resume" / ("native-" + uuid4().hex[:8])
     home.mkdir(parents=True, mode=0o700)
     workspace, config, temporary = home / "workspace", home / "native-config", home / "tmp"
     for path in (workspace, config, temporary):
@@ -200,15 +273,29 @@ def main():
                         original = next(config.glob(f"projects/*/{sessions[0]}/subagents/agent-{model.agent}.jsonl"))
                         project = original.parents[2]
                         current = project / sessions[1] / "subagents" / original.name
-                        lines = original.read_bytes().splitlines(keepends=True)
-                        rows = [json.loads(line) for line in lines]
-                        cut = next(index for index, row in enumerate(rows)
-                                   if row.get("type") == "user" and "RESUME_PHASE_0" in json.dumps(row))
-                        bridge = rows[cut]["parentUuid"]
-                        while cut and rows[cut - 1].get("type") == "attachment" and rows[cut - 1].get("parentUuid") == bridge:
-                            cut -= 1
-                        prefix, suffix = b"".join(lines[:cut]), b"".join(lines[cut:])
-                        assert MARKER.encode() in prefix and b"ORIGINAL_PRODUCER_RECEIPT" in prefix
+                        raw = original.read_bytes()
+                        if args.parallel_tool_fragments:
+                            prefix, suffix, parallel = parallel_fragments(raw, workspace)
+                            (workspace / "parallel.txt").write_text(PARALLEL_MARKER + "\n")
+                            model.parallel_fixture = parallel | {"published_path": str(current),
+                                                                 "published_bytes": prefix + suffix}
+                            result["parallel_fixture"] = parallel | {
+                                "construction": "synthetic parallel records derived only from this probe's private native stream",
+                                "expected_publication_sha256": hashlib.sha256(prefix + suffix).hexdigest(),
+                                "published_path": str(current)}
+                            cut, total = len(prefix.splitlines()), len((prefix + suffix).splitlines())
+                            bridge = parallel["parent_uuids"]
+                        else:
+                            lines = raw.splitlines(keepends=True)
+                            rows = [json.loads(line) for line in lines]
+                            cut = next(index for index, row in enumerate(rows)
+                                       if row.get("type") == "user" and "RESUME_PHASE_0" in json.dumps(row))
+                            bridge = rows[cut]["parentUuid"]
+                            while cut and rows[cut - 1].get("type") == "attachment" and rows[cut - 1].get("parentUuid") == bridge:
+                                cut -= 1
+                            prefix, suffix = b"".join(lines[:cut]), b"".join(lines[cut:])
+                            assert MARKER.encode() in prefix and b"ORIGINAL_PRODUCER_RECEIPT" in prefix
+                            total = len(rows)
                         temporary_history = current.with_suffix(".fixture")
                         temporary_history.write_bytes(suffix)
                         os.replace(temporary_history, current)
@@ -216,7 +303,7 @@ def main():
                         result["fragment_fixture"] = {"original_path": str(original), "bridge_uuid": bridge,
                             "original_sha256": hashlib.sha256(prefix).hexdigest(),
                             "suffix_sha256": hashlib.sha256(suffix).hexdigest(),
-                            "prefix_rows": cut, "suffix_rows": len(rows) - cut}
+                            "prefix_rows": cut, "suffix_rows": total - cut}
                 submit(f"PARENT_RESUME_FIXTURE_PHASE_{phase}: perform only the scripted local fixture.")
                 wait(lambda: model.done_phase == phase or model.failed, f"phase {phase} native SendMessage")
                 if model.failed:
@@ -229,6 +316,7 @@ def main():
             producer_once = (workspace / "producer.txt").read_text() == "once\n"
             result.update(context_id=runtime.conversation_id, sessions=sessions, agent_id=model.agent,
                 child_requests=model.child_count, request_summaries=model.requests, history_checks=model.history_checks,
+                parallel_history_checks=model.parallel_checks,
                 same_history_inode=len(identities) == 1, history_count=len(histories), produced_once=producer_once,
                 preserved_role=all(row.get("agentType") == "resume-worker" for row in metadata),
                 preserved_model_slot=(len({row["model"] for row in model.requests if row["scope"] == "child"}) == 1
@@ -256,6 +344,10 @@ def main():
                        and all(row["original_prompt"] and row["original_tool_result"] for row in model.history_checks)
                        and model.history_checks[-1]["resume_message"]
                        and (not args.running_crossing or result.get("running_at_rotation"))
+                       and (not args.parallel_tool_fragments or (
+                           len(model.parallel_checks) == 2 and {row["phase"] for row in model.parallel_checks} == {1, 2}
+                           and all(all(value for key, value in row.items() if key not in {"phase", "published_prefix_sha256"})
+                                   for row in model.parallel_checks)))
                        and result["preserved_role"] and result["preserved_model_slot"] and result["preserved_metadata_profile"])
             result["status"] = "passed" if success else "failed"
     except Exception as error:

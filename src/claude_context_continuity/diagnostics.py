@@ -31,7 +31,7 @@ _METRICS = {
     "remaining_tokens": "remaining_source",
 }
 _LABELS = frozenset(("hook", "hook_event", "source", "usage_source", "decision",
-                     "error_origin", *_METRICS.values()))
+                     "error_origin", "error_type", *_METRICS.values()))
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", re.ASCII)
 _MODEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:()\[\]/-]*", re.ASCII)
 _CREDENTIAL = re.compile(r"(?:sk[-_]|gh[pousr]_|github_pat_|AKIA|ASIA|eyJ|xox[baprs]-)", re.I)

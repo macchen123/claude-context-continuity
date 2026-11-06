@@ -56,6 +56,26 @@ class AgentBudgetTests(unittest.TestCase):
     def child(self):
         return agent_runtime._load(self.runtime.directory, self.agent)
 
+    def test_budget_load_preserves_defaults_and_rejects_foreign_identity(self):
+        agent = "a87654321"
+        expected = agent_runtime._load(self.runtime.directory, agent)
+        path = agent_runtime._path(self.runtime.directory, agent)
+        core.atomic(path, {"agent_id": agent})
+        self.assertEqual(agent_runtime._load(self.runtime.directory, agent), expected)
+        core.atomic(path, {"agent_id": agent, "replacement_required": True})
+        self.assertTrue(agent_runtime._load(self.runtime.directory, agent)["replacement_required"])
+        for value in ([], None, {"agent_id": self.agent}):
+            with self.subTest(value=value):
+                core.atomic(path, value)
+                with self.assertRaisesRegex(ValueError, "agent_budget_identity_mismatch"):
+                    agent_runtime._load(self.runtime.directory, agent)
+
+    def test_stop_hook_confirms_terminal_even_when_usage_read_fails(self):
+        with patch.object(agent_runtime, "transcript_usage", side_effect=OSError("fixture read failure")):
+            self.runtime.on_hook(self.event("SubagentStop", agent_transcript_path=str(self.path)))
+        self.assertTrue(self.child()["terminal_observed"])
+        self.assertEqual(self.child()["decision"], "usage_unavailable")
+
     def test_child_usage_never_mutates_parent_budget_or_rotation(self):
         before = self.runtime._state()
         self.append(50, cache=600, output=120)
@@ -75,6 +95,19 @@ class AgentBudgetTests(unittest.TestCase):
         self.assertIsNone(self.runtime._state()["native_context_window"])
         self.runtime.on_hook(self.event("PostToolUse", modelUsage={"parent": {"contextWindow": 100}}))
         self.assertEqual(self.child()["window_tokens"], 500)
+
+    def test_invalid_child_window_cannot_fall_back_to_parent_aggregate(self):
+        self.append(100)
+        for value in (None, False, 0, -1, "500"):
+            for field in ("contextWindow", "context_window"):
+                with self.subTest(field=field, value=value):
+                    child = {"agent_id": self.agent}
+                    agent_runtime._observe(child, self.path, self.sid, 1000,
+                        {field: value, "modelUsage": {"parent": {"contextWindow": 100}}})
+                    self.assertIsNone(child.get("native_context_window"))
+                    self.assertEqual(child["window_tokens"], 1000)
+                    self.assertEqual(child["window_source"], "configured_estimate")
+                    self.assertFalse(child.get("replacement_required", False))
 
     def test_incomplete_cache_and_unknown_window_are_not_zero(self):
         row = self.append(20)

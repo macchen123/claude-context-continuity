@@ -42,7 +42,7 @@ def test_complete_allowlist_and_sources(directory: Path) -> None:
         "usage_request_id": "req_usage_0",
         "model": "claude-sonnet-4-6", "hook": "PreToolUse", "hook_event": "PostToolUse",
         "source": "native_usage", "usage_source": "native_usage",
-        "decision": "observe", "error_origin": "native_synthetic", "request_sent": False,
+        "decision": "observe", "error_origin": "native_synthetic", "error_type": "OSError", "request_sent": False,
         "input_tokens": 100, "input_source": "native_usage",
         "cache_tokens": 90, "cache_source": "native_usage",
         "cache_read_input_tokens": 80, "cache_read_source": "native_usage",

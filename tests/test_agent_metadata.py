@@ -65,6 +65,10 @@ class AgentMetadataTests(unittest.TestCase):
         self.source.write_text("")
         return self.runtime.on_hook(self.event("SessionStart", source="clear"))
 
+    def clear_and_send(self):
+        self.clear()
+        return self.send()
+
     def send(self, to=None):
         return self.runtime.on_hook(self.event("PreToolUse", tool_name="SendMessage", tool_use_id=str(uuid4()),
             tool_input={"to": to or self.agent, "message": "Continue the existing bounded task."}))
@@ -78,7 +82,7 @@ class AgentMetadataTests(unittest.TestCase):
         for rotated in (False, True):
             if rotated:
                 transcript.write_bytes(valid)
-                self.clear()
+                self.clear_and_send()
             for tail in (b'{"type":', large):
                 with self.subTest(rotated=rotated, tail_bytes=len(tail)):
                     transcript.write_bytes(valid + tail)
@@ -112,7 +116,7 @@ class AgentMetadataTests(unittest.TestCase):
 
     def test_missing_history_never_reports_metadata_only_resume_ready(self):
         self.original.with_name(f"agent-{self.agent}.jsonl").unlink()
-        self.clear()
+        self.clear_and_send()
         self.assertTrue(self.sidecar(self.sid).exists())
         compatibility = self.runtime._state()["agent_metadata_compat"]
         self.assertEqual(compatibility["status"], "blocked")
@@ -121,7 +125,7 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertIn("original_agent_history_missing", guard["permissionDecisionReason"])
 
     def test_shared_history_mixed_parent_sessions_cannot_bypass_child_budget(self):
-        self.clear()
+        self.clear_and_send()
         transcript = self.sidecar(self.sid).with_name(f"agent-{self.agent}.jsonl")
         with transcript.open("a") as stream:
             stream.write(json.dumps({"type": "assistant", "sessionId": self.sid, "agentId": self.agent,
@@ -132,7 +136,7 @@ class AgentMetadataTests(unittest.TestCase):
         guard = self.send()["hookSpecificOutput"]
         self.assertEqual(guard["permissionDecision"], "deny")
         self.assertIn("超限子代理", guard["permissionDecisionReason"])
-        self.clear()
+        self.clear_and_send()
         self.assertIn("超限子代理", self.send()["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_clear_preserves_active_custom_role_model_and_opaque_fields(self):
@@ -140,16 +144,18 @@ class AgentMetadataTests(unittest.TestCase):
         before = self.original.read_bytes()
         self.clear()
         target = self.sidecar(self.sid)
-        actual = json.loads(target.read_text()) if target.exists() else {"agentType": "general-purpose"}
+        self.assertFalse(target.exists())
+        self.assertNotEqual(self.send().get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+        actual = json.loads(target.read_text())
         self.assertEqual(actual, self.metadata)
         self.assertEqual(self.original.read_bytes(), before)
         self.assertIn(self.agent, self.runtime.receipt()["active_child_handles"])
 
 
     def test_completed_agent_survives_two_clears_and_idempotent_start(self):
-        self.clear()
+        self.clear_and_send()
         first = self.sidecar(self.sid)
-        self.clear()
+        self.clear_and_send()
         second = self.sidecar(self.sid)
         before = second.stat()
         self.runtime.on_hook(self.event("SessionStart", source="clear"))
@@ -160,7 +166,7 @@ class AgentMetadataTests(unittest.TestCase):
 
     def test_finished_after_clear_preserves_identity_and_current_completion_state(self):
         before = self.original.read_bytes()
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         completed = {**self.metadata, "finished": True}
         target.write_text(json.dumps(completed))
@@ -171,14 +177,14 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), target_before)
         self.assertEqual(target.stat().st_mtime_ns, modified)
         self.assertEqual(self.original.read_bytes(), before)
-        self.clear()
+        self.clear_and_send()
         self.assertEqual(json.loads(self.sidecar(self.sid).read_text()), completed)
         self.assertNotEqual(self.send().get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
 
     def test_finished_removed_in_current_window_is_not_restored_from_old_window(self):
         self.original.write_text(json.dumps({**self.metadata, "finished": True}))
         before = self.original.read_bytes()
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         target.write_text(json.dumps(self.metadata))
         target_before = target.read_bytes()
@@ -188,13 +194,13 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), target_before)
         self.assertEqual(target.stat().st_mtime_ns, modified)
         self.assertEqual(self.original.read_bytes(), before)
-        self.clear()
+        self.clear_and_send()
         self.assertEqual(json.loads(self.sidecar(self.sid).read_text()), self.metadata)
 
     def test_resume_lazily_restores_legacy_missing_sidecar_by_id_and_name(self):
         self.metadata["name"] = "bounded-worker"
         self.original.write_text(json.dumps(self.metadata))
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         for to in (self.agent, "bounded-worker", "bounded-worker [abc123]", "bounded-worker[abc123]", self.agent[:8],
                    f" {self.agent} ", " bounded-worker [ABC123] "):
@@ -205,7 +211,7 @@ class AgentMetadataTests(unittest.TestCase):
                 self.assertEqual(json.loads(target.read_text()), self.metadata)
 
     def test_known_default_fallback_is_repaired_only_after_writer_stops(self):
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         broken = {key: self.metadata[key] for key in ("spawnDepth", "requestShape", "requestNonInteractive")}
         broken["agentType"] = "general-purpose"
@@ -223,7 +229,7 @@ class AgentMetadataTests(unittest.TestCase):
     def test_general_purpose_explicit_model_is_not_replaced_with_parent_default(self):
         self.metadata["agentType"] = "general-purpose"
         self.original.write_text(json.dumps(self.metadata))
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         target.write_text(json.dumps({"agentType": "general-purpose", "spawnDepth": 1}))
         result = self.send()
@@ -273,7 +279,7 @@ class AgentMetadataTests(unittest.TestCase):
 
     def test_native_launch_name_restores_original_metadata_without_a_sidecar_name_field(self):
         self.record_named_launch("bounded-worker")
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         target.unlink()
         result = self.send(" BOUNDED WORKER [abc123] ")
@@ -414,7 +420,7 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertIn("native_session_identity_mismatch", guard["permissionDecisionReason"])
 
     def test_unknown_metadata_and_model_conflicts_are_never_overwritten(self):
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         for change in ({"agentType": "research-scout"}, {"model": "haiku"}, {"toolUseId": "other-call"},
                        {"futureNativeField": {"keep": False}}, {"permissionMode": "bypassPermissions"}):
@@ -425,7 +431,7 @@ class AgentMetadataTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), before)
 
     def test_stop_marker_is_not_lost_after_migration(self):
-        self.clear()
+        self.clear_and_send()
         self.sidecar(self.sid).write_text(json.dumps({**self.metadata, "finished": True}))
         self.original.write_text(json.dumps({**self.metadata, "stoppedByUser": True}))
         result = self.send()
@@ -436,7 +442,7 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertTrue(json.loads(self.sidecar(self.sid).read_text())["stoppedByUser"])
 
     def test_malformed_symlink_and_secret_sidecars_fail_closed(self):
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         target.unlink()
         self.original.write_text("{incomplete")
@@ -461,14 +467,14 @@ class AgentMetadataTests(unittest.TestCase):
         nested.parent.mkdir()
         nested.write_text(json.dumps(value))
         self.original.unlink()
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid).parent / "nested" / self.original.name
         self.assertEqual(json.loads(target.read_text()), value)
         self.assertFalse(self.sidecar(self.sid).exists())
 
     def test_source_change_and_destination_race_do_not_publish_wrong_identity(self):
         from claude_context_continuity import agent_metadata
-        self.clear()
+        self.clear_and_send()
         target = self.sidecar(self.sid)
         target.unlink()
         with patch.object(agent_metadata, "_same_snapshot", side_effect=agent_metadata.MetadataError("changed")):
@@ -485,7 +491,7 @@ class AgentMetadataTests(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text()), other)
 
     def test_sendmessage_restore_and_child_calls_are_guarded(self):
-        self.clear()
+        self.clear_and_send()
         self.sidecar(self.sid).unlink()
         result = self.send()
         self.assertNotEqual(result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")

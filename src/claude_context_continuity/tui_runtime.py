@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import ExitStack
 from copy import deepcopy
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from .context_failure import is_context_rejection, rejection_locator
 from .context_runtime import (ContextRuntime, ContextRuntimeError, NativeHistoryPending, UnsupportedRuntimePhase,
                               _safe_note, _source, _uuid,
                               context_prompt, _runtime_message, _event_context_window)
-from .history import HistoryError, HistorySource, redact
+from .history import HistoryError, HistorySource, NativeUsagePending, redact
 from .resume_binding import ResumeBindingMixin
 
 
@@ -150,7 +151,13 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             return
         from . import agent_metadata
         try:
-            entries = self._catalogue_entries(self) if entries is None else entries
+            if entries is None:
+                bindings = state.get("child_handle_sources", {})
+                if all(child in bindings for child in state["active_child_handles"]):
+                    entries = [{"session_id": bindings[child][0], "source_path": bindings[child][1]}
+                               for child in state["active_child_handles"]]
+                else:
+                    entries = self._catalogue_entries(self)
             stopped = agent_metadata.stopped_handles(state, entries)
         except (ValueError, OSError, KeyError, TypeError):
             return
@@ -158,33 +165,47 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             state["active_child_handles"] = [handle for handle in state["active_child_handles"] if handle not in stopped]
             state["child_stop_receipts"] = [{"agent_id": handle, **proof} for handle, proof in sorted(stopped.items())][-8:]
 
-    def _agent_metadata(self, state, event, *, inherit=False, delivery_allowed=True):
+    def _prepare_agent_metadata(self, state, event):
+        from . import agent_metadata
+        try:
+            return agent_metadata.synchronize(
+                state, self._catalogue_entries(self), self.directory,
+                to=agent_metadata.recipient(event), session_id=event.get("session_id"))
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, agent_metadata.MetadataError) else type(exc).__name__
+            return {"status": "blocked", "restored": 0, "blocked": [{"reason": reason}]}
+
+    def _agent_metadata(self, state, event, *, delivery_allowed=True, prepared=None):
         from . import agent_metadata
         to = agent_metadata.recipient(event)
-        if not inherit and to is None:
+        if to is None:
             from .agent_runtime import parent_notice
             return (parent_notice(state, event, self.directory, delivery_allowed=delivery_allowed)
                     if not event.get("agent_id") else {})
-        try:
-            if inherit and event.get("session_id") != state["session_id"]:
-                raise agent_metadata.MetadataError("native_session_identity_mismatch")
-            entries = self._catalogue_entries(self)
-            self._settle_stopped_children(state, entries)
-            outcome = agent_metadata.synchronize(state, entries, self.directory, to=to,
-                                                  session_id=event.get("session_id"))
-        except Exception as exc:
-            reason = str(exc) if isinstance(exc, agent_metadata.MetadataError) else type(exc).__name__
-            outcome = {"status": "blocked", "restored": 0, "blocked": [{"reason": reason}]}
+        outcome = prepared if prepared is not None else self._prepare_agent_metadata(state, event)
         blocked = outcome.get("blocked", [])
         state["agent_metadata_compat"] = {
             "status": outcome["status"], "restored": outcome.get("restored", 0),
             "blocked_count": len(blocked), "blocked": blocked[:8]}
-        if to is not None and blocked:
+        if blocked:
             return agent_metadata.failure_hook(event, blocked[0]["reason"])
-        if to is not None:
-            from .agent_runtime import guard_resume
-            return guard_resume(state, event, self.directory, outcome)
-        return {}
+        from .agent_runtime import guard_resume
+        return guard_resume(state, event, self.directory, outcome)
+
+    def _agent_metadata_hook(self, event):
+        binding_fields = ("session_id", "source_path", "window_generation",
+                          "pending_session_start", "native_session_uncertain")
+        with core.lock(self.lock_path, wait_seconds=5):
+            snapshot = self._state()
+        outcome = self._prepare_agent_metadata(snapshot, event)
+        with core.lock(self.lock_path, wait_seconds=5):
+            state = self._state()
+            if any(state.get(key) != snapshot.get(key) for key in binding_fields):
+                outcome = {"status": "blocked", "restored": 0,
+                           "blocked": [{"reason": "native_session_identity_mismatch"}]}
+            result = self._agent_metadata(state, event, prepared=outcome)
+            self._save(state)
+        return result
 
     def _repair_durable_cron(self, state, event, result):
         """只在原生工具尚处于忙碌回合的同步回执中修复自身新建任务。"""
@@ -252,17 +273,20 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
     def _on_hook(self, event):
         if not isinstance(event, dict):
             return super().on_hook(event)
+        from .agent_metadata import recipient
+        from .agent_runtime import merge_output
+        local_recipient = recipient(event) is not None
         name = event.get("hook_event_name")
         if event.get("agent_id") and name != "PreCompact":
-            from .agent_runtime import merge_output
             result = super().on_hook(event)
             with core.lock(self.lock_path, wait_seconds=5):
                 state = self._state()
-                result = merge_output(result, self._agent_metadata(state, event))
+                if not local_recipient:
+                    result = merge_output(result, self._agent_metadata(state, event))
                 if name == "PostToolUse":
                     result = self._bound_output(event, result)
                 self._save(state)
-            return result
+            return merge_output(result, self._agent_metadata_hook(event)) if local_recipient else result
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
             if self._settle_superseded_hook(state, event):
@@ -279,12 +303,11 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             # on the prior epoch or replace the first resume failure.
             held = self._observe_resume_target(state, event)
             result = self._hook_output(state, name) if held else None
-            if held:
-                # Holding lifecycle observation must not bypass the native identity guard.
+            if held and not local_recipient:
                 result.update(self._agent_metadata(state, event))
             self._save(state)
-            if held:
-                return result
+        if held:
+            return merge_output(result, self._agent_metadata_hook(event)) if local_recipient else result
         if name == "UserPromptSubmit":
             return self._user_prompt(event)
         if name != "SessionStart":
@@ -342,7 +365,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                     # Older receipts without a native prompt identity still need
                     # the existing exact input snapshot; never invent one.
                     try:
-                        source = _source(state.get("source_path"), state["session_id"])
+                        source = self._history_source(state.get("source_path"), state["session_id"])
                         records = source._records(defer_incomplete_tail=True)
                         state["stop_snapshot"]["instruction_head"] = source._bounds_from_records(records)["last"]
                     except (OSError, ValueError, HistoryError, ContextRuntimeError) as exc:
@@ -354,13 +377,12 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                     except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
                         self._wait(state, "continuation_history_confirmation_pending")
                         state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
-                guard = self._agent_metadata(state, event, delivery_allowed=result.get("continue") is not False)
-                if guard:
-                    from .agent_runtime import merge_output
+                if not local_recipient:
+                    guard = self._agent_metadata(state, event, delivery_allowed=result.get("continue") is not False)
                     result = merge_output(result, guard)
                 result = self._repair_durable_cron(state, event, result)
                 self._save(state)
-            return result
+            return merge_output(result, self._agent_metadata_hook(event)) if local_recipient else result
         return self._session_start(event)
 
     def _bound_output(self, event, result):
@@ -446,16 +468,12 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 state["native_prompt_id"] = event["prompt_id"]
             initial_history_pending = False
             try:
-                self._bind(state, event)
+                _, records = self._bind(state, event)
                 state["input_observed_after_byte"] = Path(state["source_path"]).stat().st_size
                 self._verify_config(state)
                 self._window(state, event)
-                observed = self._usage(state, False)
-                if (observed is not None and self._waiting(state)
-                        and state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}
-                        and not state.get("pending_session_start") and not state.get("native_session_uncertain")
-                        and state.get("authorization")):
-                    self._clear_wait(state)
+                self._usage(state, False, records=records)
+                self._clear_observation_wait(state)
             except NativeHistoryPending as exc:
                 self._wait(state, "prompt_history_prefix_pending")
                 state["diagnostic"] = str(exc)
@@ -519,8 +537,9 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             identity = (path, item["session_id"])
             if identity not in sources:
                 source = _source(path, item["session_id"])
-                sources[identity] = source, source._records(defer_incomplete_tail=True)
-            source, records = sources[identity]
+                records = source._records(defer_incomplete_tail=True)
+                sources[identity] = source, records, source._pairs(records)
+            source, records, pairs = sources[identity]
             found = next((row for row in records
                           if row.start >= item["after_byte"] and (*identity, row.message_id) not in used
                           and any(core.digest(text) == item["prompt_hash"]
@@ -528,7 +547,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             if found is None:
                 return None
             used.add((*identity, found.message_id))
-            locators.append(source.locator(found.message_id))
+            locators.append(source._locator(found, source._kind(found, pairs)))
         return locators
 
     def _confirmed_clear_activity(self, state):
@@ -546,7 +565,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         # continuation; absent path is not evidence of concurrent activity.
         if not state.get("source_path"):
             return False
-        source = _source(state.get("source_path"), state["session_id"])
+        source = self._history_source(state.get("source_path"), state["session_id"])
         records, incomplete = source._records(defer_incomplete_tail=True, _report_deferred_tail=True)
         if incomplete:
             return None
@@ -637,6 +656,7 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             elif source == "resume":
                 self._bind_resume(state, event, sid, incoming_state=previous, reobserve=reobserve)
             elif source == "clear" and sid != old_sid:
+                self._settle_stopped_children(state)
                 # SessionStart confirms a new foreground epoch, not completion
                 # of old work. Keep its receipt for late events, never replay it.
                 state["superseded_lifecycle"] = self._superseded_lifecycle(previous)
@@ -683,7 +703,8 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 raise ContextRuntimeError("未安排的会话切换；保留状态，不自动接管")
             if path is not None:
                 state["source_path"] = path
-                self._catalogue_source(state)
+                if Path(path).exists():
+                    self._catalogue_source(state)
             self._window(state, event)
             if event.get("model") is not None:
                 state["native_session_model"] = event["model"]
@@ -707,8 +728,6 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                     pass
                 self._wait(state, "session_start_identity_or_history_pending")
                 state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
-        if not state.get("native_session_uncertain"):
-            self._agent_metadata(state, event, inherit=True)
         return state
 
     def recover_observation(self, session_id):
@@ -736,13 +755,11 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             elif state["phase"] not in {"clear_sent", "awaiting_tui_prompt", "continuation_dispatching"}:
                 try:
                     source, records = self._refresh_bound_source(state)
-                    self._usage(state, True, sample=source._usage_from_records(records))
+                    self._usage(state, False, records=records)
                     if state.get("authorization"):
                         self._verify_authorization(state)
                     if not state.get("pending_session_start"):
                         self._inherit_registered_catalogue(state, source, include_registered=True)
-                        self._agent_metadata(state, {"hook_event_name": "ManualRecovery", "session_id": session_id},
-                                             inherit=True, delivery_allowed=False)
                 except (OSError, TypeError, ValueError, HistoryError, ContextRuntimeError) as exc:
                     self._wait(state, "manual_observation_prefix_pending")
                     state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
@@ -872,7 +889,8 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 value["latest_instruction_locator"] = latest
             value["background_handles"] = source._activity_from_records(records)["background_handles"]
             recent = [row for row in records if row.kind in {"assistant", "tool_result", "original_user"}][-4:]
-            value["recent_history_locators"] = [source.locator(row.message_id) for row in recent]
+            pairs = source._pairs(records)
+            value["recent_history_locators"] = [source._locator(row, source._kind(row, pairs)) for row in recent]
         current_path = state.get("source_path")
         if current_path and state["session_id"] != state["rotation"]["request"]["session_id"]:
             current = _source(current_path, state["session_id"])
@@ -886,15 +904,16 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
         return encoded
 
     def _confirm_continuation(self, state):
-        from .history import _content, _texts
+        from .history import _submitted_prompt_texts
         path = state.get("source_path")
         if not path or not Path(path).exists() or not state.get("continuation_hash"):
             return False
         source = _source(path, state["session_id"])
         # A complete continuation record remains decisive even while native is
         # appending a later record.  Never infer delivery from the transport.
-        observed = any(core.digest("\n".join(_texts(_content(info.data)))) == state["continuation_hash"]
-                       for info in source._records(defer_incomplete_tail=True) if info.data.get("type") == "user")
+        observed = any(core.digest(text) == state["continuation_hash"]
+                       for info in source._records(include_attachments=True, defer_incomplete_tail=True)
+                       for text in _submitted_prompt_texts(info.data))
         if observed:
             state["continuation_observed"] = True
             state.pop("continuation_hash", None)
@@ -924,9 +943,8 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
             self._clear_wait(state)
         return observed
 
-    @staticmethod
-    def _history_stamp(state):
-        source = _source(state["source_path"], state["session_id"])
+    def _history_stamp(self, state):
+        source = self._history_source(state["source_path"], state["session_id"])
         stat = source.path.stat()
         return source, (str(source.path), source.session_id, stat.st_dev, stat.st_ino,
                         stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
@@ -952,6 +970,15 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 entries = self._catalogue_entries(self)
             except (OSError, TypeError, ValueError, HistoryError):
                 entries, complete = [], False
+            bindings = ([state.get("pending_tool_sources", {}).get(tool) for tool in pending]
+                        + [state.get("child_handle_sources", {}).get(child) for child in children])
+            if bindings and all(binding is not None for binding in bindings):
+                required = {tuple(binding) for binding in bindings}
+                origins = [entry for entry in entries
+                           if (entry["session_id"], entry["source_path"]) in required]
+                if {(entry["session_id"], entry["source_path"]) for entry in origins} == required:
+                    first_generation = min(entry["generation"] for entry in origins)
+                    entries = [entry for entry in entries if entry["generation"] >= first_generation]
             seen = {(state["session_id"], state["source_path"])}
             for entry in reversed(entries):
                 identity = (entry["session_id"], entry["source_path"])
@@ -991,16 +1018,10 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                 or state.get("native_session_uncertain")):
             return False
         source, records = self._refresh_bound_source(state)
-        try:
-            sample = source._usage_from_records(records)
-        except HistoryError:
-            if not state.get("context_failure"):
-                raise
+        observed = self._usage(state, False, records=records)
+        if observed is None and state.get("context_failure"):
             self._wait(state, "context_rejection_without_native_usage")
             return False
-        observed = self._usage(state, False, sample=sample)
-        if observed is None:
-            raise ContextRuntimeError("current native usage is not yet available")
         if state.get("authorization"):
             self._verify_authorization(state)
             self._clear_wait(state)
@@ -1121,18 +1142,11 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                         if not stable:
                             self._save(state)
                             return self._receipt(state)
-                        self._observe_authorization_records(state, source, records)
-                        activity = source._activity_from_records(records)
+                        observed = source.observe(secrets=core.secret_values())
+                        self._observe_authorization_bounds(state, observed["instruction_bounds"])
+                        activity = observed["activity"]
                         self._reconcile_lifecycle(state, activity)
-                        try:
-                            sample = source._usage_from_records(records)
-                        except HistoryError:
-                            if not state.get("context_failure"):
-                                raise
-                            self._wait(state, "context_rejection_without_native_usage")
-                            self._save(state)
-                            return self._receipt(state)
-                        self._usage(state, True, sample=sample)
+                        self._usage(state, True, sample=observed["usage"], records=records)
                         self._automatic_rotation(state)
                         if state["rotation"]["request"]:
                             if self._current_epoch_pending(state, activity) or state["pending_tool_ids"]:
@@ -1155,6 +1169,9 @@ class TuiRuntime(ResumeBindingMixin, ContextRuntime):
                             state["at_turn_boundary"] = False
                         if not state["rotation"]["request"]:
                             idle_stamp = stamp
+            except NativeUsagePending:
+                if state.get("context_failure"):
+                    self._wait(state, "context_rejection_without_native_usage")
             except (ValueError, OSError, KeyError, TypeError, HistoryError, core.ContinuityError,
                     ContextRuntimeError, subprocess.SubprocessError) as exc:
                 try:
@@ -1467,7 +1484,7 @@ def repair_controller_from_hook(context_id, event):
         "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop", "StopFailure",
     }:
         return None
-    runtime = TuiRuntime.load(context_id)
+    runtime = TuiRuntime(context_id)
     try:
         with core.lock(runtime.lock_path, wait_seconds=5):
             state = runtime._state()
@@ -1479,12 +1496,12 @@ def repair_controller_from_hook(context_id, event):
             if path is not None and state.get("source_path") not in {None, path}:
                 return None
         return _start_controller(runtime, environment=os.environ, automatic=True)
+    except core.LockBusy:
+        return None
     except (OSError, TypeError, ValueError, KeyError, core.ContinuityError, ContextRuntimeError,
-            subprocess.SubprocessError):
-        # Hook dispatch remains non-blocking to native tools; persist only a
-        # fixed waiting reason, never the command, environment, or credential.
+            subprocess.SubprocessError) as exc:
         try:
-            runtime._wait_external("managed_hook_controller_repair_pending")
+            runtime._wait_external("managed_hook_controller_repair_pending", error=exc)
         except (OSError, TypeError, ValueError, KeyError, core.ContinuityError, ContextRuntimeError):
             pass
         return None
@@ -1553,9 +1570,12 @@ def status(context_id):
 
 
 def serve(context_id):
+    from .continuity import _dispatch_controller_event
+    from .hook_transport import HookServer
     runtime = TuiRuntime(context_id)
-    with core.lock(runtime.directory / "controller.lock", wait_seconds=5):
+    with core.lock(runtime.directory / "controller.lock", wait_seconds=5), ExitStack() as resources:
         registered, waiting, failures, recovered_error = False, False, 0, None
+        hook_server = None
         while True:
             delay = 0.25
             try:
@@ -1566,6 +1586,11 @@ def serve(context_id):
                         state["controller_package"] = {"pid": os.getpid(), "version": __version__}
                         state["controller_starting"] = False
                         runtime._save(state)
+                    if state.get("controller_managed") is True:
+                        control_env = _controller_environment(runtime, state, os.environ, automatic=True)
+                        hook_server = resources.enter_context(HookServer(
+                            context_id, control_env[native_control.HOOK_AUTH_ENV],
+                            lambda event: _dispatch_controller_event(runtime, event)))
                     registered = True
                 outcome = runtime.advance()
                 if waiting or recovered_error is not None:
@@ -1591,18 +1616,21 @@ def serve(context_id):
                 failures += 1
             except UnsupportedRuntimePhase:
                 raise  # An obsolete stage is not a transient observation fault.
-            except Exception:
+            except (OSError, ValueError, subprocess.SubprocessError):
                 _controller_diagnostic(runtime, "failed", "state_or_io_failure")
                 recovered_error = "state_or_io_failure"
                 try:
                     runtime._wait_external("controller_state_or_io_pending")
-                except Exception:
+                except (OSError, ValueError):
                     # The diagnostic is still a durable non-success signal when
                     # state persistence itself is unavailable.
                     pass
                 delay = min(2.0, 0.25 * (2 ** min(failures, 3)))
                 failures += 1
-            time.sleep(delay)
+            if hook_server is None:
+                time.sleep(delay)
+            else:
+                hook_server.serve_one(delay)
 
 
 def run(cwd, *, prompt=None, detached=False, native_args=()):

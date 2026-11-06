@@ -8,12 +8,9 @@ from pathlib import Path
 import stat
 
 from . import core
+from .agent_history_chain import AgentHistoryError, order_fragments
 
 _MAX_LINE = 8 * 1024 * 1024
-
-
-class AgentHistoryError(ValueError):
-    """Public reason only; never include native message content."""
 
 
 def _stamp(value):
@@ -57,55 +54,6 @@ def _snapshot(path, agent, sessions, *, fragments=False):
             **({"rows": rows, "raw": b"".join(chunks)} if fragments else {})}
 
 
-def _continuation(snapshots):
-    # A previously reconstructed full stream may coexist with its retained inputs.
-    maximal = [item for item in snapshots if not any(
-        item["raw"] != other["raw"] and item["raw"] in other["raw"] for other in snapshots)]
-    owners, identifiers = {}, []
-    for index, item in enumerate(maximal):
-        ids = set()
-        for row in item["rows"]:
-            uid = row.get("uuid")
-            if not isinstance(uid, str):
-                continue
-            if uid in owners:
-                raise AgentHistoryError("divergent_agent_histories")
-            owners[uid] = index
-            ids.add(uid)
-        if not ids:
-            raise AgentHistoryError("missing_agent_history_predecessor")
-        identifiers.append(ids)
-    predecessors, successors = {}, {}
-    for index, item in enumerate(maximal):
-        external = {row["parentUuid"] for row in item["rows"]
-                    if row.get("parentUuid") and row["parentUuid"] not in identifiers[index]}
-        if not external:
-            continue
-        if len(external) != 1:
-            raise AgentHistoryError("divergent_agent_histories")
-        bridge = next(iter(external))
-        if bridge not in owners:
-            raise AgentHistoryError("missing_agent_history_predecessor")
-        previous = owners[bridge]
-        ancestry = [row for row in maximal[previous]["rows"] if isinstance(row.get("uuid"), str)]
-        if (not ancestry or ancestry[-1]["uuid"] != bridge or previous in successors
-                or any(row.get("parentUuid") == bridge for row in maximal[previous]["rows"])):
-            raise AgentHistoryError("divergent_agent_histories")
-        predecessors[index], successors[previous] = previous, index
-    roots = set(range(len(maximal))) - predecessors.keys()
-    if len(roots) != 1:
-        raise AgentHistoryError("divergent_agent_histories")
-    order, current = [], roots.pop()
-    while current not in order:
-        order.append(current)
-        if current not in successors:
-            break
-        current = successors[current]
-    if len(order) != len(maximal):
-        raise AgentHistoryError("divergent_agent_histories")
-    return [maximal[index] for index in order]
-
-
 def _fragment_receipt(directory, agent, destination):
     return Path(directory) / "agent_history" / core.digest({
         "agent_id": agent, "destination": str(destination), "method": "native_history_continuation"})
@@ -130,6 +78,14 @@ def _established_fragments(receipt_directory, paths, destination):
     return {"status": "available", "path": str(destination), "source_path": str(destination), "receipt": str(applied)}
 
 
+def _same_sources(paths, snapshots):
+    stamps = {item["identity"]: item["stamp"] for item in snapshots}
+    for path in paths:
+        current = path.lstat()
+        if _stamp(current) != stamps.get(_identity(current)):
+            raise AgentHistoryError("agent_history_changed_before_publish")
+
+
 def _publish_fragments(agent, paths, destination, sessions, project, directory):
     receipt_directory = _fragment_receipt(directory, agent, destination)
     established = _established_fragments(receipt_directory, paths, destination)
@@ -139,7 +95,8 @@ def _publish_fragments(agent, paths, destination, sessions, project, directory):
     snapshots = [_snapshot(path, agent, sessions, fragments=True) for path in unique.values()]
     if {item["identity"] for item in snapshots} != set(unique):
         raise AgentHistoryError("agent_history_changed_before_publish")
-    ordered = _continuation(snapshots)
+    _same_sources(paths, snapshots)
+    ordered = order_fragments(snapshots)
     destination_stamp = _stamp(destination.lstat()) if destination.exists() else None
     if destination_stamp is not None and destination_stamp[:2] not in unique:
         raise AgentHistoryError("destination_agent_history_conflict")
@@ -178,9 +135,7 @@ def _publish_fragments(agent, paths, destination, sessions, project, directory):
                     stream.write(snapshot["raw"])
                 stream.flush()
                 os.fsync(stream.fileno())
-        for snapshot in snapshots:
-            if _stamp(Path(snapshot["path"]).lstat()) != snapshot["stamp"]:
-                raise AgentHistoryError("agent_history_changed_before_publish")
+        _same_sources(paths, snapshots)
         if destination_stamp is None:
             os.link(temporary, destination, follow_symlinks=False)
         else:
@@ -241,10 +196,9 @@ def establish(agent, records, target, sessions, directory):
         # not new publication candidates. Their incomplete or large appends must
         # retain the native consumer's semantics; budget/identity checks still run.
         return {"status": "available", "path": str(destination), "source_path": str(paths[0])}
-    snapshots = [_snapshot(path, agent, sessions) for path in paths]
-    if {snapshot["identity"] for snapshot in snapshots} != identities:
+    source = _snapshot(paths[0], agent, sessions)
+    if source["identity"] not in identities:
         raise AgentHistoryError("agent_history_changed_before_publish")
-    source = snapshots[0]
     receipt = {"agent_id": agent, "source_path": source["path"], "source_sha256": source["sha256"],
                "source_size": source["size"], "destination": str(destination), "method": "native_history_hardlink"}
     receipt_directory = Path(directory) / "agent_history" / core.digest(receipt)
@@ -256,9 +210,7 @@ def establish(agent, records, target, sessions, directory):
         core.atomic(intent, receipt, exclusive=True)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     core.safe_path(project, destination, exists=False)
-    current = Path(source["path"]).lstat()
-    if _stamp(current) != source["stamp"]:
-        raise AgentHistoryError("agent_history_changed_before_publish")
+    _same_sources(paths, [source])
     try:
         os.link(source["path"], destination, follow_symlinks=False)
     except FileExistsError:

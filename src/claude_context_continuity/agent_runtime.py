@@ -38,10 +38,7 @@ def _path(directory, agent):
 
 def _load(directory, agent):
     path = _path(directory, agent)
-    if not path.exists():
-        return {"agent_id": agent, "native_context_window": None, "usage": None, "budget": {},
-                "replacement_required": False, "terminal_observed": False}
-    value = core.read_json(path)
+    value = core.read_json(path) if path.exists() else {"agent_id": agent}
     if not isinstance(value, dict) or value.get("agent_id") != agent:
         raise ValueError("agent_budget_identity_mismatch")
     return {"native_context_window": None, "usage": None, "budget": {},
@@ -135,10 +132,10 @@ def _observe(child, path, sid, configured_window, event=None):
         child["terminal_observed"] = False
     child.update(snapshot)
     child["source_path"], child["session_id"] = str(path), sid
-    observed = _event_context_window(event or {})
-    # A parent's modelUsage aggregate is not evidence for the child's model window.
-    if event and not any(key in event for key in ("contextWindow", "context_window")):
-        observed = None
+    # Only direct child fields are evidence; never let invalid/missing values
+    # fall back to a parent's modelUsage aggregate in the shared parser.
+    observed = _event_context_window({key: (event or {}).get(key)
+                                      for key in ("contextWindow", "context_window")})
     if observed is not None:
         child["native_context_window"] = observed
         child["window_model"] = sample["actual_model"] if sample else None
@@ -227,7 +224,7 @@ def _source_binding(state, event, child):
         candidate = declared or (child.get("source_path") if source_sid == child.get("session_id") else None)
         try:
             path = core.safe_path(base, candidate or base / f"agent-{agent}.jsonl", exists=False)
-        except (OSError, ValueError, core.ContinuityError):
+        except (OSError, ValueError):
             continue
         if declared or path.is_file():
             return path, source_sid, parent
@@ -239,7 +236,7 @@ def on_hook(state, event, directory):
     child = _load(directory, agent)
     try:
         binding = _source_binding(state, event, child)
-    except (OSError, ValueError, TypeError, core.ContinuityError):
+    except (OSError, ValueError, TypeError):
         binding = None
     if binding is None and event.get("session_id") not in {
             state["session_id"], child.get("session_id"),
@@ -252,8 +249,6 @@ def on_hook(state, event, directory):
         role = event.get("agent_type")
         if isinstance(role, str):
             child["agent_type"] = role
-    if name == "SubagentStop":
-        child["terminal_observed"] = True
     try:
         if binding is None:
             raise ValueError("agent_transcript_unavailable")
@@ -305,7 +300,7 @@ def guard_resume(state, event, directory, outcome):
             continue
         try:
             child = _load(directory, identity["agent_id"])
-        except (OSError, ValueError, TypeError, core.ContinuityError):
+        except (OSError, ValueError, TypeError):
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                     "permissionDecisionReason": "cclaude 子代理预算状态不可读，无法确认旧历史能否安全恢复；请先核对原始记录，不要绕过。"}}
         child["agent_type"] = identity.get("agent_type")
@@ -357,7 +352,7 @@ def parent_notice(state, event, directory, *, delivery_allowed=True):
     for agent, path in list(state.get("agent_handoffs", {}).items()):
         try:
             child = _load(directory, agent)
-        except (OSError, ValueError, TypeError, core.ContinuityError):
+        except (OSError, ValueError, TypeError):
             continue
         if child.get("notified_session_id") == state["session_id"]:
             continue

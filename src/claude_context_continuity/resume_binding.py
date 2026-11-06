@@ -392,7 +392,7 @@ class ResumeBindingMixin:
         if not binding.get("activity_observed"):
             candidate["resume_safe_boundary"] = True
             candidate["resume_snapshot"] = {
-                "instruction_head": source._bounds_from_records(records)["last"],
+                "instruction_head": bounds["last"],
                 "usage_locator": usage["usage_locator"],
             }
         candidate["native_resume_confirmations"] = candidate.get("native_resume_confirmations", 0) + 1

@@ -159,9 +159,8 @@ def secret_values():
 
 
 def no_secrets(value):
-    from .history import redact
-    text = json.dumps(value, ensure_ascii=False)
-    if redact(text, secret_values()) != text:
+    from .history import contains_secrets
+    if contains_secrets(value, secret_values()):
         raise ContinuityError("交接含敏感信息，拒绝落盘；请移除凭证")
 
 

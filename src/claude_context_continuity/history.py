@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
@@ -10,25 +10,28 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
-import uuid
 
 
 class HistoryError(ValueError):
     """The explicit history source or requested projection is invalid."""
 
 
+class NativeUsagePending(HistoryError):
+    """The native history has no real usage sample yet."""
+
+
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_CHARS, _MAX_RECORDS = 8_000, 20
 _MAX_UPDATE_RECORDS, _MAX_UPDATE_BYTES = 32, 64 * 1024
-_META = frozenset({"system", "file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "custom-title", "progress", "agent-progress", "session-start", "session-end", "context", "compaction", "hook", "notification", "meta"})
+_MESSAGE_TYPES = frozenset({"user", "assistant", "summary", "tool_result"})
 _STATE_ONLY = frozenset({"file-history-snapshot", "file-history-delta", "queue-operation", "mode", "permission-mode", "atis-latch", "attachment", "ai-title", "last-prompt", "cost-state", "pr-link", "agent-name", "api-request-shape", "api-request-blob", "api-request"})
-_META = _META | _STATE_ONLY
 _RUNTIME = ("<system-reminder>", "<task-notification>", "[request interrupted", "<local-command-",
             "<cross-session-message", "<teammate-message", "[cross-session idle notice]",
             "another claude session sent a message:", "<continuity-host-event>")
 _PATH_FIELDS = ("saved_output", "saved_output_path", "persisted_output", "persisted_output_path", "output_path", "output_file", "file_path", "path")
-_ASSIGNMENT = re.compile(r"(?ix)(?P<key>\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|secret|client[_-]?secret|private[_-]?key|token)\b)(?P<sep>\s*(?:=|:)\s*)(?P<value>(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:bearer\s+)?[^\s,;]+))")
+_CREDENTIAL_KEY = r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|passwd|secret|client[_-]?secret|private[_-]?key|token)"
+_ASSIGNMENT = re.compile(r"(?ix)(?P<key>\b" + _CREDENTIAL_KEY + r"\b)(?P<sep>[\"']?\s*(?:=|:)\s*)(?P<value>(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:bearer\s+)?\[REDACTED(?:\ PRIVATE\ KEY)?\]|(?:bearer\s+)?[^\s,;\"'}]+))")
 _BEARER = re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----", re.DOTALL)
 
@@ -189,6 +192,9 @@ def _submitted_prompt_texts(record: Mapping[str, Any]) -> tuple[str, ...]:
     """原生输入的精确公开形态；不模糊搜索或重建用户正文。"""
     if record.get("isSidechain"):
         return ()
+    queued = _queued_user_text(record)
+    if queued is not None:
+        return (queued.strip(),)
     if record.get("type") == "user":
         if _results(record):
             return ()
@@ -213,8 +219,6 @@ def source_kind(record: Mapping[str, Any]) -> str:
     if not isinstance(record, Mapping) or not isinstance(record.get("type"), str) or not record["type"]:
         raise HistoryError("record has no valid type")
     record_type = record["type"]
-    if record_type not in _META | {"user", "assistant", "summary", "tool_result"}:
-        raise HistoryError(f"unknown record type {record_type!r}")
     if record_type in {"user", "assistant"}:
         _content(record)
         if record["message"].get("role", record_type) != record_type:
@@ -227,10 +231,11 @@ def source_kind(record: Mapping[str, Any]) -> str:
         return "sidechain"
     if record_type == "summary":
         return "summary"
-    if not _flag(record, "isMeta") and _queued_user_text(record) is not None:
-        return "original_user"
-    if record_type in _META:
-        return "meta"
+    queued = _queued_user_text(record)
+    if not _flag(record, "isMeta") and queued is not None:
+        return "meta" if queued.lstrip().lower().startswith(_RUNTIME) else "original_user"
+    if record_type not in _MESSAGE_TYPES:
+        return "meta"  # Native extensions carry no user authority.
     if record_type == "tool_result":
         _results(record)
         return "tool_result"
@@ -325,10 +330,50 @@ def redact(text: str, secrets: Any = ()) -> str:
     if any(not isinstance(value, str) for value in values):
         raise HistoryError("secrets must be an iterable of strings")
     for value in sorted({value for value in values if value}, key=len, reverse=True):
-        text = text.replace(value, "[REDACTED]")
+        pieces = re.split(r"(\[REDACTED(?: PRIVATE KEY)?\])", text)
+        text = "".join(piece if index % 2 else piece.replace(value, "[REDACTED]")
+                       for index, piece in enumerate(pieces))
     text = _PRIVATE_KEY.sub("[REDACTED PRIVATE KEY]", text)
-    text = _ASSIGNMENT.sub(lambda match: f"{match.group('key')}{match.group('sep')}[REDACTED]", text)
+
+    def assignment(match: re.Match[str]) -> str:
+        value = match['value'].strip("\"'")
+        if value in {"[REDACTED]", "[REDACTED PRIVATE KEY]"} or re.fullmatch(r"bearer\s+\[REDACTED\]", value, re.I):
+            return match[0]
+        if match['key'].lower() in {"auth", "authorization"} and value.lower() == "none":
+            return match[0]
+        if (match['key'].lower() == "token" and ":" in match['sep']
+                and value.isdecimal() and re.search(r"\bbudget\s+$", text[:match.start()], re.I)):
+            return match[0]
+        return f"{match['key']}{match['sep']}[REDACTED]"
+
+    text = _ASSIGNMENT.sub(assignment, text)
     return _BEARER.sub("Bearer [REDACTED]", text)
+
+
+def contains_secrets(value: Any, secrets: Any = (), *, _credential_key: str | None = None) -> bool:
+    """Inspect JSON scalars and credential assignments without serializing objects.
+
+    An object such as the runtime's ``authorization`` locator is not a token;
+    its fields are inspected individually. Credential-named scalar fields (also
+    inside objects or arrays) still use the authoritative assignment redactor.
+    """
+    if isinstance(value, str) and redact(value, secrets) != value:
+        return True
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if contains_secrets(key, secrets):
+                return True
+            credential_key = (key if isinstance(key, str) and re.fullmatch(_CREDENTIAL_KEY, key, re.I)
+                              else None)
+            if contains_secrets(item, secrets, _credential_key=credential_key):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(contains_secrets(item, secrets, _credential_key=_credential_key) for item in value)
+    if _credential_key is not None and value is not None:
+        assignment = f"{_credential_key}={value}"
+        return redact(assignment, secrets) != assignment
+    return False
 
 
 def _bounded(text: str, start: int, limit: int) -> tuple[str, int | None, int]:
@@ -410,15 +455,40 @@ _MISSING = object()
 class HistorySource:
     path: Path
     session_id: str
+    _reader: Any = field(default=None, init=False, repr=False, compare=False)
+    _projection: Any = field(default=None, init=False, repr=False, compare=False)
+    _observation: Any = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def _stream(self):
+        if self._reader is None:
+            from .history_stream import HistoryStream
+            object.__setattr__(self, "_reader", HistoryStream(self))
+        return self._reader
+
+    @property
+    def reading_work(self) -> dict[str, int]:
+        """Actual I/O and JSON work of the latest stream refresh (not elapsed time)."""
+        from dataclasses import asdict
+        return asdict(self._stream.work)
+
+    def _parse_record(self, raw: bytes, start: int) -> _Record | None:
+        data = _decode(raw, start)
+        identity = data.get("sessionId")
+        if ("sessionId" in data or "session_id" in data) and identity != self.session_id:
+            raise HistoryError(f"record at byte {start} belongs to another session")
+        kind = source_kind(data)
+        if (kind == "meta" and data["type"] != "attachment"
+                and (data["type"] in _STATE_ONLY or (data["type"] not in _MESSAGE_TYPES and "uuid" not in data))
+                and _task_notice(data) is None):
+            return None
+        message_id = data.get("uuid")
+        return _Record(data, message_id if isinstance(message_id, str) else "", start,
+                       start + len(raw), hashlib.sha256(raw).hexdigest(), kind)
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not _UUID.fullmatch(self.session_id):
             raise HistoryError("session_id must be a canonical lowercase UUID")
-        try:
-            if str(uuid.UUID(self.session_id)) != self.session_id:
-                raise ValueError
-        except (ValueError, AttributeError) as exc:
-            raise HistoryError("session_id must be a canonical UUID") from exc
         path = Path(self.path).expanduser()
         if path.name != f"{self.session_id}.jsonl":
             raise HistoryError("source filename must exactly match <session_id>.jsonl")
@@ -439,6 +509,7 @@ class HistorySource:
         include_attachments: bool = False,
         defer_incomplete_tail: bool = False,
         _report_deferred_tail: bool = False,
+        _copy_records: bool = True,
     ) -> list[_Record] | tuple[list[_Record], bool]:
         """Read the canonical stream, with an opt-in incomplete-tail mode.
 
@@ -449,42 +520,13 @@ class HistorySource:
         may retain attachments to verify parentUuid ancestry; ordinary history
         reads keep their existing filtered projection.
         """
-        if type(include_task_notifications) is not bool:
-            raise HistoryError("include_task_notifications must be a boolean")
-        if type(include_attachments) is not bool:
-            raise HistoryError("include_attachments must be a boolean")
-        if type(defer_incomplete_tail) is not bool or type(_report_deferred_tail) is not bool:
-            raise HistoryError("history reader options must be booleans")
-        records, seen, deferred_tail = [], set(), False
-        try:
-            with self.path.open("rb") as handle:
-                while True:
-                    start, raw = handle.tell(), handle.readline(8 * 1024 * 1024 + 1)
-                    if not raw:
-                        break
-                    if len(raw) > 8 * 1024 * 1024:
-                        raise HistoryError("single history record exceeds the bounded reader limit")
-                    if defer_incomplete_tail and not raw.endswith(b"\n"):
-                        deferred_tail = True
-                        break
-                    data = _decode(raw, start)
-                    # 持久会话身份只认原生 sessionId；session_id 是独立的传输元数据。
-                    identity = data.get("sessionId")
-                    if ("sessionId" in data or "session_id" in data) and identity != self.session_id:
-                        raise HistoryError(f"record at byte {start} belongs to another session")
-                    kind = source_kind(data)
-                    if (kind == "meta" and data["type"] in _STATE_ONLY
-                            and not (include_task_notifications and _task_notice(data))
-                            and not (include_attachments and data["type"] == "attachment")):
-                        continue  # 用户指令和显式需要的原生任务终态不能跳过。
-                    message_id = _message_id(data)
-                    if message_id in seen:
-                        raise HistoryError(f"duplicate message identifier {message_id!r}")
-                    seen.add(message_id)
-                    records.append(_Record(data, message_id, start, handle.tell(), hashlib.sha256(raw).hexdigest(), kind))
-        except OSError as exc:
-            raise HistoryError("cannot read explicit source") from exc
-        return (records, deferred_tail) if _report_deferred_tail else records
+        return self._stream.records(
+            include_task_notifications=include_task_notifications,
+            include_attachments=include_attachments,
+            defer_incomplete_tail=defer_incomplete_tail,
+            report_deferred_tail=_report_deferred_tail,
+            copy_records=_copy_records,
+        )
 
     def _pairs(self, records: list[_Record]) -> dict[str, _Pair]:
         asks: dict[str, tuple[int, _Record, list[Any]]] = {}
@@ -557,7 +599,7 @@ class HistorySource:
         # Exact lookup of an already-complete record remains usable while the
         # host is writing one final unterminated append.  Stream pages and other
         # full-history operations intentionally remain strict.
-        records, pairs = self._records(defer_incomplete_tail=True), None
+        records = self._records(defer_incomplete_tail=True)
         pairs = self._pairs(records)
         for info in records:
             if info.message_id == message_id:
@@ -579,7 +621,7 @@ class HistorySource:
         start, end, sha = locator["start_byte"], locator["end_byte"], locator["sha256"]
         if locator["source_path"] != str(self.path) or locator["session_id"] != self.session_id or type(start) is not int or type(end) is not int or start < 0 or end <= start or not isinstance(locator["message_id"], str) or not isinstance(sha, str) or not _HASH.fullmatch(sha) or not isinstance(locator["source_kind"], str):
             raise HistoryError("locator has invalid fields")
-        records, pairs = self._records(defer_incomplete_tail=defer_incomplete_tail), None
+        records = self._records(defer_incomplete_tail=defer_incomplete_tail)
         pairs = self._pairs(records)
         info = next((item for item in records if item.start == start and item.end == end), None)
         if not info or info.message_id != locator["message_id"] or not hmac.compare_digest(info.sha256, sha):
@@ -617,35 +659,41 @@ class HistorySource:
             text = "\n".join(_texts(_content(info.data)))
         return redact(text, secrets)
 
-    def index_projection(self, *, secrets: Any = ()) -> dict[str, Any]:
-        """Project one source into index-safe public records without raw JSONL data.
+    def index_projection(self, *, secrets: Any = (), since: int | None = None) -> dict[str, Any]:
+        """Return redacted public records, or a revision-bound incremental update.
 
-        This is the only bulk-projection entry point that can defer an
-        unterminated final append.  Exact locator/read operations use the same
-        narrowly scoped allowance for an already-complete bound record.  The
-        projection still uses the canonical parser, source classification,
-        AskUserQuestion pairing, redaction, byte ranges, and record hashes.  The
-        returned data deliberately excludes tool inputs, thinking, image bytes,
-        and every other raw native-record field.
+        Without ``since`` the legacy full-projection contract is unchanged.
+        Consumers retaining this HistorySource may pass the returned revision to
+        receive changed entries and removed byte starts across intervening updates.
+        A source mutation, policy change, or invalid revision explicitly returns
+        ``reset=True``. Reuse is bound to the returned projection identity; no raw
+        records or credentials are persisted.
         """
-        projected = self._records(defer_incomplete_tail=True, _report_deferred_tail=True)
-        records, deferred_tail = projected
-        pairs = self._pairs(records)
-        calls: dict[str, tuple[int, str]] = {}
-        for index, info in enumerate(records):
-            if info.kind != "assistant":
-                continue
-            for block in _blocks(_content(info.data)):
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
+        if self._projection is None:
+            from .history_projection import HistoryProjection
+            object.__setattr__(self, "_projection", HistoryProjection(self))
+        return self._projection.update(secrets=secrets, since=since)
+
+    def _project_records(self, records: list[_Record], *, secrets: Any,
+                         pairs: Mapping[str, _Pair] | None = None,
+                         calls: dict[str, tuple[int, str]] | None = None) -> list[dict[str, Any]]:
+        pairs = self._pairs(records) if pairs is None else pairs
+        if calls is None:
+            calls = {}
+            for info in records:
+                if info.kind != "assistant":
                     continue
-                tool_use_id, name = block.get("id"), block.get("name")
-                if not isinstance(tool_use_id, str) or not tool_use_id or not isinstance(name, str) or not name:
-                    continue
-                prior = calls.get(tool_use_id)
-                if prior is not None and prior[1] != name:
-                    raise HistoryError("tool_use_id is associated with conflicting tool names")
-                if prior is None:
-                    calls[tool_use_id] = (index, name)
+                for block in _blocks(_content(info.data)):
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    tool_use_id, name = block.get("id"), block.get("name")
+                    if not isinstance(tool_use_id, str) or not tool_use_id or not isinstance(name, str) or not name:
+                        continue
+                    prior = calls.get(tool_use_id)
+                    if prior is not None and prior[1] != name:
+                        raise HistoryError("tool_use_id is associated with conflicting tool names")
+                    if prior is None:
+                        calls[tool_use_id] = (info.start, name)
 
         entries: list[dict[str, Any]] = []
         for index, info in enumerate(records):
@@ -670,7 +718,7 @@ class HistorySource:
                 for block in _results(info.data):
                     tool_use_id = block["tool_use_id"]
                     call = calls.get(tool_use_id)
-                    name = call[1] if call is not None and call[0] < index else None
+                    name = call[1] if call is not None and call[0] < info.start else None
                     tool_uses.append({"tool_use_id": tool_use_id, "tool_name": name})
                     if tool_use_id not in tool_use_ids:
                         tool_use_ids.append(tool_use_id)
@@ -682,7 +730,7 @@ class HistorySource:
                 if tool_names:
                     entry["tool_names"] = tool_names
             entries.append(entry)
-        return {"entries": entries, "deferred_incomplete_tail": deferred_tail}
+        return entries
 
     def read(self, locator: Mapping[str, Any], start: int = 0, limit: int = 2_000, secrets: Any = ()) -> dict[str, Any]:
         # An exact, already-complete bound record remains readable while the
@@ -721,7 +769,7 @@ class HistorySource:
             raise HistoryError("offset must be a non-negative byte offset")
         if type(limit) is not int or not 1 <= limit <= _MAX_RECORDS:
             raise HistoryError(f"limit must be between 1 and {_MAX_RECORDS}")
-        records, pairs = self._records(), None
+        records = self._records()
         pairs, size = self._pairs(records), self.path.stat().st_size
         if type(instructions_only) is not bool:
             raise HistoryError("instructions_only must be a boolean")
@@ -785,12 +833,30 @@ class HistorySource:
         return {"entries": entries, "scanned_records": scanned,
                 "next_offset": records[index].start if index < len(records) else None}
 
+    def observe(self, *, secrets: Any = ()) -> dict[str, Any]:
+        """Incrementally observe usage, activity and instruction bounds.
+
+        Retain this source across controller polls. ``usage=None`` explicitly
+        means no native sample yet; incomplete final appends are deferred. An
+        actual prefix mutation rebuilds all derived observations. No raw records,
+        tool inputs, thinking, or environment secret values leave this API.
+        Separately launched hooks do not share this process-local reader.
+        """
+        if self._observation is None:
+            from .history_observation import HistoryObservation
+            object.__setattr__(self, "_observation", HistoryObservation(self))
+        try:
+            return self._observation.update(secrets=secrets)
+        except Exception:
+            object.__setattr__(self, "_observation", None)
+            raise
+
     def latest_usage(self) -> dict[str, Any]:
         """只投影准确主会话最后一次模型调用的用量，不返回文本或思考。"""
         return self._usage_from_records(self._records())
 
     def _usage_from_records(self, records: list[_Record]) -> dict[str, Any]:
-        """复用本轮已验证的记录；不持有跨调用的全文缓存。"""
+        """复用已验证的完整记录；不把文本或思考包含在用量投影中。"""
         for info in reversed(records):
             if info.kind != "assistant":
                 continue
@@ -806,7 +872,7 @@ class HistorySource:
             return {**usage, "locator": self._locator(info, info.kind),
                     "cwd": info.data.get("cwd"), "timestamp": info.data.get("timestamp"),
                     "request_id": request_id if isinstance(request_id, str) and request_id else info.message_id}
-        raise HistoryError("no native main-session usage is available")
+        raise NativeUsagePending("no native main-session usage is available")
 
     def activity(self) -> dict[str, Any]:
         """从准确原生日志重建未结算工具和后台句柄，不复制业务状态。"""
@@ -834,70 +900,10 @@ class HistorySource:
 
     @staticmethod
     def _activity_from_records(records: list[_Record]) -> dict[str, Any]:
-        tools, results, backgrounds, controls = {}, set(), {}, {}
-        terminal_backgrounds, lifecycle = set(), {}
-
-        def evidence(handle):
-            return lifecycle.setdefault(handle, {"launch_tool_ids": set(), "terminal_tool_ids": set()})
-
-        for info in records:
-            notice = _task_notice(info.data)
-            if notice is not None:
-                handle, _, launch_id = notice
-                proof, launched = evidence(handle), backgrounds.get(handle)
-                if launch_id is not None:
-                    proof["terminal_tool_ids"].add(launch_id)
-                if launched is not None and (
-                        launch_id in launched["tool_use_ids"]
-                        or launch_id is None and len(proof["launch_tool_ids"]) == 1):
-                    proof["terminal_tool_ids"].update(launched["tool_use_ids"])
-                    backgrounds.pop(handle)
-                    terminal_backgrounds.add(handle)
-            if info.kind == "assistant":
-                for block in _blocks(_content(info.data)):
-                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
-                        tools[block["id"]] = {"name": block.get("name"),
-                                               "input_hash": hashlib.sha256(_json(block.get("input", {})).encode()).hexdigest()}
-                        request = block.get("input", {})
-                        if block.get("name") in {"TaskStop", "TaskOutput"} and isinstance(request, dict):
-                            target = request.get("task_id")
-                            if isinstance(target, str) and target:
-                                controls[block["id"]] = (block["name"], target, backgrounds.get(target))
-            if info.kind != "tool_result":
-                continue
-            ids = {block["tool_use_id"] for block in _results(info.data)}
-            new_ids = ids - results
-            results.update(ids)
-            response = info.data.get("toolUseResult")
-            if not new_ids or not isinstance(response, dict):
-                continue
-            for key in ("backgroundTaskId", "resumedAgentId"):
-                handle = response.get(key)
-                if isinstance(handle, str) and handle:
-                    backgrounds[handle] = {"tool_use_ids": sorted(new_ids), "source_record": info.message_id}
-                    terminal_backgrounds.discard(handle)
-                    evidence(handle)["launch_tool_ids"].update(new_ids & tools.keys())
-            handle = response.get("agentId")
-            if response.get("isAsync") is True and isinstance(handle, str) and handle:
-                backgrounds[handle] = {"tool_use_ids": sorted(new_ids), "source_record": info.message_id}
-                terminal_backgrounds.discard(handle)
-                evidence(handle)["launch_tool_ids"].update(new_ids & tools.keys())
-            # 顶层 toolUseResult 必须能唯一配回一次真实任务工具调用。
-            if len(ids) == 1 and new_ids and not any(block.get("is_error", False) for block in _results(info.data)):
-                control = controls.get(next(iter(ids)))
-                if control is not None:
-                    name, target, launched = control
-                    settled = terminal_task_result(name, {"task_id": target}, response)
-                    if settled and launched is not None and backgrounds.get(settled) == launched:
-                        backgrounds.pop(settled, None)
-                        terminal_backgrounds.add(settled)
-                        evidence(settled)["terminal_tool_ids"].update(launched["tool_use_ids"])
-        return {"pending_tools": {key: value for key, value in tools.items() if key not in results},
-                "background_handles": backgrounds,
-                "settled_tool_ids": sorted(tools.keys() & results),
-                "terminal_background_handles": sorted(terminal_backgrounds),
-                "background_lifecycle": {handle: {key: sorted(ids) for key, ids in proof.items()}
-                                         for handle, proof in lifecycle.items()}}
+        from .history_activity import NativeActivity
+        activity = NativeActivity()
+        activity.extend(records)
+        return activity.snapshot()
 
     def instruction_bounds(self) -> dict[str, Any]:
         """只返回真实用户指令的首尾定位；没有指令与来源损坏分开处理。"""
@@ -912,7 +918,7 @@ class HistorySource:
                 "last": self._locator(selected[-1], self._kind(selected[-1], pairs))}
 
     def latest_instruction(self) -> dict[str, Any]:
-        records, pairs = self._records(), None
+        records = self._records()
         pairs = self._pairs(records)
         for info in reversed(records):
             kind = self._kind(info, pairs)
@@ -931,7 +937,7 @@ class HistorySource:
     def tool_result(self, tool_use_id: str) -> dict[str, Any]:
         if not isinstance(tool_use_id, str) or not tool_use_id:
             raise HistoryError("tool_use_id must be a non-empty string")
-        records, pairs = self._records(defer_incomplete_tail=True), None
+        records = self._records(defer_incomplete_tail=True)
         pairs = self._pairs(records)
         matches = [info for info in records if info.kind == "tool_result" and any(block["tool_use_id"] == tool_use_id for block in _results(info.data))]
         if len(matches) != 1:

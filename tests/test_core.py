@@ -107,5 +107,47 @@ class CoreUtilityTests(unittest.TestCase):
                 self.assertIsNone(core.configured_window({"env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": value}}))
 
 
+def test_handoff_prose_and_redacted_structured_values_are_safe():
+    values = [
+        {"handoff": "Context budget token: 2048; continue the existing task."},
+        {"handoff": "API_KEY=[REDACTED]"},
+        {"authorization": "Bearer [REDACTED]"},
+        {"API_KEY": "[REDACTED]", "token": {"value": "[REDACTED]"}},
+        {"authorization": {"root_instruction_locator": {"message_id": "fixture-native-message", "start_byte": 0}}},
+        {"authorization": "none; runtime association only, not task approval or delivery proof"},
+        {"handoff": ['password="[REDACTED]"', "Bearer [REDACTED]"]},
+    ]
+    with patch.object(core, "secret_values", return_value=()):
+        for value in values:
+            core.no_secrets(value)
+
+
+def test_structured_credentials_and_known_environment_values_remain_rejected():
+    import pytest
+    values = [
+        {"handoff": "API_KEY=fixture-actual-key"},
+        {"token": "fixture-actual-token"},
+        {"token": 2048},
+        {"nested": {"API_KEY": ["fixture-actual-key"]}},
+        {"authorization": "fixture-actual-authorization"},
+        {"handoff": "Bearer fixture-actual-bearer"},
+        {"handoff": "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"},
+        {"handoff": "an otherwise unlabeled environment-credential-fixture"},
+    ]
+    with patch.object(core, "secret_values", return_value=("environment-credential-fixture",)):
+        for value in values:
+            with pytest.raises(core.ContinuityError, match="敏感信息"):
+                core.no_secrets(value)
+
+
+def test_innocuous_markers_do_not_override_known_environment_credentials():
+    import pytest
+    for secret, value in (("none", {"authorization": "none"}),
+                          ("2048", {"handoff": "Context budget token: 2048; continue."})):
+        with patch.object(core, "secret_values", return_value=(secret,)):
+            with pytest.raises(core.ContinuityError, match="敏感信息"):
+                core.no_secrets(value)
+
+
 if __name__ == "__main__":
     unittest.main()
