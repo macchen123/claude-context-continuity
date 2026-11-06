@@ -311,6 +311,51 @@ class ResultBudgetTests(unittest.TestCase):
         self.assertEqual(archive.stat().st_ino, original_stat.st_ino)
         self.assertEqual(list((self.context / "outputs").glob("*.json")), [archive])
 
+    def test_small_and_large_archives_share_private_exact_byte_persistence(self) -> None:
+        for size in (4_000, 80_000):
+            with self.subTest(size=size):
+                result = bound_result("Bash", bash("x" * size), directory=self.context, byte_limit=1_400)
+                self.assertTrue(result["replaced"])
+                reference = result["reference"]
+                archive = Path(reference["path"])
+                payload = archive.read_bytes()
+                self.assertEqual(reference["sha256"], hashlib.sha256(payload).hexdigest())
+                self.assertEqual(reference["bytes"], len(payload))
+                self.assertEqual(json.loads(payload)["stdout"], "x" * size)
+                self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(list(archive.parent.glob(".result-budget-*")), [])
+
+    def test_concurrent_archive_creation_only_accepts_identical_bytes(self) -> None:
+        for identical in (True, False):
+            with self.subTest(identical=identical):
+                directory = self.context / str(identical)
+                directory.mkdir()
+                observed = {}
+
+                def competing_link(source, destination):
+                    payload = Path(source).read_bytes() if identical else b"foreign archive bytes\n"
+                    Path(destination).write_bytes(payload)
+                    observed["path"], observed["bytes"] = Path(destination), payload
+                    raise FileExistsError("fixture competing creator")
+
+                with patch("claude_context_continuity.result_budget.os.link", side_effect=competing_link):
+                    result = bound_result("Bash", bash("x" * 4_000), directory=directory, byte_limit=1_600)
+                self.assertEqual(result["replaced"], identical)
+                self.assertEqual(result["defer_required"], not identical)
+                self.assertEqual(observed["path"].read_bytes(), observed["bytes"])
+                self.assertEqual(list(observed["path"].parent.glob(".result-budget-*")), [])
+
+    def test_archive_fsync_failure_defers_and_cleans_only_its_temporary_file(self) -> None:
+        response = bash("x" * 4_000)
+        with patch("claude_context_continuity.result_budget.os.fsync", side_effect=OSError("fixture fsync failure")):
+            result = bound_result("Bash", response, directory=self.context, byte_limit=1_400)
+        self.assertFalse(result["replaced"])
+        self.assertTrue(result["defer_required"])
+        self.assertIs(result["response"], response)
+        self.assertEqual(list((self.context / "outputs").iterdir()), [])
+        recovered = bound_result("Bash", response, directory=self.context, byte_limit=1_400)
+        self.assertTrue(recovered["replaced"])
+
     def test_existing_archive_hash_drift_defers_without_overwrite(self) -> None:
         response = bash("binding-output-" * 4_000, "binding-error-" * 4_000)
         first = bound_result("Bash", response, directory=self.context, byte_limit=1_300)

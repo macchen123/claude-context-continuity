@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import sys
@@ -125,10 +126,11 @@ def context_windows(context_id, offset, limit):
             "next_offset": offset + limit if offset + limit < len(paths) else None, "write_authority": False}
 
 
-def dispatch_history_search(args):
+def dispatch_history_search(args, *, index=None, secrets=None):
     from .history import HistorySource
     from .history_index import HistoryIndex
 
+    projector = None
     if args.source is not None:
         if not args.source or not args.session_id:
             raise core.ContinuityError("--source 必须为有效路径并同时指定 --session-id")
@@ -153,15 +155,18 @@ def dispatch_history_search(args):
                 break
         relative = f"runtime/contexts/{context_id}/.cache/history.sqlite3"
         scope = {"context_id": context_id, "coverage": "native_context_history_sources"}
+        if index is None and context_id == os.environ.get("CLAUDE_CONTINUITY_ID"):
+            from .history_transport import current_projector
+            projector = current_projector(context_id)
     role_kinds = {"user": ("original_user", "verified_user_answer"), "assistant": ("assistant",),
                   "tool": ("tool_result",), "summary": ("summary",)}
     selected_kinds = tuple(args.source_kind) or tuple(kind for role in args.role for kind in role_kinds[role])
     path = core.safe_path(core.HOME, relative, exists=False)
-    with HistoryIndex(path) as index:
-        result = index.search(sources, args.query, source_kinds=selected_kinds, tool=args.tool,
-                              windows=tuple(args.window), sessions=tuple(args.session),
-                              recent_first=args.recent_first, limit=args.page_size,
-                              cursor=args.cursor, secrets=core.secret_values())
+    with (nullcontext(index) if index is not None else HistoryIndex(path, projector=projector)) as selected_index:
+        result = selected_index.search(sources, args.query, source_kinds=selected_kinds, tool=args.tool,
+                                       windows=tuple(args.window), sessions=tuple(args.session),
+                                       recent_first=args.recent_first, limit=args.page_size,
+                                       cursor=args.cursor, secrets=core.secret_values() if secrets is None else secrets)
     return {**scope, **result, "write_authority": False}
 
 
@@ -189,22 +194,7 @@ def dispatch(args):
             if os.environ.get("CLAUDE_CONTINUITY_ID") != args.context_id:
                 raise core.ContinuityError("TUI hook 不属于当前自有进程")
             event = json.load(sys.stdin)
-            # A real managed native hook inherits the in-memory rendezvous
-            # credential.  It is the only automatic repair entry; attach never
-            # obtains or persists that credential.
-            # Bind the native epoch and invalidate old turn boundaries before
-            # allowing a repaired observer to act on this process's state.
-            try:
-                result = tui_runtime.TuiRuntime.load(args.context_id).on_hook(event)
-                tui_runtime.repair_controller_from_hook(args.context_id, event)
-            except Exception:
-                # 恢复角色的安全检查不能被外层观测故障的 fail-open 路径吞掉。
-                from .agent_metadata import failure_hook
-                denied = failure_hook(event)
-                if denied:
-                    return denied
-                raise
-            return result
+            return _dispatch_tui_hook(args.context_id, event)
         if args.action == "tui-serve":
             return tui_runtime.serve(args.context_id)
         if args.action == "tui-attach":
@@ -244,6 +234,51 @@ def dispatch(args):
     raise core.ContinuityError("未知命令")
 
 
+def _dispatch_controller_event(runtime, event):
+    if event.get("_cclaude_action") == "history-projection":
+        from .history_transport import project_current
+        return project_current(runtime, event)
+    return _dispatch_tui_hook(runtime.conversation_id, event, runtime=runtime)
+
+
+def _dispatch_tui_hook(context_id, event, *, runtime=None):
+    from . import hook_transport, tui_runtime
+    try:
+        if runtime is None:
+            result = hook_transport.request(context_id, event)
+            if result is not None:
+                return result
+            runtime = tui_runtime.TuiRuntime.load(context_id)
+            result = runtime.on_hook(event)
+            tui_runtime.repair_controller_from_hook(context_id, event)
+            return result
+        return runtime.on_hook(event)
+    except Exception as error:
+        from .agent_metadata import failure_hook
+        error_type = getattr(error, "error_type", type(error).__name__)
+        denied = failure_hook(event, f"hook_dispatch_failed:{error_type}")
+        if denied:
+            _record_hook_failure(context_id, error)
+            return denied
+        raise
+
+
+def _record_hook_failure(context_id, error):
+    from .context_runtime import ContextRuntime
+    from .diagnostics import record_event
+    if os.environ.get("CLAUDE_CONTINUITY_ID") != context_id:
+        return
+    try:
+        runtime = ContextRuntime(context_id)
+        error_type = getattr(error, "error_type", type(error).__name__)
+        record_event(runtime.directory, "hook_failure", context_id=context_id,
+                     source="tui_hook_dispatch", error_origin="cclaude", error_type=error_type)
+        if error_type != "LockBusy":
+            runtime._wait_external("hook_observation_failed", error=error)
+    except (ValueError, OSError, KeyError, TypeError):
+        pass
+
+
 def main():
     args = parser().parse_args()
     try:
@@ -256,12 +291,7 @@ def main():
     except (ValueError, OSError, KeyError, TypeError) as exc:
         if args.action == "tui-hook":
             # 连续性观测失败不能变成原生工具的权限拒绝。
-            try:
-                from .context_runtime import ContextRuntime
-                if os.environ.get("CLAUDE_CONTINUITY_ID") == args.context_id:
-                    ContextRuntime.load(args.context_id)._wait_external("hook_observation_failed")
-            except (ValueError, OSError, KeyError, TypeError):
-                pass
+            _record_hook_failure(args.context_id, exc)
             print("{}")
             return 0
         from .history import redact

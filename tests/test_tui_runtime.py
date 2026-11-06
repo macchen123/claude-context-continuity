@@ -204,14 +204,14 @@ class TuiRuntimeTests(unittest.TestCase):
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 
-    def test_idle_boundary_parses_once_and_does_not_rewrite_identical_state(self):
+    def test_idle_boundary_reuses_observation_without_parsing_or_rewriting_state(self):
         self.runtime.on_hook(self.hook("Stop"))
         before = self.runtime.state_path.stat()
-        with patch.object(HistorySource, "_records", autospec=True, side_effect=HistorySource._records) as reads, \
+        with patch.object(HistorySource, "_parse_record", autospec=True, side_effect=HistorySource._parse_record) as reads, \
                 patch.object(core.os, "fsync", wraps=os.fsync) as sync:
             for _ in range(6):
                 self.assertEqual(self.runtime.advance()["phase"], "running")
-        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(reads.call_count, 0)
         sync.assert_not_called()
         after = self.runtime.state_path.stat()
         self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
@@ -277,6 +277,26 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assert_waiting(self.runtime.advance(), "running")
         self.clear_mock.assert_not_called()
 
+    def test_controller_waits_quietly_for_first_usage_then_recovers(self):
+        runtime, sid, source = self.resume_runtime()
+        # Stop can arrive before the first assistant record is flushed.
+        records = [{"type": "user", "uuid": str(uuid4()), "sessionId": sid,
+                    "message": {"role": "user", "content": "Continue the authorized task."}}]
+        source.write_text("".join(json.dumps(row) + "\n" for row in records))
+        event = {"session_id": sid, "cwd": str(self.cwd), "transcript_path": str(source)}
+        runtime.on_hook({**event, "hook_event_name": "Stop", "last_assistant_message": "first response"})
+        runtime._wait_external("hook_observation_failed")
+        observed = runtime.advance()
+        self.assertIsNone(observed.get("reconciliation"))
+        self.assertIsNone(observed["usage"])
+        self.assertFalse(observed["rotation_pending"])
+        self.usage(125, source, sid)
+        output = runtime.on_hook({**event, "hook_event_name": "PreToolUse", "tool_use_id": "sample-ready"})
+        self.assertNotIn("systemMessage", output)
+        self.assertEqual(runtime._state()["usage"]["total_input_and_cache_tokens"], 125)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
     def test_serve_survives_real_state_lock_contention_and_records_recovery(self):
         lock = core.lock(self.runtime.lock_path)
         lock.__enter__()
@@ -324,6 +344,18 @@ class TuiRuntimeTests(unittest.TestCase):
         self.assertNotIn("private-exception-value", raw)
         self.assertEqual(json.loads(raw)["last_error"], "state_or_io_failure")
         self.assertIsInstance(self.runtime.receipt()["reconciliation"], dict)
+        self.clear_mock.assert_not_called()
+        self.send_mock.assert_not_called()
+
+    def test_serve_does_not_retry_programming_errors(self):
+        with patch.object(tui_runtime, "TuiRuntime", return_value=self.runtime), \
+                patch.object(self.runtime, "advance", side_effect=AttributeError("fixture bug")) as advance, \
+                patch.object(tui_runtime.time, "sleep") as sleep:
+            with self.assertRaisesRegex(AttributeError, "fixture bug"):
+                tui_runtime.serve(self.runtime.conversation_id)
+        advance.assert_called_once()
+        sleep.assert_not_called()
+        self.assertFalse(tui_runtime._controller_locked(self.runtime))
         self.clear_mock.assert_not_called()
         self.send_mock.assert_not_called()
 

@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 from uuid import UUID
 
 import apsw
@@ -51,7 +51,7 @@ MAX_CURSOR_BYTES = 4 * 1024
 
 # A private namespace marker for a reconstructible cache, not task-state data.
 _APPLICATION_ID = 0x43434958
-_REDACTION_POLICY_VERSION = 5  # Reproject readable native slash commands without changing authority.
+_REDACTION_POLICY_VERSION = 6  # Structured credential boundaries and idempotent placeholders.
 _CURSOR_VERSION = 1
 _MAX_SQLITE_INT = (1 << 63) - 1
 _SOURCE_KINDS = frozenset({
@@ -143,10 +143,19 @@ class HistoryIndex:
     filters select result bindings without evicting other cached windows.
     """
 
-    def __init__(self, path: Path) -> None:
-        self._path, existed = self._prepare_cache_path(path)
+    def __init__(
+        self,
+        path: Path,
+        *,
+        projector: Callable[[HistorySource, tuple[str, ...]], dict[str, Any] | None] | None = None,
+    ) -> None:
+        self._path = self._prepare_cache_path(path)
+        self._projector = projector
         self._db: apsw.Connection | None = None
         self._closed = False
+        self._history_sources: dict[tuple[str, str], HistorySource] = {}
+        self._source_revisions: dict[tuple[str, str], int] = {}
+        self._source_signatures: dict[tuple[str, str], _Signature] = {}
         try:
             with self._cache_lock():
                 # 等待锁期间另一进程可能已经创建缓存。
@@ -186,6 +195,9 @@ class HistoryIndex:
         if self._closed:
             return
         connection, self._db, self._closed = self._db, None, True
+        self._history_sources.clear()
+        self._source_revisions.clear()
+        self._source_signatures.clear()
         if connection is None:
             return
         try:
@@ -438,8 +450,7 @@ class HistoryIndex:
 
     # -- source normalization and canonical projection -------------------
 
-    @classmethod
-    def _bound_sources(cls, specs: tuple[_SourceSpec, ...]) -> tuple[_BoundSource, ...]:
+    def _bound_sources(self, specs: tuple[_SourceSpec, ...]) -> tuple[_BoundSource, ...]:
         bound: dict[tuple[str, str], _BoundSource] = {}
         seen_generations: dict[tuple[str, str], set[int]] = {}
         for spec in specs:
@@ -447,6 +458,8 @@ class HistoryIndex:
                 source = HistorySource(Path(spec.source_path), spec.session_id)
             except (HistoryError, OSError, TypeError, ValueError) as exc:
                 raise HistoryIndexParserError("an explicit history source is unavailable or invalid") from exc
+            key = (str(source.path), spec.session_id)
+            source = self._history_sources.setdefault(key, source)
             item = _BoundSource(spec, source)
             previous = bound.get(item.key)
             if previous is not None:
@@ -477,71 +490,43 @@ class HistoryIndex:
         source: _BoundSource,
         secrets: tuple[str, ...],
         signature: _Signature,
-    ) -> tuple[list[_ProjectedRecord], bool]:
+        *,
+        full: bool = False,
+        baseline: dict[str, Any] | None = None,
+        redaction_policy: str | None = None,
+    ) -> tuple[list[_ProjectedRecord], bool, dict[str, Any]]:
         try:
-            projection = source.source.index_projection(secrets=secrets)
+            incremental = getattr(self._projector, "project_since", None)
+            if incremental is not None:
+                projection = incremental(source.source, secrets, baseline=baseline,
+                                         redaction_policy=redaction_policy)
+            else:
+                projection = self._projector(source.source, secrets) if self._projector is not None else None
+            if projection is None:
+                projection = source.source.index_projection(
+                    secrets=secrets, since=None if full else self._source_revisions.get(source.key))
+                projection["reading_work"] = source.source.reading_work
         except HistoryError as exc:
             raise HistoryIndexParserError("canonical history projection failed") from exc
         after = self._signature(source.source.path)
         if after != signature:
             raise HistoryIndexStaleError("history source changed while its projection was being indexed; restart")
-        if not isinstance(projection, dict) or set(projection) != {"entries", "deferred_incomplete_tail"}:
-            raise HistoryIndexParserError("canonical history projection has an invalid shape")
-        deferred = projection["deferred_incomplete_tail"]
-        if type(deferred) is not bool or not isinstance(projection["entries"], list):
-            raise HistoryIndexParserError("canonical history projection has invalid values")
-        return self._prepare_projection(source, projection["entries"]), deferred
+        return (self._prepare_projection(source, projection["entries"]),
+                projection["deferred_incomplete_tail"], projection)
 
-    def _prepare_projection(self, source: _BoundSource, entries: list[Any]) -> list[_ProjectedRecord]:
+    def _prepare_projection(self, source: _BoundSource, entries: list[dict[str, Any]]) -> list[_ProjectedRecord]:
+        """Adapt the canonical parser's output; enforce only index storage limits here."""
         prepared: list[_ProjectedRecord] = []
-        starts: set[int] = set()
         for value in entries:
-            if not isinstance(value, dict):
-                raise HistoryIndexParserError("canonical history projection entry is invalid")
-            locator = value.get("locator")
-            if not isinstance(locator, dict):
-                raise HistoryIndexParserError("canonical history projection locator is invalid")
-            required = {"source_path", "session_id", "message_id", "start_byte", "end_byte", "sha256", "source_kind"}
-            if set(locator) != required:
-                raise HistoryIndexParserError("canonical history projection locator is incomplete")
-            source_path, session_id = locator["source_path"], locator["session_id"]
+            locator = value["locator"]
             message_id = locator["message_id"]
             start, end, sha = locator["start_byte"], locator["end_byte"], locator["sha256"]
-            source_kind = value.get("source_kind")
-            text, timestamp, total = value.get("text"), value.get("timestamp"), value.get("total_chars")
-            if (
-                source_path != source.key[0]
-                or session_id != source.key[1]
-                or not isinstance(message_id, str)
-                or not message_id
-                or type(start) is not int
-                or type(end) is not int
-                or start < 0
-                or end <= start
-                or not isinstance(sha, str)
-                or len(sha) != 64
-                or any(character not in "0123456789abcdef" for character in sha)
-                or source_kind not in _SOURCE_KINDS
-                or locator["source_kind"] != source_kind
-                or not isinstance(text, str)
-                or not text
-                or timestamp is not None and not isinstance(timestamp, str)
-                or type(total) is not int
-                or total != len(text)
-            ):
-                raise HistoryIndexParserError("canonical history projection entry has invalid public fields")
+            source_kind = value["source_kind"]
+            text, timestamp, total = value["text"], value["timestamp"], value["total_chars"]
             self._utf8(text, 8 * 1024 * 1024, "projected history text")
             if timestamp is not None:
                 self._utf8(timestamp, MAX_QUERY_BYTES, "projected timestamp")
-            if start in starts:
-                raise HistoryIndexParserError("canonical history projection repeats a byte boundary")
-            starts.add(start)
             tools = self._tools_from_projection(value)
-            try:
-                folded = text.casefold()
-                folded.encode("utf-8")
-            except UnicodeEncodeError as exc:
-                raise HistoryIndexParserError("canonical history text cannot be casefolded safely") from exc
             fingerprint = self._digest({
                 "message_id": message_id,
                 "start_byte": start,
@@ -554,52 +539,19 @@ class HistoryIndex:
                 "tools": tools,
             })
             prepared.append(_ProjectedRecord(
-                source_path,
-                session_id,
-                message_id,
-                start,
-                end,
-                sha,
-                source_kind,
-                timestamp,
-                text,
-                folded,
-                total,
-                tools,
-                fingerprint,
+                source.key[0], source.key[1], message_id, start, end, sha, source_kind,
+                timestamp, text, text.casefold(), total, tools, fingerprint,
             ))
-        return sorted(prepared, key=lambda item: item.start_byte)
+        return prepared
 
     @classmethod
     def _tools_from_projection(cls, value: dict[str, Any]) -> tuple[tuple[str, str | None], ...]:
-        raw_tools = value.get("tool_uses", [])
-        if not isinstance(raw_tools, list):
-            raise HistoryIndexParserError("canonical tool metadata is invalid")
-        tools: list[tuple[str, str | None]] = []
-        for raw in raw_tools:
-            if not isinstance(raw, dict) or set(raw) != {"tool_use_id", "tool_name"}:
-                raise HistoryIndexParserError("canonical tool metadata is invalid")
-            tool_use_id, tool_name = raw["tool_use_id"], raw["tool_name"]
-            if not isinstance(tool_use_id, str) or not tool_use_id or tool_name is not None and not isinstance(tool_name, str):
-                raise HistoryIndexParserError("canonical tool metadata is invalid")
+        tools = tuple((raw["tool_use_id"], raw["tool_name"]) for raw in value.get("tool_uses", ()))
+        for tool_use_id, tool_name in tools:
             cls._utf8(tool_use_id, MAX_TOOL_CHARS, "tool_use_id")
             if tool_name is not None:
-                if not tool_name:
-                    raise HistoryIndexParserError("canonical tool metadata is invalid")
                 cls._utf8(tool_name, MAX_TOOL_CHARS, "tool_name")
-            tools.append((tool_use_id, tool_name))
-        declared_ids = value.get("tool_use_ids", ())
-        declared_names = value.get("tool_names", ())
-        expected_ids: list[str] = []
-        for tool_use_id, _ in tools:
-            if tool_use_id not in expected_ids:
-                expected_ids.append(tool_use_id)
-        if declared_ids not in ((), expected_ids):
-            raise HistoryIndexParserError("canonical tool identifiers do not match their associations")
-        expected_names = list(dict.fromkeys(name for _, name in tools if name is not None))
-        if declared_names not in ((), expected_names):
-            raise HistoryIndexParserError("canonical tool names do not match their associations")
-        return tuple(tools)
+        return tools
 
     # -- cache refresh -----------------------------------------------------
 
@@ -616,6 +568,14 @@ class HistoryIndex:
             "removed_sources": 0,
             "redaction_evicted_sources": 0,
             "deferred_sources": 0,
+            "read_bytes": 0,
+            "validated_bytes": 0,
+            "parsed_bytes": 0,
+            "parsed_records": 0,
+            "projected_records": 0,
+            "transmitted_entries": 0,
+            "transmitted_bytes": 0,
+            "projection_resets": 0,
         }
 
     def _refresh_without_selected_sources(self, redaction_policy: str) -> dict[str, int]:
@@ -654,14 +614,25 @@ class HistoryIndex:
             key for key in states
             if policy_changed and key not in selected_keys and key in current_keys
         }
-        updates: dict[tuple[str, str], tuple[_Signature, list[_ProjectedRecord], bool, _State | None]] = {}
+        updates: dict[tuple[str, str], tuple[_Signature, list[_ProjectedRecord], bool, _State | None, dict[str, Any]]] = {}
 
         for source in selected:
             signature = self._signature(source.source.path)
             prior = states.get(source.key)
             if policy_changed or prior is None or prior.signature != signature:
-                records, deferred = self._project_source(source, secrets, signature)
-                updates[source.key] = (signature, records, deferred, prior)
+                records, deferred, projection = self._project_source(
+                    source, secrets, signature,
+                    full=policy_changed or prior is None
+                    or self._source_signatures.get(source.key) != prior.signature,
+                    baseline=None if policy_changed or prior is None else self._projection_baseline(
+                        source.key, prior.signature, redaction_policy),
+                    redaction_policy=redaction_policy)
+                updates[source.key] = (signature, records, deferred, prior, projection)
+                for metric, value in projection.get("transport_work", {}).items():
+                    refresh[metric] += value
+                for metric, value in projection["reading_work"].items():
+                    refresh[metric] += value
+                refresh["projected_records"] += projection["projected_records"]
                 refresh["parsed_sources"] += 1
                 refresh["refreshed_sources"] += 1
                 refresh["deferred_sources"] += int(deferred)
@@ -680,7 +651,7 @@ class HistoryIndex:
                 update = updates.get(source.key)
                 if update is None:
                     continue
-                signature, records, deferred, prior = update
+                signature, records, deferred, prior, projection = update
                 rebuild = prior is not None and (
                     signature.dev != prior.signature.dev
                     or signature.ino != prior.signature.ino
@@ -689,9 +660,21 @@ class HistoryIndex:
                 # The source binding is the records table's foreign-key parent;
                 # create/update it before adding any projected child rows.
                 self._upsert_state(source.key, signature, deferred)
-                self._merge_source(source.key, records, rebuild, refresh)
+                self._merge_source(source.key, records, rebuild, refresh,
+                                   removed_starts=projection["removed_start_bytes"],
+                                   partial=not projection["reset"])
+                self._store_projection_baseline(source.key, signature, redaction_policy,
+                                                projection.get("projection_cursor"))
             if policy_changed:
                 self._set_policy(redaction_policy)
+
+        for key in removed_keys | evicted_keys:
+            self._source_revisions.pop(key, None)
+            self._source_signatures.pop(key, None)
+            self._history_sources.pop(key, None)
+        for key, update in updates.items():
+            self._source_revisions[key] = update[4]["revision"]
+            self._source_signatures[key] = update[0]
 
         # secure_delete overwrites removed cells; VACUUM then rebuilds the cache
         # file so an old known-secret cannot remain in FTS/free pages.
@@ -705,8 +688,12 @@ class HistoryIndex:
         records: list[_ProjectedRecord],
         rebuild: bool,
         refresh: dict[str, int],
+        *,
+        removed_starts: Iterable[int] = (),
+        partial: bool = False,
     ) -> None:
-        old = self._source_records(key)
+        touched = {record.start_byte for record in records} | set(removed_starts)
+        old = self._source_records(key, starts=touched if partial and not rebuild else None)
         if rebuild:
             refresh["rebuilt_sources"] += 1
             refresh["removed_records"] += len(old)
@@ -717,8 +704,6 @@ class HistoryIndex:
             return
 
         new = {record.start_byte: record for record in records}
-        if len(new) != len(records):
-            raise HistoryIndexParserError("canonical history projection repeats a byte boundary")
         removed = set(old) - set(new)
         changed = {
             start for start in set(old) & set(new)
@@ -732,18 +717,23 @@ class HistoryIndex:
         refresh["changed_records"] += len(changed)
         refresh["added_records"] += len(added)
 
-    def _source_records(self, key: tuple[str, str]) -> dict[int, tuple[int, _ProjectedRecord]]:
+    def _source_records(self, key: tuple[str, str], *, starts: set[int] | None = None) -> dict[int, tuple[int, _ProjectedRecord]]:
+        if starts is not None and not starts:
+            return {}
+        predicate = "" if starts is None else " AND start_byte>=? AND start_byte<=?"
         rows = self._rows(
             """
             SELECT id, source_path, session_id, message_id, start_byte, end_byte, sha256,
                    source_kind, timestamp, text, text_folded, total_chars, projection_hash
               FROM records
              WHERE source_path=? AND session_id=?
-            """,
-            key,
+            """ + predicate,
+            key if starts is None else (*key, min(starts), max(starts)),
         )
         result: dict[int, tuple[int, _ProjectedRecord]] = {}
         for row in rows:
+            if starts is not None and row[4] not in starts:
+                continue
             (
                 record_id,
                 source_path,
@@ -848,6 +838,39 @@ class HistoryIndex:
     def _delete_source(self, key: tuple[str, str]) -> None:
         self._delete_records(self._source_records(key).values())
         self._connection().execute("DELETE FROM source_state WHERE source_path=? AND session_id=?", key)
+        self._connection().execute("DELETE FROM metadata WHERE key=?", (self._projection_metadata_key(key),))
+
+    @classmethod
+    def _projection_metadata_key(cls, key: tuple[str, str]) -> str:
+        return "projection:" + cls._digest(key)
+
+    def _projection_baseline(self, key: tuple[str, str], signature: _Signature,
+                             policy: str) -> dict[str, Any] | None:
+        rows = self._rows("SELECT value FROM metadata WHERE key=?", (self._projection_metadata_key(key),))
+        if not rows:
+            return None
+        try:
+            value = json.loads(rows[0][0])
+        except (TypeError, ValueError) as exc:
+            raise HistoryIndexCacheError("private history projection baseline is invalid") from exc
+        if not isinstance(value, dict) or set(value) != {"signature", "policy", "cursor"}:
+            raise HistoryIndexCacheError("private history projection baseline is invalid")
+        if value["signature"] != list(signature.values()) or value["policy"] != policy:
+            return None
+        return value["cursor"]
+
+    def _store_projection_baseline(self, key: tuple[str, str], signature: _Signature,
+                                   policy: str, cursor: dict[str, Any] | None) -> None:
+        name = self._projection_metadata_key(key)
+        if cursor is None:
+            # A local/legacy projection cannot acknowledge a controller cursor.
+            self._connection().execute("DELETE FROM metadata WHERE key=?", (name,))
+            return
+        value = json.dumps({"signature": signature.values(), "policy": policy, "cursor": cursor},
+                           ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        self._connection().execute(
+            "INSERT INTO metadata(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (name, value))
 
     def _upsert_state(self, key: tuple[str, str], signature: _Signature, deferred_tail: bool) -> None:
         self._connection().execute(
@@ -886,9 +909,7 @@ class HistoryIndex:
     ) -> str:
         snapshot = []
         for source in selected:
-            state = states.get(source.key)
-            if state is None:
-                raise HistoryIndexCacheError("selected source cache state is missing")
+            state = states[source.key]
             snapshot.append({
                 "source_path": source.key[0],
                 "session_id": source.key[1],
@@ -981,17 +1002,7 @@ class HistoryIndex:
         count: int,
     ) -> list[tuple[Any, ...]]:
         use_fts = needle is not None and len(needle) >= 3 and "\x00" not in needle
-        if use_fts:
-            try:
-                return self._query_rows(selected, needle, kinds, tool, recent_first, position, count, use_fts=True)
-            except apsw.SQLError as exc:
-                # The generated phrase is quoted, but a SQLite build can still
-                # reject an edge Unicode token.  Content scan retains exact
-                # literal semantics without rereading native JSONL.
-                message = str(exc).lower()
-                if not any(marker in message for marker in ("syntax", "malformed", "not supported", "unsupported")):
-                    raise HistoryIndexCacheError("private history FTS query failed") from exc
-        return self._query_rows(selected, needle, kinds, tool, recent_first, position, count, use_fts=False)
+        return self._query_rows(selected, needle, kinds, tool, recent_first, position, count, use_fts=use_fts)
 
     def _query_rows(
         self,
@@ -1155,7 +1166,7 @@ class HistoryIndex:
             raise HistoryIndexCacheError("cannot inspect private history index storage") from exc
 
     @classmethod
-    def _prepare_cache_path(cls, value: Path) -> tuple[Path, bool]:
+    def _prepare_cache_path(cls, value: Path) -> Path:
         try:
             original = Path(value).expanduser()
         except (TypeError, ValueError, RuntimeError) as exc:
@@ -1167,7 +1178,7 @@ class HistoryIndex:
         cls._check_sidecars(path)
         info = cls._lstat(path)
         if info is None:
-            return path, False
+            return path
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise HistoryIndexCacheError("history index cache target must be one regular nonsymlink file")
         cls._require_current_owner(info, "history index cache target")
@@ -1175,7 +1186,7 @@ class HistoryIndex:
             os.chmod(path, 0o600)
         except OSError as exc:
             raise HistoryIndexCacheError("cannot restrict history index cache permissions") from exc
-        return path, True
+        return path
 
     @classmethod
     def _ensure_private_parent(cls, parent: Path) -> None:

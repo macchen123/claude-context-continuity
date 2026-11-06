@@ -76,7 +76,27 @@ def _sources(state, entries):
     return _source_directories([*entries, target]), _source(target)
 
 
-def _recipient_inventory(state, entries):
+def _bound_relative(directory, entries, agent):
+    """Use the native transcript already observed by child accounting, not an ID index."""
+    from .agent_runtime import _load
+    child = _load(directory, agent)
+    source = child.get("source_path")
+    if not source:
+        return None
+    path = Path(source)
+    if path.name != f"agent-{agent}.jsonl":
+        raise MetadataError("invalid_agent_transcript_path")
+    for entry in entries:
+        if entry["session_id"] != child.get("session_id"):
+            continue
+        project, base = _source(entry)
+        if path.is_relative_to(base):
+            safe = core.safe_path(project, path, exists=False)
+            return safe.relative_to(base).with_suffix(".meta.json")
+    return None
+
+
+def _recipient_inventory(state, entries, directory, *, agent_prefix=None):
     """Read candidate local names without authorizing any identity restoration.
 
     A pending resume's exact source must also be searched for local collisions.
@@ -88,7 +108,12 @@ def _recipient_inventory(state, entries):
     pending = state.get("pending_session_start")
     if isinstance(pending, dict) and pending.get("source") == "resume":
         candidates.append({"session_id": pending["session_id"], "source_path": pending["transcript_path"]})
-    records, faults = _inventory(_source_directories(candidates))
+    sources = _source_directories(candidates)
+    relative = _bound_relative(directory, candidates, agent_prefix) if agent_prefix is not None else None
+    if relative is not None:
+        records, faults = _inventory(sources, relative=relative)
+    else:
+        records, faults = _inventory(sources, agent_prefix=agent_prefix)
     return records, faults, candidates
 
 
@@ -114,33 +139,46 @@ def _launch_name_matches(entries, records, bare):
                     calls.add(call)
     except (ValueError, OSError, TypeError):
         raise MetadataError("agent_name_registry_unreadable") from None
-    bound_calls = {call for rows in records.values() for row in rows
-                   if isinstance(call := row["value"].get("toolUseId"), str) and call in calls}
+    bound_calls, matched = set(), set()
+    for agent, rows in records.items():
+        for row in rows:
+            call = row["value"].get("toolUseId")
+            if isinstance(call, str) and call in calls:
+                bound_calls.add(call)
+                matched.add(agent)
     if calls - bound_calls:
         raise MetadataError("original_agent_metadata_missing")
-    return {agent for agent, rows in records.items()
-            if any(isinstance(call := row["value"].get("toolUseId"), str) and call in calls for row in rows)}
+    return matched
 
 
-def _metadata_paths(project, directory):
-    # pathlib.rglob silently skips unreadable directories. They are uncertainty,
-    # not evidence that a same-named local agent is absent.
+def _metadata_paths(project, directory, *, agent_prefix=None, agents=None):
+    # Names need the complete registry. IDs need filenames only: never read an
+    # unrelated sidecar merely to resolve an already native-addressable ID.
     def unreadable(_):
         raise MetadataError("agent_name_registry_unreadable")
     paths = []
     for current, directories, files in os.walk(directory, onerror=unreadable):
         for name in directories:
             core.safe_path(project, Path(current) / name, exists=True)
-        paths.extend(Path(current) / name for name in files if _METADATA_NAME.fullmatch(name))
+        for name in files:
+            match = _METADATA_NAME.fullmatch(name)
+            if (match is not None and (agent_prefix is None or match[1].startswith(agent_prefix))
+                    and (agents is None or match[1] in agents)):
+                paths.append(Path(current) / name)
     return sorted(paths)
 
 
-def _inventory(sources):
+def _inventory(sources, *, agent_prefix=None, agents=None, relative=None):
     records, faults = {}, {}
     for project, directory in sources:
         if not directory.exists():
             continue
-        for path in _metadata_paths(project, directory):
+        if relative is None:
+            paths = _metadata_paths(project, directory, agent_prefix=agent_prefix, agents=agents)
+        else:
+            candidate = directory / relative
+            paths = [candidate] if candidate.exists() or candidate.is_symlink() else []
+        for path in paths:
             match = _METADATA_NAME.fullmatch(path.name)
             if match is None:
                 continue
@@ -268,12 +306,18 @@ def failure_hook(event, reason="agent_metadata_unavailable"):
                                     f"原因：{reason}。不要重发或改角色绕过；先核对原生 metadata、历史与发布回执。"}}
 
 
-def stopped_handles(state, entries):
+def stopped_handles(state, entries, *, agents=None):
     """Read explicit native stop markers without resuming agents or writing sidecars."""
+    handles = state.get("active_child_handles", [])
+    if agents is not None:
+        selected = set(agents)
+        handles = [agent for agent in handles if agent in selected]
+    if not handles:
+        return {}
     sources, _ = _sources(state, entries)
-    records, faults = _inventory(sources)
+    records, faults = _inventory(sources, agents=set(handles))
     stopped = {}
-    for agent in state.get("active_child_handles", []):
+    for agent in handles:
         if agent in faults or agent not in records:
             continue
         try:
@@ -289,7 +333,7 @@ def stopped_handles(state, entries):
 
 
 def synchronize(state, entries, directory, *, to=None, session_id=_UNSPECIFIED_SESSION):
-    """SessionStart主动继承；只对可能恢复本地代理的工具执行身份门禁。"""
+    """Restore explicit bulk requests or the native identities addressed by SendMessage."""
     if to is None:
         sources, target = _sources(state, entries)
         records, faults = _inventory(sources)
@@ -298,8 +342,9 @@ def synchronize(state, entries, directory, *, to=None, session_id=_UNSPECIFIED_S
         if (native_addressing.explicit_peer(to)
                 or native_addressing.normalized_name(native_addressing.bare_recipient(to)) == "main"):
             return {"status": "not_local_agent", "restored": 0, "blocked": []}
-        records, faults, source_entries = _recipient_inventory(state, entries)
         bare = native_addressing.normalized_name(native_addressing.bare_recipient(to))
+        records, faults, source_entries = _recipient_inventory(
+            state, entries, directory, agent_prefix=bare if _NATIVE_ID.fullmatch(bare) else None)
         candidates = set(records) | set(faults)
         matched = {agent for agent in candidates if agent == bare or
                    (_NATIVE_ID.fullmatch(bare) and agent.startswith(bare)) or

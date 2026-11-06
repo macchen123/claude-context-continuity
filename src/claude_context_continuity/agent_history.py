@@ -78,6 +78,14 @@ def _established_fragments(receipt_directory, paths, destination):
     return {"status": "available", "path": str(destination), "source_path": str(destination), "receipt": str(applied)}
 
 
+def _same_sources(paths, snapshots):
+    stamps = {item["identity"]: item["stamp"] for item in snapshots}
+    for path in paths:
+        current = path.lstat()
+        if _stamp(current) != stamps.get(_identity(current)):
+            raise AgentHistoryError("agent_history_changed_before_publish")
+
+
 def _publish_fragments(agent, paths, destination, sessions, project, directory):
     receipt_directory = _fragment_receipt(directory, agent, destination)
     established = _established_fragments(receipt_directory, paths, destination)
@@ -87,6 +95,7 @@ def _publish_fragments(agent, paths, destination, sessions, project, directory):
     snapshots = [_snapshot(path, agent, sessions, fragments=True) for path in unique.values()]
     if {item["identity"] for item in snapshots} != set(unique):
         raise AgentHistoryError("agent_history_changed_before_publish")
+    _same_sources(paths, snapshots)
     ordered = order_fragments(snapshots)
     destination_stamp = _stamp(destination.lstat()) if destination.exists() else None
     if destination_stamp is not None and destination_stamp[:2] not in unique:
@@ -126,9 +135,7 @@ def _publish_fragments(agent, paths, destination, sessions, project, directory):
                     stream.write(snapshot["raw"])
                 stream.flush()
                 os.fsync(stream.fileno())
-        for snapshot in snapshots:
-            if _stamp(Path(snapshot["path"]).lstat()) != snapshot["stamp"]:
-                raise AgentHistoryError("agent_history_changed_before_publish")
+        _same_sources(paths, snapshots)
         if destination_stamp is None:
             os.link(temporary, destination, follow_symlinks=False)
         else:
@@ -189,10 +196,9 @@ def establish(agent, records, target, sessions, directory):
         # not new publication candidates. Their incomplete or large appends must
         # retain the native consumer's semantics; budget/identity checks still run.
         return {"status": "available", "path": str(destination), "source_path": str(paths[0])}
-    snapshots = [_snapshot(path, agent, sessions) for path in paths]
-    if {snapshot["identity"] for snapshot in snapshots} != identities:
+    source = _snapshot(paths[0], agent, sessions)
+    if source["identity"] not in identities:
         raise AgentHistoryError("agent_history_changed_before_publish")
-    source = snapshots[0]
     receipt = {"agent_id": agent, "source_path": source["path"], "source_sha256": source["sha256"],
                "source_size": source["size"], "destination": str(destination), "method": "native_history_hardlink"}
     receipt_directory = Path(directory) / "agent_history" / core.digest(receipt)
@@ -204,9 +210,7 @@ def establish(agent, records, target, sessions, directory):
         core.atomic(intent, receipt, exclusive=True)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     core.safe_path(project, destination, exists=False)
-    current = Path(source["path"]).lstat()
-    if _stamp(current) != source["stamp"]:
-        raise AgentHistoryError("agent_history_changed_before_publish")
+    _same_sources(paths, [source])
     try:
         os.link(source["path"], destination, follow_symlinks=False)
     except FileExistsError:

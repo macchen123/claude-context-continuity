@@ -167,7 +167,7 @@ def _possibly_local(runtime, state, recipient):
     if agent_metadata._NATIVE_ID.fullmatch(bare):
         return True
     entries = ResumeBindingMixin._catalogue_entries(runtime, runtime)
-    records, faults, _ = agent_metadata._recipient_inventory(state, entries)
+    records, faults, _ = agent_metadata._recipient_inventory(state, entries, runtime.directory)
     return bool(faults) or any(agent == bare or any(agent_metadata._name_matches(row["value"].get("name"), bare)
                                                  for row in rows)
                                for agent, rows in records.items())

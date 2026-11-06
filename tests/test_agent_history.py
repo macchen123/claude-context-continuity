@@ -10,6 +10,8 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from claude_context_continuity import agent_history, core
@@ -448,6 +450,55 @@ class AgentHistoryTests(unittest.TestCase):
         self.target = self.project / self.new / "subagents"
         result = self.establish()
         self.assertTrue(Path(result["path"]).is_relative_to(self.target / "nested"))
+
+
+def alias_fixture(root):
+    project = root / "project"
+    old, alias_sid, new = str(uuid4()), str(uuid4()), str(uuid4())
+    agent = "a1234567890abcdef"
+    relative = Path(f"agent-{agent}.meta.json")
+    records = [{"project": project, "path": project / sid / "subagents" / relative,
+                "relative": relative} for sid in (old, alias_sid)]
+    source, alias = [row["path"].with_name(f"agent-{agent}.jsonl") for row in records]
+    for record in records:
+        record["path"].parent.mkdir(parents=True)
+    raw = (json.dumps({"type": "user", "uuid": str(uuid4()), "parentUuid": None,
+        "agentId": agent, "sessionId": old, "isSidechain": True,
+        "message": {"role": "user", "content": "synthetic original"}}) + "\n").encode()
+    source.write_bytes(raw)
+    os.link(source, alias)
+    target = project / new / "subagents"
+    return agent, records, (project, target), {old, alias_sid, new}, source, alias
+
+
+def test_unselected_hardlink_alias_replacement_during_read_blocks_publication(tmp_path):
+    agent, records, target, sessions, source, alias = alias_fixture(tmp_path)
+    snapshot = agent_history._snapshot
+    def replace_alias(*args, **kwargs):
+        result = snapshot(*args, **kwargs)
+        alias.unlink()
+        alias.write_bytes(source.read_bytes())
+        return result
+    with patch.object(agent_history, "_snapshot", side_effect=replace_alias) as reads:
+        with pytest.raises(ValueError, match="agent_history_changed_before_publish"):
+            agent_history.establish(agent, records, target, sessions, tmp_path / "runtime")
+    assert reads.call_count == 1
+    assert not (target[1] / source.name).exists()
+
+
+def test_unselected_hardlink_alias_replacement_after_intent_blocks_publication(tmp_path):
+    agent, records, target, sessions, source, alias = alias_fixture(tmp_path)
+    atomic = core.atomic
+    def replace_alias(path, value, **kwargs):
+        result = atomic(path, value, **kwargs)
+        if Path(path).name == "intent.json":
+            alias.unlink()
+            alias.write_bytes(source.read_bytes())
+        return result
+    with patch.object(core, "atomic", side_effect=replace_alias):
+        with pytest.raises(ValueError, match="agent_history_changed_before_publish"):
+            agent_history.establish(agent, records, target, sessions, tmp_path / "runtime")
+    assert not (target[1] / source.name).exists()
 
 
 if __name__ == "__main__":

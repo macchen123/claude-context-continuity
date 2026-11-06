@@ -256,7 +256,7 @@ class NotesStore:
             if current is not None and current["sha256"] == digest and prior == combined:
                 return {**current, "created": False, "non_authoritative": True}
 
-            self._store_revision(revisions_dir, name, digest, raw, revisions)
+            self._store_revision(revisions_dir, name, digest, raw)
             identity = self._identity(name, digest)
             self._write_pointer(note_dir, identity)
             _, _, verified, verified_revisions = self._note_state(notes_root, name)
@@ -571,13 +571,8 @@ class NotesStore:
         name: str,
         digest: str,
         raw: bytes,
-        revisions: dict[str, str],
     ) -> None:
         path = revisions_dir / f"{digest}.json"
-        if digest in revisions:
-            if self._utf8(revisions[digest], MAX_NOTE_BYTES, "stored revision") != raw:
-                raise NotesError("existing revision does not match its content identity")
-            return
         if self._lstat(path) is not None:
             if self._read_revision(revisions_dir, name, digest).encode("utf-8") != raw:
                 raise NotesError("existing revision does not match its content identity")

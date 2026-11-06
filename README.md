@@ -140,7 +140,7 @@ Since rotating context involves session boundaries, this package includes a ligh
 
 Native Claude Code needs both a subagent's identity (`.meta.json`) and native history (`agent-<id>.jsonl`) in the current session to resume a completed child. Metadata alone can report a preserved role while native `SendMessage` still fails with `No transcript found for agent ID`.
 
-cclaude establishes both native loader inputs from its catalogued sessions at `SessionStart` and revalidates them before `SendMessage`, the current native resume entry:
+`SessionStart` binds the new parent session without restoring every historical subagent. Before `SendMessage`, cclaude establishes the addressed agent's native loader inputs from its catalogued sources. A recorded exact agent ID uses its observed native location without reading unrelated agents' metadata; aliases of one physical history are read once when establishing the connection:
 
 - Resuming a session retains its validated earlier history references, including when that session contains new user instructions. Those instructions remain authoritative; inheriting the catalogue does not adopt an older owner's authorization.
 - Native role, explicit model, permission/isolation fields, and opaque extension fields are preserved. Agent definitions, global settings, and official binaries are untouched.
@@ -166,7 +166,7 @@ If an earlier version dropped the resumed session's catalogue references, run th
 claude-context tui-recover --context-id "$CLAUDE_CONTINUITY_ID" --session-id "<session-id>"
 ```
 
-This rechecks the bound source, restores validated catalogue references and refreshes the native subagent loader inputs. It does not replay work or overwrite conflicting histories; repeating it does not add duplicate catalogue entries.
+This rechecks the bound source and restores validated catalogue references. The addressed subagent's loader inputs are prepared when `SendMessage` actually needs them. Recovery does not replay work or overwrite conflicting histories; repeating it does not add duplicate catalogue entries.
 
 Each child reads input, cache and output usage from its own native transcript, never from its parent. Without an observed child window, the configured ceiling is an estimate with a 25% reserve. Missing usage and windows remain unknown; file bytes are not token counts.
 
@@ -240,6 +240,16 @@ No. You are still using native Claude Code. Your models, system prompts, MCP ser
 
 ### 5. Why is automatic switching waiting?
 The host may be waiting for a complete native history record, a tool result, or confirmation that a clear or handoff was received. It keeps checking and continues when the missing fact becomes available. A delayed confirmation does not permanently disable automatic switching, and an uncertain command is not sent again blindly.
+
+New native metadata such as `tools-used` does not block history reads, usage observation, or rotation, and never becomes a user instruction. UUID-free state records are skipped; extension records with UUIDs retain locators without exposing their payloads. Malformed messages and conflicting session identities still report their actual cause rather than promising recovery by waiting. The controller retries state/I/O faults, not unexpected programming errors.
+
+Before the first real usage sample arrives in a new window, the budget stays unknown and normal input and tools continue; missing that sample does not create a fault wait. A startup transcript is catalogued after its first write, so resuming another session does not leave a nonexistent search source. Malformed usage fields still report an error. Hook lock contention is logged without changing the session's wait state. Other failures reaching the hook entry point retain a redacted exception type and cause, including failures before a subagent identity check can run. A new waiting reason does not reuse an unrelated old diagnostic; `tui-status` retains the previous cause in `last_reconciliation.diagnostic`, and `hook_failure` entries in `events.jsonl` record `error_type`, not exception text.
+
+Managed hooks reuse the existing controller through a private authenticated local socket. Same-context `history-search` keeps SQLite queries and maintenance in its own CLI process, so cold index refreshes and redaction cleanup do not occupy the hook process. After initial indexing, separate CLI searches request only added, changed and removed public projection entries, including changes across intervening observations. The cursor is committed with the indexed rows and bound to the source, projection lifetime and redaction policy. A missing or invalid baseline explicitly requests a full replacement; unchanged sources need no IPC request. Explicit-source and other-context searches retain their standalone entry points.
+
+The controller retains only the current native source reader. Each read captures a bounded snapshot, validates its captured bytes if the file changes during reading, and consumes subsequent appends on the next observation. Ordinary live appends do not invalidate the snapshot. New complete records are decoded incrementally; replacement, truncation or prefix changes rebuild the observation. Detecting arbitrary old-prefix edits still requires comparing old bytes on append, so delta-only IPC does not make total source I/O O(delta).
+
+Raw records and thinking stay in process memory, not in a new persistent cache. Before any bytes are sent, an absent listener uses the original local reader for search or the local hook/observer-repair path for hooks; already-sent requests are never replayed.
 
 Native `Stop` confirms that Claude Code has finished responding, while its history is written asynchronously. The host retains that receipt even if the transcript file or current input has not appeared yet. It verifies the exact native turn and final response once those records arrive, then continues the requested context switch automatically. Delayed records are matched by native conversation identity rather than transcript append order.
 

@@ -311,6 +311,30 @@ class DurableCronTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "owned_process_alive")
         self.assertEqual(self.tasks_path.read_bytes(), before)
 
+    def test_repair_and_disabled_restore_preserve_native_permissions(self) -> None:
+        self.tasks_path.chmod(0o640)
+        self.assertEqual(self.repair()["status"], "applied")
+        self.assertEqual(self.tasks_path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(self.receipt_paths()[0].stat().st_mode & 0o777, 0o600)
+        with patch("claude_context_continuity.durable_cron.os.kill", side_effect=ProcessLookupError):
+            outcome = durable_cron.restore_bindings(self.state(enabled=False), self.runtime_directory)
+        self.assertEqual(outcome["status"], "applied")
+        self.assertEqual(self.native_tasks()["tasks"][0]["createdBySessionId"], self.current_session)
+        self.assertEqual(self.tasks_path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(list(self.native.glob(".durable-cron-*")), [])
+        self.assertEqual(list(self.receipt_paths()[0].parent.glob(".durable-cron-*")), [])
+
+    def test_failed_native_replace_retains_receipt_and_can_recover_exactly(self) -> None:
+        before = self.tasks_path.read_bytes()
+        with patch.object(durable_cron.os, "replace", side_effect=OSError("fixture replace failure")):
+            outcome = self.repair()
+        self.assertEqual(outcome, {"status": "error", "task_id": self.task["id"], "reason": "io_error"})
+        self.assertEqual(self.tasks_path.read_bytes(), before)
+        self.assertEqual(len(self.receipt_paths()), 1)
+        self.assertEqual(list(self.native.glob(".durable-cron-*")), [])
+        self.assertEqual(self.repair()["status"], "applied")
+        self.assertEqual(len(self.receipt_paths()), 1)
+
     def test_changed_native_snapshot_is_not_overwritten(self) -> None:
         original_replace = durable_cron._replace_if_unchanged
 

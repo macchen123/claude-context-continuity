@@ -6,12 +6,11 @@ import os
 from pathlib import Path
 import shlex
 import sys
-from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import uuid4
 
 from . import core
-from .history import HistoryError, HistorySource, redact, terminal_task_result
+from .history import HistoryError, HistorySource, NativeUsagePending, redact, terminal_task_result
 from .notes import MAX_NOTE_BYTES, NotesStore
 
 _SCHEMA = "claude-context-runtime.v1"
@@ -21,13 +20,6 @@ _MAX_HANDOFF_BYTES = MAX_NOTE_BYTES
 _BUDGET_FIELDS = ("guard_tokens", "window_tokens", "window_is_actual", "cache_fields_complete",
                   "handoff_reported", "last_sample_id")
 RUNTIME_SIGNAL = "<continuity-host-event>"
-
-
-@dataclass
-class _HookHistorySnapshot:
-    """One transient, validated history read shared only within one hook call."""
-
-    records: list[Any] | None = None
 
 
 def _runtime_message(text):
@@ -368,7 +360,13 @@ class ContextRuntime:
             return
         if not isinstance(reason, str) or not reason:
             reason = "native_observation_pending"
-        state["reconciliation"] = {"stage": state["phase"], "reason": reason}
+        current = {"stage": state["phase"], "reason": reason}
+        previous = state.get("reconciliation")
+        if previous != current:
+            diagnostic = state.pop("diagnostic", None)
+            if isinstance(previous, dict):
+                state["last_reconciliation"] = previous | ({"diagnostic": diagnostic} if diagnostic else {})
+        state["reconciliation"] = current
 
     @staticmethod
     def _waiting(state: dict[str, Any]) -> bool:
@@ -378,15 +376,22 @@ class ContextRuntime:
     @staticmethod
     def _clear_wait(state: dict[str, Any]) -> None:
         previous = state.pop("reconciliation", None)
+        diagnostic = state.pop("diagnostic", None)
         if isinstance(previous, dict):
-            state["last_reconciliation"] = previous
+            state["last_reconciliation"] = previous | ({"diagnostic": diagnostic} if diagnostic else {})
             state["observation_recoveries"] = state.get("observation_recoveries", 0) + 1
-        state.pop("diagnostic", None)
+
+    def _clear_observation_wait(self, state: dict[str, Any]) -> None:
+        """A verified hook binding can recover before the first usage sample arrives."""
+        if (self._waiting(state) and state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}
+                and not state.get("pending_session_start") and not state.get("native_session_uncertain")
+                and state.get("authorization")):
+            self._clear_wait(state)
 
     @staticmethod
     def _receipt(state: dict[str, Any]) -> dict[str, Any]:
         rotation = state["rotation"]
-        return {key: state.get(key) for key in ("conversation_id", "phase", "reconciliation", "cwd", "session_id",
+        return {key: state.get(key) for key in ("conversation_id", "phase", "reconciliation", "last_reconciliation", "cwd", "session_id",
                 "source_path", "configuration", "usage", "authorization", "owned_pid", "diagnostic", "capabilities")} | {
                     "pending_tool_ids": list(state["pending_tool_ids"]),
                     "active_child_handles": list(state["active_child_handles"]),
@@ -407,10 +412,13 @@ class ContextRuntime:
     @staticmethod
     def _observe_authorization_records(state: dict[str, Any], source: HistorySource, records: list[Any]) -> None:
         """Update authority only from exact complete native records already read."""
+        ContextRuntime._observe_authorization_bounds(state, source._bounds_from_records(records))
+
+    @staticmethod
+    def _observe_authorization_bounds(state: dict[str, Any], bounds: dict[str, Any]) -> None:
         pending = state.get("pending_session_start")
         if isinstance(pending, dict) and not pending.get("workspace_verified"):
             return
-        bounds = source._bounds_from_records(records)
         if state["authorization"] is None:
             # A SessionStart or tool hook can precede the first durable human
             # record.  This is not an identity failure and must not suppress
@@ -435,22 +443,20 @@ class ContextRuntime:
         state.setdefault("launch_cwd", state["cwd"])
         state["cwd"], state["source_path"] = cwd, path
 
-    def _bind(self, state: dict[str, Any], event: dict[str, Any], *,
-              snapshot: _HookHistorySnapshot | None = None) -> HistorySource:
+    def _bind(self, state: dict[str, Any], event: dict[str, Any]) -> tuple[HistorySource, list[Any]]:
         self._observe_native_context(state, event)
-        source = _source(state["source_path"], state["session_id"])
-        self._catalogue_source(state)
-        # Runtime observation may use the parser's existing complete-prefix
-        # mode.  Public History APIs remain strict for ordinary stream reads.
-        records = source._records(defer_incomplete_tail=True)
-        self._observe_authorization_records(state, source, records)
-        if snapshot is not None:
-            snapshot.records = records
+        return self._refresh_bound_source(state)
+
+    def _history_source(self, path, session_id):
+        source = getattr(self, "_observed_source", None)
+        if source is None or (str(source.path), source.session_id) != (path, session_id):
+            source = _source(path, session_id)
+            self._observed_source = source
         return source
 
     def _refresh_bound_source(self, state: dict[str, Any]) -> tuple[HistorySource, list[Any]]:
         """Re-observe one already-validated binding without fabricating a hook."""
-        source = _source(state.get("source_path"), state["session_id"])
+        source = self._history_source(state.get("source_path"), state["session_id"])
         self._catalogue_source(state)
         records = source._records(defer_incomplete_tail=True)
         self._observe_authorization_records(state, source, records)
@@ -494,15 +500,14 @@ class ContextRuntime:
             reason = state.get("diagnostic") or reconciliation.get("reason") or "原因尚未确认"
             notice_key = core.digest([state["session_id"], reconciliation.get("stage"), reason])
             if state.get("wait_notice_key") != notice_key:
-                result["systemMessage"] = (
-                    "cclaude 正在等待原生状态确认，确认后自动继续。原因：" + reason)
+                result["systemMessage"] = "cclaude 暂未执行上下文切换。原因：" + reason
                 state["wait_notice_key"] = notice_key
         else:
             state.pop("wait_notice_key", None)
         return result
 
     def _usage(self, state: dict[str, Any], required: bool, *, sample: dict[str, Any] | None = None,
-               records: list[Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+               records: list[Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]] | None:
         if not isinstance(state["source_path"], str):
             if required:
                 raise ContextRuntimeError("current native history source is unavailable")
@@ -511,13 +516,13 @@ class ContextRuntime:
             if sample is not None:
                 usage = sample
             else:
-                source = HistorySource(Path(state["source_path"]), state["session_id"])
+                source = self._history_source(state["source_path"], state["session_id"])
                 if records is None:
                     records = source._records(defer_incomplete_tail=True)
                 usage = source._usage_from_records(records)
-        except (OSError, HistoryError, TypeError, ValueError) as exc:
+        except NativeUsagePending:
             if required:
-                raise ContextRuntimeError("actual native usage is unavailable") from exc
+                raise
             return None
         windows = [value for value in (state["native_context_window"], state["configuration"]["configured_window"])
                    if type(value) is int and value > 0]
@@ -595,7 +600,7 @@ class ContextRuntime:
 
     def _latest_before_clear(self, state: dict[str, Any]) -> None:
         try:
-            source = HistorySource(Path(state["source_path"]), state["session_id"])
+            source = self._history_source(state["source_path"], state["session_id"])
             latest = source._bounds_from_records(source._records(defer_incomplete_tail=True))["last"]
             if latest is not None:
                 state["authorization"]["latest_instruction_locator"] = latest
@@ -603,13 +608,10 @@ class ContextRuntime:
             raise ContextRuntimeError("current native history cannot be verified") from exc
         self._verify_authorization(state)
 
-    def _context(self, state: dict[str, Any], *, records: list[Any] | None = None) -> str | None:
-        observed = self._usage(state, False, records=records)
+    def _context(self, state: dict[str, Any], observed: tuple[dict[str, Any], dict[str, Any]] | None) -> str | None:
         if observed is None:
             return None
         usage, decision = observed
-        if decision is None:
-            return None
         source = ("observed native contextWindow" if decision["window_is_actual"]
                   else "configured host-window estimate; native contextWindow was not observed")
         cache = ("stream cache fields explicitly present" if decision["cache_fields_complete"]
@@ -660,10 +662,11 @@ class ContextRuntime:
         if self._waiting(state):
             return
         # 不为腾窗口再发模型总结请求；只保存可精确读回的公开历史定位。
-        source = HistorySource(Path(state["source_path"]), state["session_id"])
-        recent = [info for info in source._records(defer_incomplete_tail=True)
-                  if info.kind in {"assistant", "tool_result"}][-4:]
-        locators = [source.locator(info.message_id) for info in recent]
+        source = self._history_source(state["source_path"], state["session_id"])
+        records = source._records(defer_incomplete_tail=True)
+        pairs = source._pairs(records)
+        recent = [info for info in records if info.kind in {"assistant", "tool_result"}][-4:]
+        locators = [source._locator(info, source._kind(info, pairs)) for info in recent]
         reason = ("原生宿主已拒绝过长上下文，按核验过的失败记录安全换窗；" if failure else
                   "宿主因真实预算进入预留区自动换窗；" if state.get("budget_handoff_signal") else
                   "宿主为处理上一条交接未包含的已提交输入而换窗；")
@@ -896,17 +899,11 @@ class ContextRuntime:
                 else:
                     self._observe_tool_hook(state, event)
                     self._verify_config(state)
-                    history = _HookHistorySnapshot()
-                    self._bind(state, event, snapshot=history)
+                    _, records = self._bind(state, event)
                     self._window(state, event)
-                    if history.records is None:
-                        raise ContextRuntimeError("hook history snapshot is unavailable")
-                    context = self._context(state, records=history.records)
-                    if (context is not None and self._waiting(state)
-                            and state["phase"] in {"running", "rotation_requested", "waiting_safe_boundary"}
-                            and not state.get("pending_session_start") and not state.get("native_session_uncertain")
-                            and state.get("authorization")):
-                        self._clear_wait(state)
+                    observed = self._usage(state, False, records=records)
+                    self._clear_observation_wait(state)
+                    context = self._context(state, observed)
             except (OSError, TypeError, ValueError, HistoryError, core.ContinuityError, ContextRuntimeError) as exc:
                 self._wait(state, "hook_state_or_source_pending")
                 state["diagnostic"] = redact(str(exc), core.secret_values())[:400]
@@ -914,10 +911,13 @@ class ContextRuntime:
             self._save(state)
         return result
 
-    def _wait_external(self, reason: str) -> dict[str, Any]:
+    def _wait_external(self, reason: str, *, error: Exception | None = None) -> dict[str, Any]:
         with core.lock(self.lock_path, wait_seconds=5):
             state = self._state()
             self._wait(state, reason)
+            if error is not None:
+                error_type = getattr(error, "error_type", type(error).__name__)
+                state["diagnostic"] = redact(f"{error_type}: {error}", core.secret_values())[:400]
             self._save(state)
             return self._receipt(state)
 

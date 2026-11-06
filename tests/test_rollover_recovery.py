@@ -451,7 +451,7 @@ def test_stopped_native_sidecar_is_not_reported_as_live_after_clear(managed_runt
     f.clear_epoch()
     assert f.runtime.receipt()["active_child_handles"] == [live]
     assert old_stopped.read_bytes() == before
-    assert json.loads((f.root / f.sid / "subagents" / old_stopped.name).read_text())["stoppedByUser"]
+    assert not (f.root / f.sid / "subagents" / old_stopped.name).exists()
     f.clear.assert_not_called()
 
 

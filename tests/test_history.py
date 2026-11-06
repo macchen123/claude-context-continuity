@@ -184,16 +184,49 @@ class HistorySourceTests(unittest.TestCase):
         self.assertEqual([record.message_id for record in self.source()._records()], ["user-1", "assistant-1"])
         self.assertEqual(self.source().read(before["last"])["text"], "continue the authorized task")
 
-    def test_pr_link_still_checks_session_and_unknown_record_types_still_fail(self) -> None:
+    def test_metadata_still_checks_session_identity(self) -> None:
         original = self.record("user-1", "user", "authorized task")
-        cases = [
-            ({"type": "pr-link", "sessionId": str(uuid4())}, "another session"),
-            ({"type": "future-unrecognized-record", "sessionId": self.SID}, "unknown record type"),
-        ]
-        for extra, reason in cases:
-            with self.subTest(record_type=extra["type"]):
+        for kind in ("pr-link", "tools-used", "future-unrecognized-record"):
+            with self.subTest(record_type=kind):
+                self.write_records(original, {"type": kind, "sessionId": str(uuid4())})
+                with self.assertRaisesRegex(HistoryError, "another session"):
+                    self.source().instruction_bounds()
+
+    def test_tools_used_and_extension_metadata_do_not_block_history(self) -> None:
+        original = self.record("user-1", "user", "authorized task")
+        assistant = self.record("assistant-1", "assistant", "public result")
+        assistant["message"].update(model="native-model", usage={
+            "input_tokens": 125, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+        later = self.record("user-2", "user", "verify the result")
+        for kind in ("tools-used", "future-unrecognized-record", "api-request-unknown"):
+            for identity in ({}, {"uuid": "extension-1"}):
+                with self.subTest(record_type=kind, identity=identity):
+                    metadata = {"type": kind, "sessionId": self.SID, "tools": ["Bash"], **identity}
+                    # A user-shaped payload in an extension is still not an instruction.
+                    metadata["message"] = {"role": "user", "content": "private-extension-marker"}
+                    raw = self.write_records(original, assistant, metadata, later)
+                    source = self.source()
+                    self.assertEqual(source_kind(metadata), "meta")
+                    bounds = source.instruction_bounds()
+                    self.assertEqual(bounds["first"]["message_id"], "user-1")
+                    self.assertEqual(bounds["last"]["start_byte"], len(raw) - len(self.line(later)))
+                    self.assertEqual(source.read(bounds["last"])["text"], "verify the result")
+                    self.assertEqual(source.latest_usage()["total_input_tokens"], 125)
+                    self.assertEqual(source.activity()["pending_tools"], {})
+                    self.assertEqual(source.search("private-extension-marker")["entries"], [])
+                    self.assertNotIn("private-extension-marker", json.dumps(source.index_projection()))
+                    self.assertEqual([row["message_id"] for row in source.page(instructions_only=True)["entries"]],
+                                     ["user-1", "user-2"])
+
+    def test_metadata_tolerance_does_not_hide_invalid_content(self) -> None:
+        original = self.record("user-1", "user", "authorized task")
+        for extra in ({"type": "assistant", "sessionId": self.SID},
+                      {"type": "tool_result", "sessionId": self.SID},
+                      {"type": "", "sessionId": self.SID},
+                      {"sessionId": self.SID}):
+            with self.subTest(record=extra):
                 self.write_records(original, extra)
-                with self.assertRaisesRegex(HistoryError, reason):
+                with self.assertRaises(HistoryError):
                     self.source().instruction_bounds()
 
     def test_agent_name_metadata_is_skipped_without_shifting_instruction_locators(self) -> None:
@@ -258,16 +291,13 @@ class HistorySourceTests(unittest.TestCase):
         self.assertEqual([row["message_id"] for row in source.page(instructions_only=True)["entries"]],
                          ["user-1", "user-2"])
 
-    def test_api_request_metadata_keeps_session_checks_and_unknown_types_fail_closed(self) -> None:
+    def test_api_request_metadata_keeps_session_checks(self) -> None:
         original = self.record("user-1", "user", "authorized task")
         for kind in ("api-request-shape", "api-request-blob", "api-request"):
             with self.subTest(kind=kind):
                 self.write_records(original, {"type": kind, "sessionId": str(uuid4())})
                 with self.assertRaisesRegex(HistoryError, "another session"):
                     self.source()._records(defer_incomplete_tail=True)
-        self.write_records(original, {"type": "api-request-unknown", "sessionId": self.SID})
-        with self.assertRaisesRegex(HistoryError, "unknown record type"):
-            self.source()._records(defer_incomplete_tail=True)
 
     def test_activity_settles_native_backgrounds_but_not_pasted_notices(self) -> None:
         launch = self.record("launch", "assistant", [{"type": "tool_use", "id": "call-1",
@@ -944,6 +974,198 @@ class HistorySourceTests(unittest.TestCase):
             source.saved_output(source.tool_result("save-1"), outside, hashlib.sha256(outside.read_bytes()).hexdigest())
         with self.assertRaises(HistoryError):
             source.saved_output(source.tool_result("save-2"), escape, hashlib.sha256(outside.read_bytes()).hexdigest())
+
+
+def _incremental_record(message_id, kind="user", content="public text", **extra):
+    return {"uuid": message_id, "type": kind, "sessionId": HistorySourceTests.SID,
+            "message": {"role": kind, "content": content}, **extra}
+
+
+def _incremental_line(record):
+    return json.dumps(record, separators=(",", ":")).encode() + b"\n"
+
+
+def test_credential_redaction_is_idempotent_without_json_punctuation_artifacts():
+    for text in (
+        "Context budget token: 2048; continue the existing task.",
+        "API_KEY=[REDACTED]", 'password="[REDACTED]"', "Authorization=Bearer [REDACTED]",
+        "API_KEY=[fixture-bracket-key]",
+        '{"API_KEY":"fixture-key"}', "token=abc; next",
+        "Authorization: Bearer fixture-bearer-value", "Bearer fixture-bearer-value",
+        "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----",
+        "known-environment-fixture",
+    ):
+        result = redact(text, ("known-environment-fixture",))
+        assert redact(result, ("known-environment-fixture",)) == result
+    assert redact("API_KEY=[REDACTED]") == "API_KEY=[REDACTED]"
+    assert redact("Authorization=Bearer [REDACTED]") == "Authorization=Bearer [REDACTED]"
+    assert "fixture-bracket-key" not in redact("API_KEY=[fixture-bracket-key]")
+    assert redact("Context budget token: 2048; continue the existing task.") == (
+        "Context budget token: 2048; continue the existing task.")
+    assert redact("budget token=2048") == "budget token=[REDACTED]"
+    assert redact("access_token: 2048") == "access_token: [REDACTED]"
+
+
+def test_large_retained_observation_parses_only_new_complete_records(tmp_path):
+    from unittest.mock import patch
+    from claude_context_continuity import history
+    path = tmp_path / f"{HistorySourceTests.SID}.jsonl"
+    raw = b"".join(_incremental_line(_incremental_record(f"u-{i}", content="public " + "x" * 300))
+                   for i in range(12_000))
+    path.write_bytes(raw)
+    source = HistorySource(path, HistorySourceTests.SID)
+    with patch.object(history, "_decode", wraps=history._decode) as decode:
+        cold = source.observe()
+        assert cold["work"]["parsed_records"] == decode.call_count == 12_000
+        assert cold["work"]["parsed_bytes"] == len(raw)
+        assert cold["usage"] is None
+        decode.reset_mock()
+        hot = source.observe()
+        assert hot["work"] == {"read_bytes": 0, "validated_bytes": 0,
+                               "parsed_bytes": 0, "parsed_records": 0, "projected_records": 0}
+        assert decode.call_count == 0
+        assistant = _incremental_record("a-next", "assistant", "new answer")
+        assistant["message"].update(model="fixture-model", id="request-fixture", usage={"input_tokens": 250})
+        appended = (_incremental_line(assistant)
+                    + _incremental_line(_incremental_record("u-next", content="new authorized instruction")))
+        with path.open("ab") as handle:
+            handle.write(appended)
+        warm = source.observe()
+        assert decode.call_count == warm["work"]["parsed_records"] == 2
+        assert warm["work"]["parsed_bytes"] == len(appended)
+        assert warm["work"]["validated_bytes"] == len(raw)
+        assert warm["work"]["read_bytes"] == len(raw) + len(appended)
+        assert warm["work"]["projected_records"] == 2
+        assert warm["usage"]["total_input_tokens"] == 250
+        assert warm["instruction_bounds"]["last"]["message_id"] == "u-next"
+        records = HistorySource(path, HistorySourceTests.SID)._records()
+        assert warm["activity"] == source._activity_from_records(records)
+        assert warm["instruction_bounds"] == source._bounds_from_records(records)
+        assert warm["usage"] == source._usage_from_records(records)
+        print(json.dumps({"scenario": "12000-record retained observation",
+                          "cold": cold["work"], "unchanged": hot["work"], "append": warm["work"]}, sort_keys=True))
+
+
+def test_retained_stream_detects_prefix_mutation_even_when_file_grows(tmp_path):
+    import pytest
+    path = tmp_path / f"{HistorySourceTests.SID}.jsonl"
+    original = _incremental_line(_incremental_record("first", content="old text"))
+    path.write_bytes(original)
+    source = HistorySource(path, HistorySourceTests.SID)
+    locator = source.locator("first")
+    source.observe()
+    changed = _incremental_line(_incremental_record("first", content="new text"))
+    assert len(original) == len(changed)
+    path.write_bytes(changed + _incremental_line(_incremental_record("second")))
+    observed = source.observe()
+    assert observed["work"]["parsed_records"] == 2
+    with pytest.raises(HistoryError, match="bound record changed"):
+        source.read(locator)
+    assert source.read(source.locator("first"))["text"] == "new text"
+    path.write_bytes(changed)
+    assert source.observe()["instruction_bounds"]["last"]["message_id"] == "first"
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(_incremental_line(_incremental_record("replacement")))
+    replacement.replace(path)
+    assert source.observe()["instruction_bounds"]["first"]["message_id"] == "replacement"
+
+
+def test_retained_stream_defers_only_incomplete_tail_and_recovers_after_repair(tmp_path):
+    import pytest
+    path = tmp_path / f"{HistorySourceTests.SID}.jsonl"
+    first = _incremental_line(_incremental_record("first"))
+    second = _incremental_line(_incremental_record("second"))
+    path.write_bytes(first + second[:-8])
+    source = HistorySource(path, HistorySourceTests.SID)
+    assert source.observe()["deferred_incomplete_tail"] is True
+    with pytest.raises(HistoryError, match="truncated"):
+        source.page()
+    with path.open("ab") as handle:
+        handle.write(second[-8:])
+    assert source.observe()["work"]["parsed_records"] == 1
+    assert source.page()["entries"][-1]["message_id"] == "second"
+    with path.open("ab") as handle:
+        handle.write(b"not-json\n")
+    with pytest.raises(HistoryError, match="invalid JSONL"):
+        source.observe()
+    path.write_bytes(first + second)
+    assert source.observe()["instruction_bounds"]["last"]["message_id"] == "second"
+    with path.open("ab") as handle:
+        handle.write(_incremental_line(_incremental_record("second")))
+    with pytest.raises(HistoryError, match="duplicate message"):
+        source.observe()
+    path.write_bytes(first)
+    assert source.observe()["instruction_bounds"]["last"]["message_id"] == "first"
+    foreign = _incremental_record("foreign", sessionId="223e4567-e89b-12d3-a456-426614174000")
+    with path.open("ab") as handle:
+        handle.write(_incremental_line(foreign))
+    with pytest.raises(HistoryError, match="another session"):
+        source.observe()
+
+
+def test_incremental_projection_revokes_ambiguous_answer_and_preserves_tool_components(tmp_path):
+    questions = [{"question": "Publish?"}]
+    ask = _incremental_record("ask", "assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion",
+                                                     "input": {"questions": questions}}])
+    ask["message"].update(model="fixture-model", usage={"input_tokens": 100})
+    answer = _incremental_record("answer", content=[{"type": "tool_result", "tool_use_id": "q", "content": "tool prose"}],
+                                 toolUseResult={"questions": questions, "answers": {"Publish?": "No"}, "annotations": {}})
+    path = tmp_path / f"{HistorySourceTests.SID}.jsonl"
+    path.write_bytes(_incremental_line(ask))
+    source = HistorySource(path, HistorySourceTests.SID)
+    initial = source.index_projection()
+    with path.open("ab") as handle:
+        handle.write(_incremental_line(answer))
+    update = source.index_projection(since=initial["revision"])
+    assert not update["reset"]
+    assert update["entries"][0]["source_kind"] == "verified_user_answer"
+    assert source.observe()["instruction_bounds"]["last"]["message_id"] == "answer"
+    duplicate = {**ask, "uuid": "duplicate-ask"}
+    with path.open("ab") as handle:
+        handle.write(_incremental_line(duplicate))
+    revoked = source.index_projection(since=update["revision"])
+    assert revoked["entries"][0]["source_kind"] == "tool_result"
+    assert source.observe()["instruction_bounds"] == {"first": None, "last": None}
+    fresh = HistorySource(path, HistorySourceTests.SID).index_projection()
+    assert source.index_projection()["entries"] == fresh["entries"]
+    # Public result mutation cannot poison a retained projection or exact read.
+    fresh["entries"][0]["text"] = "poison"
+    public = source.index_projection()
+    public["entries"][0]["locator"]["message_id"] = "poison"
+    assert source.index_projection()["entries"][0]["locator"]["message_id"] == "answer"
+
+
+def test_retained_activity_reuses_inputs_and_preserves_background_terminal_evidence(tmp_path):
+    from unittest.mock import patch
+    from claude_context_continuity import history_activity
+    path = tmp_path / f"{HistorySourceTests.SID}.jsonl"
+    path.write_bytes(b"")
+    source = HistorySource(path, HistorySourceTests.SID)
+    launch = _incremental_record("launch", "assistant", [{"type": "tool_use", "id": "agent-call", "name": "Agent",
+                                                           "input": {"prompt": "private-tool-input-fixture"}}])
+    launch["message"].update(model="fixture-model", usage={"input_tokens": 100})
+    launched = _incremental_record("launched", content=[{"type": "tool_result", "tool_use_id": "agent-call", "content": "public"}],
+                                   toolUseResult={"agentId": "agent-fixture", "isAsync": True})
+    control = _incremental_record("control", "assistant", [{"type": "tool_use", "id": "output-call", "name": "TaskOutput",
+                                                            "input": {"task_id": "agent-fixture"}}])
+    control["message"].update(model="fixture-model", usage={"input_tokens": 150})
+    completed = _incremental_record("completed", content=[{"type": "tool_result", "tool_use_id": "output-call", "content": "public"}],
+                                    toolUseResult={"retrieval_status": "success", "task": {"task_id": "agent-fixture", "status": "completed"}})
+    for record in (launch, launched, control, completed):
+        with path.open("ab") as handle:
+            handle.write(_incremental_line(record))
+        with patch.object(history_activity, "_json", wraps=history_activity._json) as inputs:
+            observed = source.observe()
+            assert inputs.call_count == (1 if record["type"] == "assistant" else 0)
+            source.observe()
+            assert inputs.call_count == (1 if record["type"] == "assistant" else 0)
+        fresh = HistorySource(path, HistorySourceTests.SID)
+        assert observed["activity"] == fresh.activity()
+        assert "private-tool-input-fixture" not in json.dumps(observed)
+    assert observed["activity"]["background_handles"] == {}
+    assert observed["activity"]["terminal_background_handles"] == ["agent-fixture"]
+    assert observed["activity"]["background_lifecycle"]["agent-fixture"] == {
+        "launch_tool_ids": ["agent-call"], "terminal_tool_ids": ["agent-call"]}
 
 
 if __name__ == "__main__":

@@ -80,7 +80,7 @@ def bound_result(
         model = _compact_json_bytes(replacement)
         if model is None or len(model) > byte_limit or not _replacement_valid(kind, replacement):
             return _deferred(tool_response, raw_bytes, "result has no faithful bounded replacement")
-        _store_archive(root, outputs, archive_path, digest, archive_bytes, redacted_response)
+        _store_archive(root, outputs, archive_path, digest, archive_bytes)
     except (HistoryError, OSError, TypeError, ValueError, UnicodeError, core.ContinuityError):
         # 异常文本可能含路径或凭证；调用方只需要安全的停止信号。
         return _deferred(tool_response, raw_bytes, "private result archive is unavailable")
@@ -268,8 +268,8 @@ def _bounded_bash(
     def build(limit: int) -> dict[str, Any]:
         result = dict(original)
         # 原生 persistedOutputPath 等元数据只保留，不复制进提示文本。
-        result["stdout"] = stdout[:limit] + stdout_notice
-        result["stderr"] = stderr[:limit] + stderr_notice
+        result["stdout"] = stdout[:limit] + stdout_notice if stdout else ""
+        result["stderr"] = stderr[:limit] + stderr_notice if stderr else ""
         return result
 
     return _fit_prefixes(build, max(len(stdout), len(stderr)), byte_limit)
@@ -391,7 +391,6 @@ def _store_archive(
     archive_path: Path,
     digest: str,
     archive_bytes: bytes,
-    archive_value: dict[str, Any],
 ) -> None:
     outputs = _ensure_archive_directory(root, outputs)
     planned = core.safe_path(root, Path(_ARCHIVE_DIRECTORY) / archive_path.name, exists=False)
@@ -401,18 +400,15 @@ def _store_archive(
         _verify_archive(root, archive_path, digest, archive_bytes)
         return
     try:
-        if len(archive_bytes) <= core.MAX_PACKET:
-            core.atomic(archive_path, archive_value, exclusive=True)
-        else:
-            _atomic_large_archive(archive_path, archive_bytes)
+        _atomic_archive(archive_path, archive_bytes)
     except FileExistsError:
         # 并发创建后只接受内容完全一致的既有文件。
         pass
     _verify_archive(root, archive_path, digest, archive_bytes)
 
 
-def _atomic_large_archive(path: Path, payload: bytes) -> None:
-    """保留大结果，沿用共享原子写的临时文件和 fsync 语义。"""
+def _atomic_archive(path: Path, payload: bytes) -> None:
+    """原样持久化已绑定 hash 的字节；所有大小共用 exclusive link 和 fsync。"""
     if path.is_symlink():
         raise ResultBudgetError("archive path is a symlink")
     fd, temporary_name = tempfile.mkstemp(prefix=".result-budget-", dir=path.parent)
@@ -441,9 +437,8 @@ def _verify_archive(root: Path, path: Path, digest: str, expected: bytes) -> Non
     if verified != path or stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
         raise ResultBudgetError("archive file is not a regular bound file")
     try:
-        observed = core.sha(path)
         exact = path.read_bytes()
     except OSError as exc:
         raise ResultBudgetError("archive file cannot be read") from exc
-    if not hmac.compare_digest(observed, digest) or exact != expected:
+    if not hmac.compare_digest(hashlib.sha256(exact).hexdigest(), digest) or exact != expected:
         raise ResultBudgetError("archive content binding differs")

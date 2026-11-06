@@ -85,6 +85,28 @@ class HistoryIndexTests(unittest.TestCase):
     def ids(result: dict[str, object]) -> list[str]:
         return [entry["locator"]["message_id"] for entry in result["entries"]]  # type: ignore[index]
 
+    def test_extension_metadata_preserves_search_and_exact_locators(self) -> None:
+        spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "extensions.sqlite") as index:
+            before = index.search([spec], "needle")
+            for kind in ("tools-used", "tools-used", "future-native-state"):
+                self.append(path, {"type": kind, "sessionId": sid, "tools": ["Bash"],
+                                   "message": {"role": "user", "content": "metadata-only-marker"}})
+            after = index.search([spec], "needle")
+            self.assertEqual(self.ids(after), ["user-1"])
+            locator = after["entries"][0]["locator"]
+            self.assertEqual(locator, before["entries"][0]["locator"])
+            self.assertEqual(HistorySource(path, sid).read(locator)["text"], "authorized needle")
+            self.assertEqual(index.search([spec], "metadata-only-marker")["entries"], [])
+
+    def test_fts_errors_are_reported_without_silent_scan_retry(self) -> None:
+        spec, _, _ = self.source(0, self.record("", "user-1", "user", "authorized needle"))
+        with HistoryIndex(self.work / "fts-error.sqlite") as index:
+            with patch.object(index, "_query_rows", side_effect=apsw.SQLError("syntax error")) as query:
+                with self.assertRaises(HistoryIndexCacheError):
+                    index.search([spec], "needle")
+            query.assert_called_once()
+
     def test_appended_pr_link_without_uuid_does_not_block_search_or_become_instruction(self) -> None:
         spec, path, sid = self.source(0, self.record("", "user-1", "user", "authorized needle"))
         with HistoryIndex(self.work / "pr-link.sqlite") as index:
@@ -603,6 +625,167 @@ class HistoryIndexTests(unittest.TestCase):
         with self.assertRaises(HistoryIndexCacheError):
             HistoryIndex(link)
         self.assertEqual(target.read_bytes(), b"unrelated")
+
+
+def test_retained_index_scale_measures_decode_projection_and_validation_work(tmp_path):
+    specs = []
+    total_bytes = 0
+    live_path = None
+    live_sid = None
+    live_raw = b""
+    for window in range(160):
+        sid = str(uuid4())
+        path = tmp_path / f"{sid}.jsonl"
+        records = [HistoryIndexTests().record(sid, f"u-{i}", "user", "public window instruction " + "x" * 200)
+                   for i in range(128)]
+        if window == 159:
+            for agent in range(1_000):
+                records.extend([
+                    HistoryIndexTests().record(sid, f"a-{agent}", "assistant", [
+                        {"type": "tool_use", "id": f"call-{agent}", "name": "Agent",
+                         "input": {"name": f"fixture-agent-{agent}", "prompt": "private-tool-input-not-indexed"}}]),
+                    HistoryIndexTests().record(sid, f"r-{agent}", "user", [
+                        {"type": "tool_result", "tool_use_id": f"call-{agent}", "content": "public agent result"}],
+                        toolUseResult={"agentId": f"agent-{agent}", "isAsync": True}),
+                ])
+        raw = b"".join(HistoryIndexTests.line(record) for record in records)
+        path.write_bytes(raw)
+        total_bytes += len(raw)
+        specs.append({"source_path": str(path), "session_id": sid, "generation": window})
+        live_path, live_sid, live_raw = path, sid, raw
+    cache = tmp_path / "scale.sqlite"
+    with HistoryIndex(cache) as index:
+        cold = index.search(specs, None)["refresh"]
+        assert cold["parsed_records"] == cold["projected_records"] == 160 * 128 + 2_000
+        assert cold["parsed_bytes"] == cold["read_bytes"] == total_bytes
+        hot = index.search(specs, None)["refresh"]
+        assert hot["unchanged_sources"] == 160
+        assert hot["parsed_records"] == hot["parsed_bytes"] == hot["read_bytes"] == 0
+        append = HistoryIndexTests.line(HistoryIndexTests().record(live_sid, "append", "user", "incremental marker"))
+        with live_path.open("ab") as handle:
+            handle.write(append)
+        warm = index.search(specs, "incremental marker")["refresh"]
+        assert warm["parsed_sources"] == warm["parsed_records"] == warm["projected_records"] == 1
+        assert warm["unchanged_sources"] == 159
+        assert warm["parsed_bytes"] == len(append)
+        assert warm["validated_bytes"] == len(live_raw)
+        assert warm["read_bytes"] == len(live_raw) + len(append)
+        assert warm["added_records"] == 1
+    # The SQLite public cache survives reopen, but the canonical parser state
+    # intentionally does not. A separately launched process skips unchanged
+    # sources and must parse a changed source from the beginning.
+    with HistoryIndex(cache) as index:
+        reopened = index.search(specs, None)["refresh"]
+        assert reopened["read_bytes"] == reopened["parsed_records"] == 0
+        with live_path.open("ab") as handle:
+            handle.write(HistoryIndexTests.line(HistoryIndexTests().record(live_sid, "append-2", "user", "second marker")))
+        separate = index.search(specs, "second marker")["refresh"]
+        assert separate["parsed_records"] == 128 + 2_000 + 2
+        assert separate["parsed_sources"] == 1
+    print(json.dumps({"scenario": "160 windows / 1000 Agent calls", "cold": cold, "unchanged": hot,
+                      "append": warm, "reopened_unchanged": reopened, "reopened_append": separate}, sort_keys=True))
+
+
+def test_incremental_index_reprojects_revoked_answers_and_reports_conflicting_tools(tmp_path):
+    import pytest
+    sid = str(uuid4())
+    fixture = HistoryIndexTests()
+    questions = [{"question": "Publish?"}]
+    ask = fixture.record(sid, "ask", "assistant", [{"type": "tool_use", "id": "q", "name": "AskUserQuestion",
+                                                   "input": {"questions": questions}}])
+    answer = fixture.record(sid, "answer", "user", [{"type": "tool_result", "tool_use_id": "q", "content": "public result"}],
+                            toolUseResult={"questions": questions, "answers": {"Publish?": "No"}, "annotations": {}})
+    path = tmp_path / f"{sid}.jsonl"
+    path.write_bytes(fixture.line(ask) + fixture.line(answer))
+    spec = {"source_path": str(path), "session_id": sid, "generation": 0}
+    with HistoryIndex(tmp_path / "answers.sqlite") as index:
+        assert index.search([spec], None)["entries"][0]["source_kind"] == "verified_user_answer"
+        fixture.append(path, {**answer, "uuid": "second-result"})
+        result = index.search([spec], None)
+        assert {entry["source_kind"] for entry in result["entries"]} == {"tool_result"}
+        assert result["refresh"]["changed_records"] == 1
+        assert result["refresh"]["added_records"] == 1
+        assert result["refresh"]["parsed_records"] == 1
+        fixture.append(path, fixture.record(sid, "conflict", "assistant", [
+            {"type": "tool_use", "id": "q", "name": "Bash", "input": {}}]))
+        with pytest.raises(HistoryIndexParserError):
+            index.search([spec], None)
+
+
+def test_incremental_index_rolls_back_failed_merge_without_acknowledging_revision(tmp_path):
+    import pytest
+    sid = str(uuid4())
+    fixture = HistoryIndexTests()
+    path = tmp_path / f"{sid}.jsonl"
+    path.write_bytes(fixture.line(fixture.record(sid, "first", "user", "first public text")))
+    spec = {"source_path": str(path), "session_id": sid, "generation": 0}
+    with HistoryIndex(tmp_path / "rollback.sqlite") as index:
+        index.search([spec], None)
+        fixture.append(path, fixture.record(sid, "second", "user", "second public text"))
+        with patch.object(index, "_insert_record", side_effect=apsw.SQLError("injected failure")):
+            with pytest.raises(HistoryIndexCacheError):
+                index.search([spec], None)
+        result = index.search([spec], None)
+        assert fixture.ids(result) == ["first", "second"]
+        assert result["refresh"]["parsed_records"] == 0
+        assert result["refresh"]["added_records"] == 1
+
+
+def test_external_cache_refresh_cannot_make_retained_delta_keep_stale_prefix(tmp_path):
+    sid = str(uuid4())
+    fixture = HistoryIndexTests()
+    path = tmp_path / f"{sid}.jsonl"
+    old = fixture.line(fixture.record(sid, "same", "user", "original text"))
+    path.write_bytes(old)
+    spec = {"source_path": str(path), "session_id": sid, "generation": 0}
+    cache = tmp_path / "shared.sqlite"
+    with HistoryIndex(cache) as first:
+        first.search([spec], None)
+        path.write_bytes(fixture.line(fixture.record(sid, "same", "user", "rewritten text")))
+        with HistoryIndex(cache) as second:
+            assert second.search([spec], "rewritten")["entries"]
+        path.write_bytes(old + fixture.line(fixture.record(sid, "append", "user", "new append")))
+        result = first.search([spec], "original")
+        assert fixture.ids(result) == ["same"]
+        assert first.search([spec], "rewritten")["entries"] == []
+        assert fixture.ids(first.search([spec], "new append")) == ["append"]
+
+
+def test_canonical_projection_spans_unconsumed_revisions_without_copying_unchanged_entries(tmp_path):
+    sid = str(uuid4())
+    fixture = HistoryIndexTests()
+    path = tmp_path / f"{sid}.jsonl"
+    path.write_bytes(fixture.line(fixture.record(sid, "baseline", "user", "original public text")))
+    source = HistorySource(path, sid)
+    first = source.index_projection()
+    fixture.append(path, fixture.record(sid, "second", "user", "second public text"))
+    source.index_projection(since=first["revision"])
+    fixture.append(path, fixture.record(sid, "third", "user", "third public text"))
+    source.index_projection()
+    delta = source.index_projection(since=first["revision"])
+    assert not delta["reset"]
+    assert [entry["locator"]["message_id"] for entry in delta["entries"]] == ["second", "third"]
+    assert delta["removed_start_bytes"] == []
+    assert source.index_projection(since=delta["revision"])["entries"] == []
+    assert source.index_projection(since=delta["revision"] + 100)["reset"]
+    assert len(source.index_projection()["entries"]) == 3
+
+
+def test_pending_append_cannot_make_an_adjacent_future_projection_revision_valid(tmp_path):
+    sid = str(uuid4())
+    fixture = HistoryIndexTests()
+    path = tmp_path / f"{sid}.jsonl"
+    path.write_bytes(fixture.line(fixture.record(sid, "baseline", "user", "original public text")))
+    source = HistorySource(path, sid)
+    baseline = source.index_projection()
+    fixture.append(path, fixture.record(sid, "pending", "user", "pending public text"))
+    future = source.index_projection(since=baseline["revision"] + 1)
+    assert future["revision"] == baseline["revision"] + 1
+    assert future["reset"]
+    assert [entry["locator"]["message_id"] for entry in future["entries"]] == ["baseline", "pending"]
+    committed = source.index_projection(since=baseline["revision"])
+    assert not committed["reset"]
+    assert [entry["locator"]["message_id"] for entry in committed["entries"]] == ["pending"]
 
 
 if __name__ == "__main__":

@@ -173,7 +173,8 @@ class ResumeBindingTests(unittest.TestCase):
         if recover:
             with patch.object(runtime, "_inherit_registered_catalogue"):
                 runtime.on_hook(self._event("SessionStart", sid, path, source="resume"))
-            self.assertEqual(runtime._state()["agent_metadata_compat"]["status"], "blocked")
+            self.assertNotIn("agent_metadata_compat", runtime._state())
+            self.assertFalse((current / original_history.name).exists())
             if rotate:
                 self.assertEqual(runtime.advance()["phase"], "clear_sent")
                 continuation = self._complete_rotation(runtime)
@@ -195,6 +196,12 @@ class ResumeBindingTests(unittest.TestCase):
         if rotate:
             self.assertNotIn((sources[-1][0], str(sources[-1][1])), self._catalogue_pairs(runtime))
         self.assertEqual(state["authorization"], authorization)
+        self.assertFalse((current / original_history.name).exists())
+        result = runtime.on_hook(self._event(
+            "PreToolUse", sid, path, tool_name="SendMessage", tool_use_id="resume-original-child",
+            tool_input={"to": agent, "message": "Continue the original leaf."}))
+        self.assertNotEqual(result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+        state = runtime._state()
         self.assertEqual(state["agent_metadata_compat"]["status"], "verified")
         self.assertTrue(os.path.samefile(original_history, current / original_history.name))
         if recover:

@@ -78,7 +78,7 @@ def _created_at(value: Any, reason: str) -> int | float:
     return value
 
 
-def _runtime_state(state: Any, *, require_enabled: bool) -> dict[str, Any]:
+def _runtime_state(state: Any) -> dict[str, Any]:
     if not isinstance(state, dict):
         raise _Fault("invalid_state")
     cwd_value = state.get("cwd")
@@ -101,14 +101,6 @@ def _runtime_state(state: Any, *, require_enabled: bool) -> dict[str, Any]:
         raise _Fault("invalid_state")
     scheduler_session_id = _session_id(compat.get("scheduler_session_id"))
     session_id = _session_id(state.get("session_id"))
-    if require_enabled and not compat["enabled"]:
-        return {
-            "cwd": cwd,
-            "owned_pid": owned_pid,
-            "session_id": session_id,
-            "scheduler_session_id": scheduler_session_id,
-            "enabled": False,
-        }
     return {
         "cwd": cwd,
         "owned_pid": owned_pid,
@@ -502,7 +494,7 @@ def repair_created_task(state: dict, event: dict, directory: Path) -> dict:
     """
     task_id: str | None = None
     try:
-        runtime = _runtime_state(state, require_enabled=True)
+        runtime = _runtime_state(state)
         runtime_directory = _runtime_directory(directory)
         if not runtime["enabled"]:
             return _summary("skipped", "disabled")
@@ -609,7 +601,7 @@ def restore_bindings(state: dict, directory: Path) -> dict:
     recreated, and an externally changed task is left untouched.
     """
     try:
-        runtime = _runtime_state(state, require_enabled=False)
+        runtime = _runtime_state(state)
         runtime_directory = _runtime_directory(directory)
         exited, reason = _owner_exited(runtime["owned_pid"])
         if not exited:
